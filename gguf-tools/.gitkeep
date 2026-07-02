@@ -1,0 +1,6 @@
+# GGUF tools (Phase 4)
+
+This directory will contain:
+- convert.py — HF safetensors → qw6 GGUF conversion
+- quantize.c — IQ2_M, Q4_K, Q8_0 quantisation with asymmetric mix
+- imatrix/ — Calibration + imatrix collection for routed experts

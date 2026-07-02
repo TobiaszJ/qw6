@@ -1,0 +1,38 @@
+# Build artifacts
+qw6
+qw6-server
+qw6-agent
+qw6-eval
+qw6-bench
+qw6_test
+*.o
+*.obj
+
+# Model weights
+gguf/
+*.gguf
+ds4flash.gguf
+
+# Test outputs
+/tmp/
+*.log
+*.trace
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Vulkan shader cache
+shader_cache/
+*.spv.tmp
+
+# imatrix calibration output
+gguf-tools/imatrix/output/
+gguf-tools/imatrix/dataset/cache/
