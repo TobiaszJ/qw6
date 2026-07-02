@@ -235,16 +235,15 @@ state — the board reverts to stock 24-CU on reboot if the module parameter is 
 With headless CachyOS (~2 GB system), ~14 GB available for qw6:
 
 ```
-Weights (primary: IQ2_M experts + Q4_K_M rest + Q8_0 critical):
-  IQ2_M experts (34 layers):       10.47 GB
-  IQ3_XXS experts (6 tail layers):  1.86 GB
-  Shared expert (Q4_K_M):           0.08 GB
-  Full attention (Q4_K_M):          0.11 GB
-  Linear attention (Q4_K_M):        0.53 GB
-  Embeddings (Q4_K_M):              0.31 GB
-  Output projection (Q8_0):         0.54 GB
-  Router (Q8_0):                    0.02 GB
-  MTP (Q4_K_M):                     0.50 GB
+Weights (IQ2_M experts + Q6_K critical + Q8_0 router):
+  IQ2_M experts (40 layers):       10.47 GB
+  Shared expert (Q6_K):              0.09 GB
+  Full attention (Q6_K):             0.13 GB
+  Linear attention (Q6_K):          0.64 GB
+  Embeddings (Q6_K):                 0.37 GB
+  Output projection (Q6_K):         0.37 GB
+  Router (Q8_0):                     0.02 GB
+  MTP (Q4_K_M):                      0.50 GB
   Norms + conv1d (FP32/FP16):      <0.01 GB
 
 Overhead:
@@ -252,11 +251,12 @@ Overhead:
   KV cache Q4_0 @ 64K:              0.34 GB  (10 full-attn layers only)
   Compute scratch:                  0.50 GB
 ───────────────────────────────────────────────
-Total:                             13.90 GB
-Headroom:                          +0.10 GB
+Total:                             13.94 GB
+Headroom:                          +0.06 GB
 ```
 
 Fits in 14 GB — no SSD streaming, no disk KV, no context truncation.
+Q6_K for critical components: near-lossless quality, +0.37 GB vs Q4_K_M.
 IQ3/Q4 for all experts does NOT fit (12.34 GB for experts alone at IQ3_XXS).
 
 ---

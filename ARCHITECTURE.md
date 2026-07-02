@@ -185,29 +185,29 @@ Vulkan heaps:  16.5 GiB (two overlapping views of same pool)
 **Memory budget for qw6 (14 GB available, headless OS):**
 
 ```
-IQ2_M experts (34 layers):       10.47 GB
-IQ3_XXS experts (6 tail layers):  1.86 GB
-Shared expert (Q4_K_M):           0.08 GB
-Full attention (Q4_K_M):          0.11 GB
-Linear attention (Q4_K_M):        0.53 GB
-Embeddings (Q4_K_M):              0.31 GB
-Output projection (Q8_0):         0.54 GB
-Router (Q8_0):                    0.02 GB
-MTP (Q4_K_M):                     0.50 GB
-Norms + conv1d (FP32/FP16):      <0.01 GB
+IQ2_M experts (40 layers):        10.47 GB
+Shared expert (Q6_K):               0.09 GB
+Full attention (Q6_K):             0.13 GB
+Linear attention (Q6_K):           0.64 GB
+Embeddings (Q6_K):                  0.37 GB
+Output projection (Q6_K):          0.37 GB
+Router (Q8_0):                      0.02 GB
+MTP (Q4_K_M):                       0.50 GB
+Norms + conv1d (FP32/FP16):       <0.01 GB
 ─────────────────────────────────────────────
-Total weights:                  14.42 GB (primary: 12.56 GB with IQ2_M only)
+Total weights:                     12.60 GB
 
-DeltaNet state (FP16):            0.50 GB  (fixed, 30 layers)
-KV cache Q4_0 @ 64K:              0.34 GB  (10 full-attn layers only)
-Compute scratch:                  0.50 GB
+DeltaNet state (FP16):             0.50 GB  (fixed, 30 layers)
+KV cache Q4_0 @ 64K:               0.34 GB  (10 full-attn layers only)
+Compute scratch:                   0.50 GB
 ─────────────────────────────────────────────
-Total overhead:                   1.34 GB
-Total (primary):                 13.90 GB
-Headroom:                         +0.10 GB
+Total overhead:                    1.34 GB
+Total:                            13.94 GB
+Headroom:                          +0.06 GB
 ```
 
 Fits in 14 GB. No SSD streaming, no disk KV cache. Tight but viable.
+Q6_K for critical components: near-lossless quality, +0.37 GB vs Q4_K_M.
 
 ### 2.4 40-CU Unlock
 
@@ -408,25 +408,27 @@ at Q4_K_M or Q8_0 costs almost nothing.
 
 | Component | Quant | Bytes/param | Size | Rationale |
 |---|---|---|---|---|
-| Routed experts (main, 34 layers) | **IQ2_M** | 0.325 | 10.47 GB | 91% of model; only 8 active per token |
-| Routed experts (tail, 6 layers) | **IQ3_XXS** | 0.383 | 1.86 GB | Last 6 layers are output-critical |
-| Shared expert | **Q4_K_M** | 0.606 | 0.08 GB | Always active — quality-critical, tiny |
-| Full attention (Q,K,V,O) | **Q4_K_M** | 0.606 | 0.11 GB | Quality-sensitive, tiny |
-| Linear attention (DeltaNet) | **Q4_K_M** | 0.606 | 0.53 GB | State quality matters, tiny |
-| Embeddings (input) | **Q4_K_M** | 0.606 | 0.31 GB | Large vocab, quality matters |
-| Output projection (lm_head) | **Q8_0** | 1.063 | 0.54 GB | Token selection critical, untied |
+| Routed experts (all 40 layers) | **IQ2_M** | 0.325 | 10.47 GB | 91% of model; only 8 active per token |
+| Shared expert | **Q6_K** | 0.729 | 0.09 GB | Always active — near-lossless quality, tiny |
+| Full attention (Q,K,V,O) | **Q6_K** | 0.729 | 0.13 GB | Quality-sensitive, tiny |
+| Linear attention (DeltaNet) | **Q6_K** | 0.729 | 0.64 GB | State quality matters, tiny |
+| Embeddings (input) | **Q6_K** | 0.729 | 0.37 GB | Large vocab, near-lossless quality |
+| Output projection (lm_head) | **Q6_K** | 0.729 | 0.37 GB | Token selection critical, untied |
 | Router weights | **Q8_0** | 1.063 | 0.02 GB | Routing accuracy essential, tiny |
-| MTP layer | **Q4_K_M** | 0.606 | 0.50 GB | Speculative decoding needs accuracy |
+| MTP layer | **Q4_K_M** | 0.606 | 0.50 GB | Speculative decoding — good quality, smaller |
 | RMSNorm weights | FP32 | 4.0 | <0.01 GB | No benefit to quantise, tiny |
 | Conv1d kernels | FP16 | 2.0 | <0.01 GB | 4 elements per layer, tiny |
-| DeltaNet state | FP16 | 2.0 | 0.50 GB | Fixed [16×128×32×128] per layer, capacity trade-off |
+| DeltaNet state | FP16 | 2.0 | 0.50 GB | Fixed [16×128×32×128] per layer |
 
-**Primary scenario: 12.56 GB weights + 1.34 GB overhead = 13.90 GB total.**
-Fits in 14 GB (headless OS, ~2 GB system overhead) with 0.10 GB headroom.
+**Primary scenario: 12.60 GB weights + 1.34 GB overhead = 13.94 GB.**
+Fits in 14 GB with +0.06 GB headroom. Q6_K for critical components costs only
++0.37 GB vs Q4_K_M but provides near-lossless quality for every component that
+processes every token.
 
 IQ3 or Q4 for all experts does NOT fit — 256 experts × 40 layers = 32.2B params.
 Even IQ3_XXS produces 12.34 GB for experts alone. The ds4-style asymmetric mix
-is the only way to maximise quality while staying in memory.
+(aggressive expert quant + high-precision critical path) is the only way to
+maximise quality while staying in memory.
 
 ### 3.8 GGUF Format
 
