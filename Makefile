@@ -3,10 +3,9 @@
 
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Werror -Wpedantic -O2 -g
-LDFLAGS ?=
+LDFLAGS ?= -lm
 
 # Vulkan
-VULKAN_SDK ?=
 VULKAN_CFLAGS ?= $(shell pkg-config --cflags vulkan 2>/dev/null || echo "")
 VULKAN_LIBS ?= $(shell pkg-config --libs vulkan 2>/dev/null || echo "-lvulkan")
 
@@ -18,44 +17,44 @@ SERVER_SRCS = qw6.c qw6-server.c
 BIN = qw6
 SERVER = qw6-server
 
-.PHONY: all cpu vulkan test bench clean help
+.PHONY: all cpu vulkan server test bench clean help
 
-all: help
+all: cpu
 
 help:
 	@echo "qw6 build targets:"
 	@echo "  make cpu       — CPU-only reference/debug build (no Vulkan needed)"
 	@echo "  make vulkan    — Vulkan build for BC-250 (requires Mesa 25.1+)"
+	@echo "  make server    — Build HTTP server (Phase 4)"
 	@echo "  make test      — Run regression tests"
 	@echo "  make bench     — Run benchmarks"
 	@echo "  make clean     — Remove build artifacts"
 	@echo ""
-	@echo "Current status: pre-alpha (Phase 0 — design complete, no code yet)"
+	@echo "Current status: Phase 1 (CPU reference path — in progress)"
 
-# CPU-only build (Phase 1 target)
+# CPU-only build (Phase 1)
 cpu: $(BIN)
-	@echo "Built $(BIN) (CPU reference path — Phase 1 target, not yet implemented)"
 
-# Vulkan build (Phase 2 target)
+# Vulkan build (Phase 2)
 vulkan: CFLAGS += -DQW6_VULKAN $(VULKAN_CFLAGS)
 vulkan: LDFLAGS += $(VULKAN_LIBS)
 vulkan: $(BIN)
-	@echo "Built $(BIN) (Vulkan backend — Phase 2 target, not yet implemented)"
 
-$(BIN): qw6.c
-	@echo "Phase 1/2 not yet started — qw6.c does not exist"
-	@exit 1
-
-# Server
+# Server build (Phase 4)
 server: $(SERVER)
-	@echo "Built $(SERVER) — Phase 4 target, not yet implemented"
+
+$(BIN): qw6.c qw6.h
+	$(CC) $(CFLAGS) -o $@ qw6.c $(LDFLAGS)
+
+$(SERVER): qw6-server.c qw6.c qw6.h
+	$(CC) $(CFLAGS) -o $@ qw6-server.c qw6.c $(LDFLAGS)
 
 # Test
-test:
+test: $(BIN)
 	@echo "Tests not yet implemented — see ROADMAP.md Phase 1"
 
 # Bench
-bench:
+bench: $(BIN)
 	@echo "Benchmarks not yet implemented — see ROADMAP.md Phase 3"
 
 clean:

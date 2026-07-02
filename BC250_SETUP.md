@@ -232,21 +232,32 @@ state — the board reverts to stock 24-CU on reboot if the module parameter is 
 
 ## 6. qw6 Memory Budget
 
-With the above setup, qw6's memory budget on 16 GB:
+With headless CachyOS (~2 GB system), ~14 GB available for qw6:
 
 ```
-IQ2_M weights:              10.0 GB   (248MB×256exp + 1 shared × 40 layers)
-KV cache Q4_0 @ 64K:          0.3 GB   (10 full-attn layers × GQA × Q4_0)
-GatedDeltaNet state:          0.05 GB  (30 layers × fixed [16×128×32×128] in FP32)
-Compute scratch (activations): 0.5 GB  (intermediate tensors during forward pass)
-MTP scratch:                   0.3 GB  (speculative decoding buffers)
+Weights (primary: IQ2_M experts + Q4_K_M rest + Q8_0 critical):
+  IQ2_M experts (34 layers):       10.47 GB
+  IQ3_XXS experts (6 tail layers):  1.86 GB
+  Shared expert (Q4_K_M):           0.08 GB
+  Full attention (Q4_K_M):          0.11 GB
+  Linear attention (Q4_K_M):        0.53 GB
+  Embeddings (Q4_K_M):              0.31 GB
+  Output projection (Q8_0):         0.54 GB
+  Router (Q8_0):                    0.02 GB
+  MTP (Q4_K_M):                     0.50 GB
+  Norms + conv1d (FP32/FP16):      <0.01 GB
+
+Overhead:
+  DeltaNet state (FP16, fixed):     0.50 GB
+  KV cache Q4_0 @ 64K:              0.34 GB  (10 full-attn layers only)
+  Compute scratch:                  0.50 GB
 ───────────────────────────────────────────────
-Total qw6:                   11.15 GB
-OS + services:               ~2.0 GB  (headless, no GUI)
-Swap headroom:              ~3.0 GB   (NVMe swap, ~400-850 MB used steady state)
-───────────────────────────────────────────────
-Total system:                16.0 GB   (Fits. No SSD streaming.)
+Total:                             13.90 GB
+Headroom:                          +0.10 GB
 ```
+
+Fits in 14 GB — no SSD streaming, no disk KV, no context truncation.
+IQ3/Q4 for all experts does NOT fit (12.34 GB for experts alone at IQ3_XXS).
 
 ---
 

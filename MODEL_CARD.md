@@ -227,15 +227,92 @@ output.weight                            [vocab, hidden]  Q8_0
 | `output.weight` | [248320, 2048] | 509M |
 | `mtp.layers.0.*` | (one full layer) | ~varies |
 
-### 3.3 Size Estimates by Quantisation
+## 3. Parameter Breakdown
 
-| Quant mix | Routed experts | Shared/attn | Embed/output | Total |
+| Component | Parameters | % of total |
+|---|---|---|
+| Routed experts (256 × 40 layers) | 32.21B | 91.4% |
+| Linear attention (30 layers) | 881M | 2.5% |
+| Embeddings + output (untied) | 1,018M | 2.9% |
+| MTP layer | 827M | 2.3% |
+| Full attention (10 layers) | 189M | 0.5% |
+| Shared expert (40 layers) | 126M | 0.4% |
+| Router (40 layers) | 21M | 0.06% |
+| **Total** | **35.27B** | **100%** |
+
+Routed experts dominate at 91%. This is where aggressive quantisation saves the
+most memory. The critical components (router, shared expert, attention, embeddings,
+MTP) are tiny by comparison — keeping them at higher precision costs almost nothing.
+
+---
+
+## 4. Quantisation Plan (ds4-style Asymmetric Mix)
+
+### 4.1 Design Philosophy
+
+Following ds4's approach: **quantise the big routed experts aggressively, leave
+critical components at higher precision.** The routed experts are 91% of the model
+but only 8 are active per token. The critical components (shared expert, attention,
+embeddings, output, router) process every token and are quality-sensitive — but
+they're tiny, so keeping them at Q4_K_M or Q8_0 costs almost nothing.
+
+### 4.2 Recommended Quant Mixes (14 GB budget, headless OS)
+
+With headless CachyOS using ~2 GB, ~14 GB are available for qw6.
+
+| Scenario | Routed experts | Rest | Critical | Weights | Total | Headroom | Fit |
+|---|---|---|---|---|---|---|---|
+| **★ Primary** | IQ2_M | Q4_K_M | Q8_0 (emb/out/rtr) | 12.56 GB | 13.90 GB | +0.10 GB | ✅ |
+| **★ Quality** | IQ2_M | Q4_K_S | Q8_0 | 12.40 GB | 13.74 GB | +0.26 GB | ✅ |
+| **Balanced** | IQ2_XXS + IQ3_XXS tail(6) | Q4_K_M | Q8_0 | 10.74 GB | 12.09 GB | +1.91 GB | ✅ |
+| **Compact** | IQ2_XXS | Q4_K_M | Q8_0 | 10.37 GB | 11.71 GB | +2.29 GB | ✅ |
+| **Failed** | IQ3_XXS all | Q4_K_M | Q8_0 | ~13.7 GB | ~15.0 GB | -1.0 GB | ❌ |
+
+**IQ3 / Q4 for all experts does NOT fit** in 14 GB. The 256 experts × 40 layers are
+too many tensors — even IQ3_XXS (0.383 bytes/param) produces 12.34 GB for experts
+alone, leaving no room for the rest.
+
+### 4.3 Per-Component Quantisation
+
+| Component | Quant | Bytes/param | Size | Rationale |
 |---|---|---|---|---|
-| IQ2_M + Q4_K + Q8_0 | ~6.1 GB (256×40) | ~1.2 GB | ~1.0 GB | ~9.5 GB |
-| IQ2_XXS + Q4_K + Q8_0 | ~4.9 GB | ~1.2 GB | ~1.0 GB | ~8.3 GB |
-| Q4_K_M (all) | ~12.1 GB | ~1.2 GB | ~1.0 GB | ~14.3 GB |
+| Routed experts (main, layers 0-33) | **IQ2_M** | 0.325 | 10.47 GB | 91% of model; aggressive quant saves most |
+| Routed experts (tail, layers 34-39) | **IQ3_XXS** | 0.383 | 1.86 GB | Last 6 layers quality-sensitive (output-critical) |
+| Shared expert | **Q4_K_M** | 0.606 | 0.08 GB | Always active — quality-critical, tiny |
+| Full attention (Q,K,V,O) | **Q4_K_M** | 0.606 | 0.11 GB | GQA heads, quality-sensitive, tiny |
+| Linear attention (DeltaNet) | **Q4_K_M** | 0.606 | 0.53 GB | State quality matters, tiny |
+| Embeddings (input) | **Q4_K_M** | 0.606 | 0.31 GB | Vocab is large (248K), quality matters |
+| Output projection (lm_head) | **Q8_0** | 1.063 | 0.54 GB | Critical for token selection, untied |
+| Router weights | **Q8_0** | 1.063 | 0.02 GB | Routing accuracy essential, tiny |
+| MTP weights | **Q4_K_M** | 0.606 | 0.50 GB | Speculative decoding needs accuracy |
+| RMSNorm weights | FP32 | 4.0 | <0.01 GB | No quantisation benefit, tiny |
+| Conv1d weights | FP16 | 2.0 | <0.01 GB | 4 elements per layer, tiny |
+| DeltaNet state | FP16 | 2.0 | 0.50 GB | Fixed [16×128×32×128] per layer |
 
-**IQ2_M is the primary target** — best quality/capacity trade-off for 16 GB.
+**Primary scenario total: 12.56 GB weights + 1.34 GB (state+KV+scratch) = 13.90 GB.**
+
+This leaves 0.10 GB headroom on a 14 GB budget. Tight but viable.
+
+If more headroom is needed: drop MTP (saves 0.50 GB), or use IQ2_XXS for experts
+(saves 2.19 GB, at cost of more quality degradation).
+
+### 4.4 Why IQ3/Q4 for All Experts Doesn't Fit
+
+| Expert quant | Expert size | Total weights | 14 GB fit? |
+|---|---|---|---|
+| IQ2_XXS (0.257 B/param) | 8.28 GB | 10.37 GB | ✅ (+2.29) |
+| IQ2_M (0.325 B/param) | 10.47 GB | 12.56 GB | ✅ (+0.10) |
+| IQ3_XXS (0.383 B/param) | 12.34 GB | ~14.4 GB | ❌ (-0.4) |
+| IQ3_M (0.465 B/param) | 14.98 GB | ~17.0 GB | ❌ |
+| Q4_K_M (0.606 B/param) | 19.53 GB | ~21.5 GB | ❌ |
+
+The 256 experts × 40 layers = 32.2B parameters dominate. Even IQ3_XXS at 2.5 bits
+average produces 12.34 GB for experts alone, plus 2+ GB for everything else. There
+is no room for IQ3 or higher on all experts in 14 GB.
+
+**The ds4-style asymmetric approach is the only way to get expert quantisation
+above IQ2 while fitting in memory:** keep 256 experts at IQ2_M, and use Q4_K_M for
+the small critical components that process every token.
 
 ---
 

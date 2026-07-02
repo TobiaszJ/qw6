@@ -182,20 +182,32 @@ GTT:           16 GiB (ttm.pages_limit=4194304)
 Vulkan heaps:  16.5 GiB (two overlapping views of same pool)
 ```
 
-**Memory budget for qw6:**
+**Memory budget for qw6 (14 GB available, headless OS):**
 
 ```
-IQ2_M weights:          10.0 GB
-KV cache Q4_0 @ 64K:     0.3 GB
-GatedDeltaNet state:     0.05 GB (fixed, 30 layers × small tensors)
-Compute scratch:         0.5 GB
-MTP scratch:             0.3 GB
-─────────────────────────────────
-Total:                  11.15 GB
-Available headroom:      4.85 GB (OS + services)
+IQ2_M experts (34 layers):       10.47 GB
+IQ3_XXS experts (6 tail layers):  1.86 GB
+Shared expert (Q4_K_M):           0.08 GB
+Full attention (Q4_K_M):          0.11 GB
+Linear attention (Q4_K_M):        0.53 GB
+Embeddings (Q4_K_M):              0.31 GB
+Output projection (Q8_0):         0.54 GB
+Router (Q8_0):                    0.02 GB
+MTP (Q4_K_M):                     0.50 GB
+Norms + conv1d (FP32/FP16):      <0.01 GB
+─────────────────────────────────────────────
+Total weights:                  14.42 GB (primary: 12.56 GB with IQ2_M only)
+
+DeltaNet state (FP16):            0.50 GB  (fixed, 30 layers)
+KV cache Q4_0 @ 64K:              0.34 GB  (10 full-attn layers only)
+Compute scratch:                  0.50 GB
+─────────────────────────────────────────────
+Total overhead:                   1.34 GB
+Total (primary):                 13.90 GB
+Headroom:                         +0.10 GB
 ```
 
-Fits comfortably. No SSD streaming, no disk KV cache.
+Fits in 14 GB. No SSD streaming, no disk KV cache. Tight but viable.
 
 ### 2.4 40-CU Unlock
 
@@ -388,22 +400,33 @@ Thinking modes:
 
 ### 3.7 Quantisation Strategy (ds4-style asymmetric)
 
-Following ds4's approach — different quantisation for different tensor classes:
+Following ds4's approach — different quantisation for different tensor classes.
+Routed experts are 91% of all parameters but only 8/256 are active per token.
+The critical components (shared expert, attention, embeddings, output, router)
+process every token and are quality-sensitive, but they're tiny — keeping them
+at Q4_K_M or Q8_0 costs almost nothing.
 
-| Tensor class | Quantisation | Rationale |
-|---|---|---|
-| Routed MoE experts (majority of size) | **IQ2_XXS** or **IQ2_M** | Smallest size, quality verified by imatrix |
-| Shared expert | **Q4_K** | Always active — quality-critical |
-| Attention weights (Q, K, V, O) | **Q4_K** or **Q8_0** | Quality-sensitive, small size |
-| Output projection / lm_head | **Q8_0** | Critical for token selection |
-| Router weights | **Q8_0** or FP16 | Tiny size, routing accuracy essential |
-| Embeddings | **Q8_0** | Vocabulary is large (248K), quality matters |
-| LayerNorm / RMSNorm weights | FP32 | Tiny, no quantisation benefit |
-| MTP layer weights | **Q4_K** | Same as main layers |
-| Conv1d kernels | FP16 | Tiny (4 elements per layer) |
+| Component | Quant | Bytes/param | Size | Rationale |
+|---|---|---|---|---|
+| Routed experts (main, 34 layers) | **IQ2_M** | 0.325 | 10.47 GB | 91% of model; only 8 active per token |
+| Routed experts (tail, 6 layers) | **IQ3_XXS** | 0.383 | 1.86 GB | Last 6 layers are output-critical |
+| Shared expert | **Q4_K_M** | 0.606 | 0.08 GB | Always active — quality-critical, tiny |
+| Full attention (Q,K,V,O) | **Q4_K_M** | 0.606 | 0.11 GB | Quality-sensitive, tiny |
+| Linear attention (DeltaNet) | **Q4_K_M** | 0.606 | 0.53 GB | State quality matters, tiny |
+| Embeddings (input) | **Q4_K_M** | 0.606 | 0.31 GB | Large vocab, quality matters |
+| Output projection (lm_head) | **Q8_0** | 1.063 | 0.54 GB | Token selection critical, untied |
+| Router weights | **Q8_0** | 1.063 | 0.02 GB | Routing accuracy essential, tiny |
+| MTP layer | **Q4_K_M** | 0.606 | 0.50 GB | Speculative decoding needs accuracy |
+| RMSNorm weights | FP32 | 4.0 | <0.01 GB | No benefit to quantise, tiny |
+| Conv1d kernels | FP16 | 2.0 | <0.01 GB | 4 elements per layer, tiny |
+| DeltaNet state | FP16 | 2.0 | 0.50 GB | Fixed [16×128×32×128] per layer, capacity trade-off |
 
-This is the same philosophy as ds4: **quantise the big routed experts aggressively,
-leave critical components untouched**.
+**Primary scenario: 12.56 GB weights + 1.34 GB overhead = 13.90 GB total.**
+Fits in 14 GB (headless OS, ~2 GB system overhead) with 0.10 GB headroom.
+
+IQ3 or Q4 for all experts does NOT fit — 256 experts × 40 layers = 32.2B params.
+Even IQ3_XXS produces 12.34 GB for experts alone. The ds4-style asymmetric mix
+is the only way to maximise quality while staying in memory.
 
 ### 3.8 GGUF Format
 
@@ -469,14 +492,14 @@ From bc250 community measurements:
 
 ### 5.2 Generation Speed (estimates)
 
-| Configuration | Weight reads/token | Roofline max | Target | Baseline (llama.cpp) |
+| Configuration | Weight reads/token | Roofline max | Target (40% eff) | Baseline (llama.cpp) |
 |---|---|---|---|---|
-| IQ2_M, 40-CU | ~0.26 GB | 1,373 tok/s | 200–300 tok/s | 78 tok/s |
-| IQ2_XXS, 40-CU | ~0.21 GB | 1,700 tok/s | 250–350 tok/s | — |
-| Q4_K_M, 40-CU | ~0.52 GB | 687 tok/s | 100–150 tok/s | — |
+| IQ2_XXS experts + Q4_K_M rest, 40-CU | 1.29 GB | 278 tok/s | ~111 tok/s | — |
+| IQ2_M experts + Q4_K_M rest, 40-CU | 1.35 GB | 264 tok/s | ~106 tok/s | 78 tok/s |
+| IQ2_XXS + IQ3_XXS tail, 40-CU | 1.33 GB | 268 tok/s | ~107 tok/s | — |
 
-The 2.5× gap between llama.cpp baseline (78 tok/s) and roofline (1,373 tok/s)
-is the optimisation headroom a model-specific engine can capture:
+The gap between llama.cpp baseline (78 tok/s) and roofline (~264 tok/s) is the
+optimisation headroom a model-specific engine can capture:
 
 1. **On-the-fly dequant in MatMul kernel** — avoids separate dequant pass
 2. **MoE expert locality** — keep hot experts in CU shared memory
