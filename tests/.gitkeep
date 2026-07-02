@@ -1,7 +1,0 @@
-# Test vectors (Phase 1)
-
-Official Qwen 3.6-35B-A3B API continuations for regression testing:
-- Short prompt (greedy, thinking disabled)
-- Medium context (4K tokens)
-- Long context (32K tokens — tests DeltaNet state management)
-- Tool calling format
