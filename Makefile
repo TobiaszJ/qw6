@@ -10,8 +10,8 @@ VULKAN_CFLAGS ?= $(shell pkg-config --cflags vulkan 2>/dev/null || echo "")
 VULKAN_LIBS ?= $(shell pkg-config --libs vulkan 2>/dev/null || echo "-lvulkan")
 
 # Sources
-SRCS = qw6.c
-SERVER_SRCS = qw6.c qw6-server.c
+SRCS = qw6.c qw6_tok.c
+SERVER_SRCS = qw6.c qw6_tok.c qw6-server.c
 
 # Output binaries
 BIN = qw6
@@ -43,11 +43,11 @@ vulkan: $(BIN)
 # Server build (Phase 4)
 server: $(SERVER)
 
-$(BIN): qw6.c qw6.h
-	$(CC) $(CFLAGS) -o $@ qw6.c $(LDFLAGS)
+$(BIN): qw6.c qw6_tok.c qw6.h qw6_tok.h
+	$(CC) $(CFLAGS) -o $@ qw6.c qw6_tok.c $(LDFLAGS)
 
-$(SERVER): qw6-server.c qw6.c qw6.h
-	$(CC) $(CFLAGS) -o $@ qw6-server.c qw6.c $(LDFLAGS)
+$(SERVER): qw6-server.c qw6.c qw6_tok.c qw6.h qw6_tok.h
+	$(CC) $(CFLAGS) -o $@ qw6-server.c qw6.c qw6_tok.c $(LDFLAGS)
 
 # Test
 test: $(BIN)

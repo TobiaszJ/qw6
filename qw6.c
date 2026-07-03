@@ -17,6 +17,7 @@
  */
 
 #include "qw6.h"
+#include "qw6_tok.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -471,10 +472,10 @@ static void usage(void) {
         QW6_VERSION, QW6_BUILD_PHASE, QW6_DEFAULT_CTX
     );
 }
-
 int main(int argc, char **argv) {
     const char *model_path = NULL;
     const char *prompt = NULL;
+    const char *tok_path = "tokenizer/tokenizer.json";
     int n_tokens = 256;
     int ctx = QW6_DEFAULT_CTX;
     float temp = 0.0f;
@@ -483,6 +484,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i+1 < argc) model_path = argv[++i];
         else if (strcmp(argv[i], "-p") == 0 && i+1 < argc) prompt = argv[++i];
+        else if (strcmp(argv[i], "--tok") == 0 && i+1 < argc) tok_path = argv[++i];
         else if (strcmp(argv[i], "-n") == 0 && i+1 < argc) n_tokens = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ctx") == 0 && i+1 < argc) ctx = atoi(argv[++i]);
         else if (strcmp(argv[i], "--temp") == 0 && i+1 < argc) temp = (float)atof(argv[++i]);
@@ -500,16 +502,59 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!model_path) { fprintf(stderr, "qw6: -m <model.gguf> required\n"); return 1; }
     if (!prompt && !bench) { fprintf(stderr, "qw6: -p <prompt> required\n"); return 1; }
 
-    fprintf(stderr, "qw6 %s — Phase %d (CPU reference)\n", QW6_VERSION, QW6_BUILD_PHASE);
+    fprintf(stderr, "qw6 %s -- Phase %d (CPU reference)\n", QW6_VERSION, QW6_BUILD_PHASE);
     fprintf(stderr, "Model: Qwen 3.6-35B-A3B (35B total, 3B active, 256 experts)\n");
     fprintf(stderr, "Architecture: hybrid attention (30 Gated DeltaNet + 10 Gated Attention)\n\n");
+
+    /* Load tokenizer */
+    qw6_tokenizer_t tokenizer;
+    fprintf(stderr, "qw6: loading tokenizer from %s ...\n", tok_path);
+    if (qw6_tok_init(&tokenizer, tok_path) != 0) {
+        fprintf(stderr, "qw6: failed to load tokenizer\n");
+        return 1;
+    }
+    fprintf(stderr, "qw6: tokenizer loaded (%u vocab, %u merges, %u added)\n\n",
+            tokenizer.vocab_count, tokenizer.merge_count, tokenizer.added_count);
+
+    if (dump_tokens && prompt) {
+        fprintf(stderr, "qw6: encoding: \"%s\"\n\n", prompt);
+        uint32_t *tokens = NULL;
+        uint32_t n = 0;
+        if (qw6_tok_encode(&tokenizer, prompt, &tokens, &n) == 0) {
+            qw6_dump_tokens(tokens, n);
+            /* Also show raw byte-level strings for debugging */
+            fprintf(stderr, "\nqw6: raw tokens: \"");
+            for (uint32_t i = 0; i < n; i++) {
+                fprintf(stderr, "%s", qw6_tok_id_to_str(&tokenizer, tokens[i]));
+            }
+            fprintf(stderr, "\"\n");
+            /* Now decode properly with byte-level reversal */
+            char *decoded = NULL;
+            if (qw6_tok_decode(&tokenizer, tokens, n, &decoded) == 0) {
+                fprintf(stderr, "qw6: decoded: \"%s\"\n", decoded);
+                free(decoded);
+            }
+            free(tokens);
+        } else {
+            fprintf(stderr, "qw6: encoding failed\n");
+        }
+        qw6_tok_free(&tokenizer);
+        return 0;
+    }
+
+    /* Model loading (Phase 1 TODO) */
+    if (!model_path) {
+        fprintf(stderr, "qw6: -m <model.gguf> required for inference (not for --dump-tokens)\n");
+        qw6_tok_free(&tokenizer);
+        return 1;
+    }
 
     qw6_model_t model;
     if (qw6_model_load(&model, model_path) != 0) {
         fprintf(stderr, "qw6: model loading is Phase 1 TODO (GGUF parser)\n");
+        qw6_tok_free(&tokenizer);
         return 1;
     }
 
@@ -517,21 +562,8 @@ int main(int argc, char **argv) {
     if (qw6_session_init(&session, &model, (uint32_t)ctx) != 0) {
         fprintf(stderr, "qw6: session init failed\n");
         qw6_model_free(&model);
+        qw6_tok_free(&tokenizer);
         return 1;
-    }
-
-    if (dump_tokens && prompt) {
-        uint32_t *tokens = NULL;
-        uint32_t n = 0;
-        if (qw6_token_encode(prompt, &tokens, &n) == 0) {
-            qw6_dump_tokens(tokens, n);
-            free(tokens);
-        } else {
-            fprintf(stderr, "qw6: tokeniser not yet implemented\n");
-        }
-        qw6_session_free(&session);
-        qw6_model_free(&model);
-        return 0;
     }
 
     if (prompt) {
@@ -541,10 +573,11 @@ int main(int argc, char **argv) {
 
         uint32_t *tokens = NULL;
         uint32_t n = 0;
-        if (qw6_token_encode(prompt, &tokens, &n) != 0) {
-            fprintf(stderr, "qw6: BPE tokeniser is Phase 1 TODO (vocab %d)\n", QW6_VOCAB_SIZE);
+        if (qw6_tok_encode(&tokenizer, prompt, &tokens, &n) != 0) {
+            fprintf(stderr, "qw6: tokeniser encoding failed\n");
             qw6_session_free(&session);
             qw6_model_free(&model);
+            qw6_tok_free(&tokenizer);
             return 1;
         }
         fprintf(stderr, "qw6: tokenised to %u tokens\n", n);
@@ -554,6 +587,7 @@ int main(int argc, char **argv) {
             free(tokens);
             qw6_session_free(&session);
             qw6_model_free(&model);
+            qw6_tok_free(&tokenizer);
             return 1;
         }
 
@@ -569,5 +603,6 @@ int main(int argc, char **argv) {
 
     qw6_session_free(&session);
     qw6_model_free(&model);
+    qw6_tok_free(&tokenizer);
     return 0;
 }
