@@ -249,9 +249,13 @@ void qw6_cpu_matmul_f16(float *out, const void *w, const float *x,
             }
             out[r] = acc;
         }
+    } else if (quant == QW6_Q_Q8_0) {
+        qw6_cpu_matmul_q8(out, w, x, rows, cols);
+    } else if (quant == QW6_Q_Q4_K_M || quant == QW6_Q_Q4_K_S) {
+        qw6_cpu_matmul_q4km(out, w, x, rows, cols);
+    } else if (quant == QW6_Q_IQ2_M || quant == QW6_Q_IQ2_XXS) {
+        qw6_cpu_matmul_iq2m(out, w, x, rows, cols);
     } else {
-        /* Phase 1 TODO: Q8_0, Q4_K_M, IQ2_M dequant kernels */
-        (void)w; (void)x;
         memset(out, 0, (size_t)rows * sizeof(float));
     }
 }
@@ -277,15 +281,40 @@ void qw6_cpu_matmul_q8(float *out, const void *w, const float *x,
 void qw6_cpu_matmul_q4km(float *out, const void *w, const float *x,
                          int rows, int cols) {
     QW6_ASSERT_PTR(out); QW6_ASSERT_PTR(w); QW6_ASSERT_PTR(x);
-    (void)w; (void)x; (void)rows; (void)cols;
-    /* Phase 1 TODO */
+    QW6_ASSERT(rows > 0 && cols > 0, "rows>0 && cols>0");
+
+    const float *scales = (const float *)w;
+    const uint8_t *packed = (const uint8_t *)(scales + rows);
+    for (int r = 0; r < rows; r++) {
+        float acc = 0.0f;
+        for (int c = 0; c < cols; c++) {
+            size_t idx = (size_t)r * (size_t)cols + (size_t)c;
+            uint8_t byte = packed[idx >> 1];
+            int q = (idx & 1) ? (byte >> 4) : (byte & 0x0f);
+            q -= 8;
+            acc += ((float)q * scales[r]) * x[c];
+        }
+        out[r] = acc;
+    }
 }
 
 void qw6_cpu_matmul_iq2m(float *out, const void *w, const float *x,
                          int rows, int cols) {
     QW6_ASSERT_PTR(out); QW6_ASSERT_PTR(w); QW6_ASSERT_PTR(x);
-    (void)w; (void)x; (void)rows; (void)cols;
-    /* Phase 1 TODO */
+    QW6_ASSERT(rows > 0 && cols > 0, "rows>0 && cols>0");
+
+    const float *scales = (const float *)w;
+    const uint8_t *packed = (const uint8_t *)(scales + rows);
+    static const float lut[4] = {-1.5f, -0.5f, 0.5f, 1.5f};
+    for (int r = 0; r < rows; r++) {
+        float acc = 0.0f;
+        for (int c = 0; c < cols; c++) {
+            size_t idx = (size_t)r * (size_t)cols + (size_t)c;
+            uint8_t code = (packed[idx >> 2] >> ((idx & 3) * 2)) & 0x03;
+            acc += (lut[code] * scales[r]) * x[c];
+        }
+        out[r] = acc;
+    }
 }
 
 /* ---- Gated DeltaNet ---- */
@@ -476,21 +505,26 @@ uint32_t qw6_sample(qw6_session_t *s, float temp, float top_p) {
     return qw6_cpu_argmax(s->logits, QW6_VOCAB_SIZE);
 }
 
-/* ---- Tokenizer (Phase 1 stub) ---- */
+/* ---- Tokenizer convenience API ---- */
 
 int qw6_token_encode(const char *text, uint32_t **out_tokens, uint32_t *out_n) {
     QW6_ASSERT_PTR(text); QW6_ASSERT_PTR(out_tokens); QW6_ASSERT_PTR(out_n);
-    (void)text;
-    *out_tokens = NULL;
-    *out_n = 0;
-    return -1;
+
+    qw6_tokenizer_t tokenizer;
+    if (qw6_tok_init(&tokenizer, "tokenizer/tokenizer.json") != 0) return -1;
+    int rc = qw6_tok_encode(&tokenizer, text, out_tokens, out_n);
+    qw6_tok_free(&tokenizer);
+    return rc;
 }
 
 int qw6_token_decode(const uint32_t *tokens, uint32_t n, char **out_text) {
     QW6_ASSERT_PTR(tokens); QW6_ASSERT_PTR(out_text);
-    (void)tokens; (void)n;
-    *out_text = NULL;
-    return -1;
+
+    qw6_tokenizer_t tokenizer;
+    if (qw6_tok_init(&tokenizer, "tokenizer/tokenizer.json") != 0) return -1;
+    int rc = qw6_tok_decode(&tokenizer, tokens, n, out_text);
+    qw6_tok_free(&tokenizer);
+    return rc;
 }
 
 /* ---- Debug ---- */
@@ -572,6 +606,22 @@ static int selftest_matmul(void) {
     qw6_cpu_matmul_q8(out, &q8, x, 2, 3);
     fail += selftest_close(out[0], 1.5f, 1e-6f, "matmul_q8[0]");
     fail += selftest_close(out[1], -1.5f, 1e-6f, "matmul_q8[1]");
+
+    struct {
+        float scales[2];
+        uint8_t q[3];
+    } q4 = {{0.5f, 0.25f}, {0xca, 0xf7, 0x4a}};
+    qw6_cpu_matmul_q4km(out, &q4, x, 2, 3);
+    fail += selftest_close(out[0], -0.25f, 1e-6f, "matmul_q4[0]");
+    fail += selftest_close(out[1], 2.5f, 1e-6f, "matmul_q4[1]");
+
+    struct {
+        float scales[2];
+        uint8_t q[2];
+    } iq2 = {{1.0f, 0.5f}, {0xd8, 0x06}};
+    qw6_cpu_matmul_iq2m(out, &iq2, x, 2, 3);
+    fail += selftest_close(out[0], -3.75f, 1e-6f, "matmul_iq2[0]");
+    fail += selftest_close(out[1], 1.125f, 1e-6f, "matmul_iq2[1]");
     return fail;
 }
 

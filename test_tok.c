@@ -26,17 +26,13 @@ static const struct test_case tests[] = {
 #define NUM_TESTS (int)(sizeof(tests) / sizeof(tests[0]))
 
 int main(void) {
-    fprintf(stderr, "DBG: start\n"); fflush(stderr);
     qw6_tokenizer_t tok;
-    fprintf(stderr, "DBG: before init\n"); fflush(stderr);
     int rc = qw6_tok_init(&tok, "tokenizer/tokenizer.json");
-    fprintf(stderr, "DBG: init rc=%d\n", rc); fflush(stderr);
     if (rc != 0) { fprintf(stderr, "FAIL: init\n"); return 1; }
 
     int pass = 0, fail = 0;
 
     for (int i = 0; i < NUM_TESTS; i++) {
-        fprintf(stderr, "DBG: test %d: \"%s\"\n", i, tests[i].text); fflush(stderr);
         uint32_t *tokens = NULL;
         uint32_t n = 0;
 
@@ -45,20 +41,15 @@ int main(void) {
             fail++;
             continue;
         }
-        fprintf(stderr, "DBG: encoded %u tokens\n", n); fflush(stderr);
 
         char *decoded = NULL;
         bool roundtrip_ok = false;
-        fprintf(stderr, "DBG: before decode\n"); fflush(stderr);
         if (qw6_tok_decode(&tok, tokens, n, &decoded) == 0) {
-            fprintf(stderr, "DBG: decoded: \"%s\"\n", decoded); fflush(stderr);
             roundtrip_ok = (strcmp(decoded, tests[i].text) == 0);
             if (!roundtrip_ok)
                 fprintf(stderr, "FAIL [%d] roundtrip: \"%s\" -> \"%s\"\n",
                         i, tests[i].text, decoded);
             free(decoded);
-        } else {
-            fprintf(stderr, "DBG: decode returned error\n"); fflush(stderr);
         }
 
         bool ids_ok = (n == tests[i].expected_count);
@@ -75,7 +66,6 @@ int main(void) {
         free(tokens);
     }
 
-    fprintf(stderr, "DBG: before free\n"); fflush(stderr);
     qw6_tok_free(&tok);
     fprintf(stderr, "\n%d passed, %d failed\n", pass, fail);
     return fail > 0 ? 1 : 0;

@@ -198,7 +198,13 @@ int qw6_token_decode(const uint32_t *tokens, uint32_t n, char **out_text);
 void qw6_cpu_rmsnorm(float *out, const float *x, const float *weight, int dim);
 void qw6_cpu_matmul_f16(float *out, const void *w, const float *x,
                         int rows, int cols, qw6_quant_t quant);
-/* CPU reference Q8 layout: [rows float scales][rows*cols int8 weights]. */
+/* CPU reference quant layouts used by self-tests and small fixtures:
+ * Q8:  [rows float scales][rows*cols int8 weights].
+ * Q4K: [rows float scales][ceil(rows*cols/2) packed int4 weights],
+ *       low nibble first, signed range [-8,7] via nibble-8.
+ * IQ2M: [rows float scales][ceil(rows*cols/4) packed uint2 weights],
+ *       two-bit values map to {-1.5,-0.5,0.5,1.5}.
+ */
 void qw6_cpu_matmul_q8(float *out, const void *w, const float *x,
                        int rows, int cols);
 void qw6_cpu_matmul_q4km(float *out, const void *w, const float *x,
