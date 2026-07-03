@@ -47,11 +47,9 @@ native work against Qwen 3.6 GGUF weights:
 - `mmap`-backed weight access with tensor offsets, shapes, quant types, and byte spans
 - packed routed-expert tensors split into per-expert views
 - tokenizer loading and token dump path
-- CPU kernels and probes for RMSNorm, top-k MoE routing, shared-expert FFN, and native matvec
-- native dequantization for F32, F16, BF16, Q4_K, Q5_K, and Q6_K
-
-Routed expert formats `IQ2_XXS`, `IQ2_S`, and `IQ3_S` still need native
-decoders before routed MoE and full forward inference can run.
+- CPU kernels and probes for RMSNorm, top-k MoE routing, routed/shared-expert FFN, and native matvec
+- native dequantization for F32, F16, BF16, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_S, and IQ3_S
+- layer-0 Gated DeltaNet single-token forward probe through SSM conv, GDN update, gated norm, and `ssm_out`
 
 The repository currently contains CPU engine code, tokenizer implementation,
 native GGUF loader/indexing, kernel scaffolding, and design documentation:
@@ -78,9 +76,9 @@ be run with:
 ```
 
 Expected current behavior: model metadata validation passes and native probes
-print tensor checksums, router top-k experts, and shared-FFN summary values.
-Normal prompt generation is still a Phase 1 TODO until the remaining native
-forward path is implemented.
+print tensor checksums, router top-k experts, routed/shared-FFN summaries, and a
+layer-0 DeltaNet forward checksum. Normal prompt generation is still a Phase 1
+TODO until the 40-layer forward-to-logits path is implemented.
 
 ## Acknowledgements
 

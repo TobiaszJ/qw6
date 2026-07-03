@@ -35,6 +35,9 @@
 #define QW6_NUM_VALUE_HEADS     32
 #define QW6_VALUE_HEAD_DIM      128
 #define QW6_CONV1D_KERNEL       4
+#define QW6_LINEAR_QKV_DIM      (QW6_NUM_KEY_HEADS * QW6_KEY_HEAD_DIM * 2 + \
+                                 QW6_NUM_VALUE_HEADS * QW6_VALUE_HEAD_DIM)
+#define QW6_LINEAR_VALUE_DIM    (QW6_NUM_VALUE_HEADS * QW6_VALUE_HEAD_DIM)
 
 /* MoE */
 #define QW6_NUM_EXPERTS         256
@@ -119,6 +122,7 @@ typedef struct {
 
         /* RMSNorm */
         qw6_tensor_t norm;             /* [hidden] FP32 */
+        qw6_tensor_t post_norm;        /* [hidden] FP32 */
 
         /* Full attention (type == FULL_ATTN only) */
         qw6_tensor_t attn_q;           /* [num_q*head_dim, hidden] */
@@ -134,10 +138,15 @@ typedef struct {
         qw6_tensor_t dn_query;         /* [val_heads*val_dim, hidden] */
         qw6_tensor_t dn_out;           /* [hidden, val_heads*val_dim] */
         qw6_tensor_t dn_gate;          /* [hidden] FP16 — output gate */
-        qw6_tensor_t dn_norm;          /* [hidden] FP32 — key normalisation */
+        qw6_tensor_t dn_norm;          /* [hidden] FP32 - key normalisation */
+        qw6_tensor_t dn_alpha;
+        qw6_tensor_t dn_beta;
+        qw6_tensor_t dn_dt;
+        qw6_tensor_t dn_a;
 
         /* MoE (all layers) */
         qw6_tensor_t moe_router;       /* [num_experts, hidden] */
+        qw6_tensor_t shared_router;
         /* Expert weights: gate_proj, up_proj, down_proj per expert */
         /* Stored contiguously for cache-friendly loading */
         qw6_tensor_t expert_gate[QW6_NUM_EXPERTS];   /* [moe_inter, hidden] */

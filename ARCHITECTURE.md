@@ -15,15 +15,16 @@ path before the Vulkan backend:
 - Model weights are accessed through `mmap`; tensors store real file offsets,
   shapes, quant types, byte spans, and data pointers.
 - Packed 3D routed-expert tensors are split into per-expert views.
-- Native dequantization currently covers F32, F16, BF16, Q4_K, Q5_K, and Q6_K.
-- Native probes run output projection MatVec, layer-0 RMSNorm, router top-k, and
-  shared-expert FFN against real Qwen3.6 weights.
+- Native dequantization currently covers F32, F16, BF16, Q4_K, Q5_K, Q6_K,
+  IQ2_XXS, IQ2_S, and IQ3_S.
+- Native probes run output projection MatVec, layer-0 RMSNorm, router top-k,
+  routed/shared-expert FFN, and a single-token layer-0 Gated DeltaNet forward
+  probe against real Qwen3.6 weights.
 
 Not yet implemented:
 
-- native IQ2_XXS, IQ2_S, and IQ3_S dequantization for routed experts
-- full routed MoE forward pass
-- full Gated DeltaNet / GQA layer forward
+- full 40-layer native forward pass
+- full GQA layer forward integrated with KV cache
 - end-to-end native token generation
 
 The old experimental external `llama.cpp` generation bridge is not part of the

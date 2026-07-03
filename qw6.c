@@ -18,6 +18,7 @@
 
 #include "qw6.h"
 #include "qw6_tok.h"
+#include "qw6_iq_tables.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -404,7 +405,7 @@ static size_t qw6_quant_block_size(qw6_quant_t q) {
         case QW6_Q_Q5_K: return 176;
         case QW6_Q_Q6_K: return 210;
         case QW6_Q_IQ2_XXS: return 66;
-        case QW6_Q_IQ2_S: return 74;
+        case QW6_Q_IQ2_S: return 82;
         case QW6_Q_IQ3_S: return 110;
         default: return 0;
     }
@@ -463,14 +464,23 @@ static int bind_layer_tensor(qw6_model_t *m, int layer,
     qw6_tensor_t *dst = NULL;
 
     if (strcmp(local, "attn_norm.weight") == 0) dst = &m->layers[layer].norm;
+    else if (strcmp(local, "post_attention_norm.weight") == 0) dst = &m->layers[layer].post_norm;
     else if (strcmp(local, "attn_qkv.weight") == 0) dst = &m->layers[layer].attn_q;
+    else if (strcmp(local, "attn_q.weight") == 0) dst = &m->layers[layer].attn_q;
+    else if (strcmp(local, "attn_k.weight") == 0) dst = &m->layers[layer].attn_k;
+    else if (strcmp(local, "attn_v.weight") == 0) dst = &m->layers[layer].attn_v;
     else if (strcmp(local, "attn_output.weight") == 0) dst = &m->layers[layer].attn_o;
     else if (strcmp(local, "attn_gate.weight") == 0) dst = &m->layers[layer].attn_gate;
     else if (strcmp(local, "ssm_conv1d.weight") == 0) dst = &m->layers[layer].conv1d;
     else if (strcmp(local, "ssm_in.weight") == 0) dst = &m->layers[layer].dn_key;
     else if (strcmp(local, "ssm_out.weight") == 0) dst = &m->layers[layer].dn_out;
     else if (strcmp(local, "ssm_norm.weight") == 0) dst = &m->layers[layer].dn_norm;
+    else if (strcmp(local, "ssm_alpha.weight") == 0) dst = &m->layers[layer].dn_alpha;
+    else if (strcmp(local, "ssm_beta.weight") == 0) dst = &m->layers[layer].dn_beta;
+    else if (strcmp(local, "ssm_dt.bias") == 0) dst = &m->layers[layer].dn_dt;
+    else if (strcmp(local, "ssm_a") == 0) dst = &m->layers[layer].dn_a;
     else if (strcmp(local, "ffn_gate_inp.weight") == 0) dst = &m->layers[layer].moe_router;
+    else if (strcmp(local, "ffn_gate_inp_shexp.weight") == 0) dst = &m->layers[layer].shared_router;
     else if (strcmp(local, "ffn_gate_exps.weight") == 0) {
         bind_expert_pack(m->layers[layer].expert_gate, ti, base, abs_offset, span);
         return 1;
@@ -1051,6 +1061,26 @@ typedef struct {
     uint16_t d;
 } qw6_block_q6_k_t;
 
+typedef struct {
+    uint16_t d;
+    uint16_t qs[QW6_QK_K / 8];
+} qw6_block_iq2_xxs_t;
+
+typedef struct {
+    uint16_t d;
+    uint8_t qs[QW6_QK_K / 4];
+    uint8_t qh[QW6_QK_K / 32];
+    uint8_t scales[QW6_QK_K / 32];
+} qw6_block_iq2_s_t;
+
+typedef struct {
+    uint16_t d;
+    uint8_t qs[QW6_QK_K / 4];
+    uint8_t qh[QW6_QK_K / 32];
+    uint8_t signs[QW6_QK_K / 8];
+    uint8_t scales[QW6_QK_K / 64];
+} qw6_block_iq3_s_t;
+
 static float qw6_fp16_to_f32(uint16_t h) {
     uint32_t sign = (uint32_t)(h & 0x8000) << 16;
     uint32_t exp = (h >> 10) & 0x1f;
@@ -1183,6 +1213,100 @@ static int qw6_dequantize_row_q6_k(const void *src, float *dst, int k) {
     return 0;
 }
 
+static int qw6_dequantize_row_iq2_xxs(const void *src, float *dst, int k) {
+    QW6_ASSERT_PTR(src); QW6_ASSERT_PTR(dst);
+    QW6_ASSERT(k > 0 && k % QW6_QK_K == 0, "iq2_xxs row multiple");
+    const qw6_block_iq2_xxs_t *x = (const qw6_block_iq2_xxs_t *)src;
+    int nb = k / QW6_QK_K;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = qw6_fp16_to_f32(x[i].d);
+        for (int ib32 = 0; ib32 < QW6_QK_K / 32; ib32++) {
+            uint32_t aux32[2];
+            memcpy(aux32, x[i].qs + 4 * ib32, sizeof(aux32));
+            const uint8_t *aux8 = (const uint8_t *)aux32;
+            const float db = d * (0.5f + (aux32[1] >> 28)) * 0.25f;
+            for (int l = 0; l < 4; l++) {
+                const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
+                uint8_t signs = ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];
+                for (int j = 0; j < 8; j++)
+                    *dst++ = db * grid[j] * (signs & kmask_iq2xs[j] ? -1.0f : 1.0f);
+            }
+        }
+    }
+    return 0;
+}
+
+static int qw6_dequantize_row_iq2_s(const void *src, float *dst, int k) {
+    QW6_ASSERT_PTR(src); QW6_ASSERT_PTR(dst);
+    QW6_ASSERT(k > 0 && k % QW6_QK_K == 0, "iq2_s row multiple");
+    const qw6_block_iq2_s_t *x = (const qw6_block_iq2_s_t *)src;
+    int nb = k / QW6_QK_K;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = qw6_fp16_to_f32(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const uint8_t *signs = qs + QW6_QK_K / 8;
+        for (int ib32 = 0; ib32 < QW6_QK_K / 32; ib32++) {
+            float db0 = d * (0.5f + (x[i].scales[ib32] & 0x0f)) * 0.25f;
+            float db1 = d * (0.5f + (x[i].scales[ib32] >> 4)) * 0.25f;
+            for (int l = 0; l < 4; l++) {
+                float dl = l < 2 ? db0 : db1;
+                uint32_t grid_idx = qs[l] | ((qh[ib32] << (8 - 2 * l)) & 0x300);
+                const uint8_t *grid = (const uint8_t *)(iq2s_grid + grid_idx);
+                for (int j = 0; j < 8; j++)
+                    *dst++ = dl * grid[j] * (signs[l] & kmask_iq2xs[j] ? -1.0f : 1.0f);
+            }
+            qs += 4;
+            signs += 4;
+        }
+    }
+    return 0;
+}
+
+static int qw6_dequantize_row_iq3_s(const void *src, float *dst, int k) {
+    QW6_ASSERT_PTR(src); QW6_ASSERT_PTR(dst);
+    QW6_ASSERT(k > 0 && k % QW6_QK_K == 0, "iq3_s row multiple");
+    const qw6_block_iq3_s_t *x = (const qw6_block_iq3_s_t *)src;
+    int nb = k / QW6_QK_K;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = qw6_fp16_to_f32(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const uint8_t *signs = x[i].signs;
+        for (int ib32 = 0; ib32 < QW6_QK_K / 32; ib32 += 2) {
+            float db1 = d * (1 + 2 * (x[i].scales[ib32 / 2] & 0x0f));
+            float db2 = d * (1 + 2 * (x[i].scales[ib32 / 2] >> 4));
+            for (int l = 0; l < 4; l++) {
+                const uint8_t *g1 = (const uint8_t *)(iq3s_grid + (qs[2*l] | ((qh[0] << (8 - 2*l)) & 256)));
+                const uint8_t *g2 = (const uint8_t *)(iq3s_grid + (qs[2*l+1] | ((qh[0] << (7 - 2*l)) & 256)));
+                for (int j = 0; j < 4; j++) {
+                    dst[j] = db1 * g1[j] * (signs[l] & kmask_iq2xs[j] ? -1.0f : 1.0f);
+                    dst[j + 4] = db1 * g2[j] * (signs[l] & kmask_iq2xs[j + 4] ? -1.0f : 1.0f);
+                }
+                dst += 8;
+            }
+            qs += 8;
+            signs += 4;
+            for (int l = 0; l < 4; l++) {
+                const uint8_t *g1 = (const uint8_t *)(iq3s_grid + (qs[2*l] | ((qh[1] << (8 - 2*l)) & 256)));
+                const uint8_t *g2 = (const uint8_t *)(iq3s_grid + (qs[2*l+1] | ((qh[1] << (7 - 2*l)) & 256)));
+                for (int j = 0; j < 4; j++) {
+                    dst[j] = db2 * g1[j] * (signs[l] & kmask_iq2xs[j] ? -1.0f : 1.0f);
+                    dst[j + 4] = db2 * g2[j] * (signs[l] & kmask_iq2xs[j + 4] ? -1.0f : 1.0f);
+                }
+                dst += 8;
+            }
+            qh += 2;
+            qs += 8;
+            signs += 4;
+        }
+    }
+    return 0;
+}
+
 static int qw6_tensor_dequantize_row(const qw6_tensor_t *t, uint32_t row,
                                      float *dst) {
     QW6_ASSERT_PTR(t); QW6_ASSERT_PTR(dst);
@@ -1210,6 +1334,12 @@ static int qw6_tensor_dequantize_row(const qw6_tensor_t *t, uint32_t row,
         block_size = sizeof(qw6_block_q5_k_t);
     else if (t->quant == QW6_Q_Q6_K)
         block_size = sizeof(qw6_block_q6_k_t);
+    else if (t->quant == QW6_Q_IQ2_XXS)
+        block_size = sizeof(qw6_block_iq2_xxs_t);
+    else if (t->quant == QW6_Q_IQ2_S)
+        block_size = sizeof(qw6_block_iq2_s_t);
+    else if (t->quant == QW6_Q_IQ3_S)
+        block_size = sizeof(qw6_block_iq3_s_t);
     else
         return -1;
 
@@ -1220,7 +1350,13 @@ static int qw6_tensor_dequantize_row(const qw6_tensor_t *t, uint32_t row,
         return qw6_dequantize_row_q4_k(src, dst, (int)cols);
     if (t->quant == QW6_Q_Q5_K)
         return qw6_dequantize_row_q5_k(src, dst, (int)cols);
-    return qw6_dequantize_row_q6_k(src, dst, (int)cols);
+    if (t->quant == QW6_Q_Q6_K)
+        return qw6_dequantize_row_q6_k(src, dst, (int)cols);
+    if (t->quant == QW6_Q_IQ2_XXS)
+        return qw6_dequantize_row_iq2_xxs(src, dst, (int)cols);
+    if (t->quant == QW6_Q_IQ2_S)
+        return qw6_dequantize_row_iq2_s(src, dst, (int)cols);
+    return qw6_dequantize_row_iq3_s(src, dst, (int)cols);
 }
 
 static int qw6_probe_tensor_row(const char *label, const qw6_tensor_t *t) {
@@ -1393,6 +1529,214 @@ static int qw6_probe_layer0_shared_ffn(qw6_model_t *m) {
 
     free(hidden); free(norm_w); free(normed); free(gate);
     free(up); free(mid); free(out);
+    return rc;
+}
+
+static int qw6_probe_layer0_routed_ffn(qw6_model_t *m) {
+    QW6_ASSERT_PTR(m);
+    float *hidden = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *norm_w = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *normed = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *router_logits = calloc(QW6_NUM_EXPERTS, sizeof(float));
+    float *gate = calloc(QW6_MOE_INTER, sizeof(float));
+    float *up = calloc(QW6_MOE_INTER, sizeof(float));
+    float *mid = calloc(QW6_MOE_INTER, sizeof(float));
+    float *tmp = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *out = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    int idx[QW6_EXPERTS_PER_TOK] = {0};
+    float w[QW6_EXPERTS_PER_TOK] = {0};
+    QW6_ASSERT_PTR(hidden); QW6_ASSERT_PTR(norm_w); QW6_ASSERT_PTR(normed);
+    QW6_ASSERT_PTR(router_logits); QW6_ASSERT_PTR(gate); QW6_ASSERT_PTR(up);
+    QW6_ASSERT_PTR(mid); QW6_ASSERT_PTR(tmp); QW6_ASSERT_PTR(out);
+
+    int rc = qw6_tensor_dequantize_row(&m->tok_embeddings, 0, hidden);
+    if (rc == 0) rc = qw6_tensor_dequantize_row(&m->layers[0].norm, 0, norm_w);
+    if (rc == 0) {
+        qw6_cpu_rmsnorm(normed, hidden, norm_w, QW6_HIDDEN_SIZE);
+        rc = qw6_tensor_matvec(router_logits, &m->layers[0].moe_router,
+                               normed, QW6_NUM_EXPERTS);
+    }
+    if (rc == 0) {
+        qw6_cpu_moe_route(idx, w, router_logits,
+                          QW6_NUM_EXPERTS, QW6_EXPERTS_PER_TOK);
+        for (int e = 0; e < QW6_EXPERTS_PER_TOK && rc == 0; e++) {
+            const int expert = idx[e];
+            rc = qw6_tensor_matvec(gate, &m->layers[0].expert_gate[expert],
+                                   normed, QW6_MOE_INTER);
+            if (rc == 0) rc = qw6_tensor_matvec(up, &m->layers[0].expert_up[expert],
+                                                normed, QW6_MOE_INTER);
+            if (rc == 0) {
+                for (int i = 0; i < QW6_MOE_INTER; i++) mid[i] = qw6_silu(gate[i]) * up[i];
+                rc = qw6_tensor_matvec(tmp, &m->layers[0].expert_down[expert],
+                                       mid, QW6_HIDDEN_SIZE);
+            }
+            if (rc == 0)
+                for (int i = 0; i < QW6_HIDDEN_SIZE; i++) out[i] += w[e] * tmp[i];
+        }
+    }
+
+    if (rc == 0) {
+        double sum = 0.0, abs_sum = 0.0, max_abs = 0.0;
+        for (int i = 0; i < QW6_HIDDEN_SIZE; i++) {
+            double v = out[i], av = fabs(v);
+            sum += v; abs_sum += av; if (av > max_abs) max_abs = av;
+        }
+        fprintf(stderr,
+                "qw6: probe layer0 routed ffn sum=%.6f abs=%.6f max=%.6f first=%.6f\n",
+                sum, abs_sum, max_abs, out[0]);
+    }
+
+    free(hidden); free(norm_w); free(normed); free(router_logits);
+    free(gate); free(up); free(mid); free(tmp); free(out);
+    return rc;
+}
+
+static float qw6_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+static float qw6_softplus(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return expf(x);
+    return log1pf(expf(x));
+}
+
+static void qw6_l2_norm_heads(float *x, int heads, int dim) {
+    for (int h = 0; h < heads; h++) {
+        float ss = 0.0f;
+        float *row = x + h * dim;
+        for (int i = 0; i < dim; i++) ss += row[i] * row[i];
+        float scale = 1.0f / sqrtf(ss + QW6_RMS_EPS);
+        for (int i = 0; i < dim; i++) row[i] *= scale;
+    }
+}
+
+static int qw6_ssm_conv1d_single(float *out, const qw6_tensor_t *conv,
+                                 const float *current) {
+    QW6_ASSERT_PTR(out); QW6_ASSERT_PTR(conv); QW6_ASSERT_PTR(current);
+    if (!conv->data || conv->quant != QW6_Q_FP32 ||
+        conv->rows != QW6_LINEAR_QKV_DIM || conv->cols != QW6_CONV1D_KERNEL)
+        return -1;
+
+    const float *w = (const float *)conv->data;
+    for (int c = 0; c < QW6_LINEAR_QKV_DIM; c++) {
+        out[c] = current[c] * w[c * QW6_CONV1D_KERNEL + (QW6_CONV1D_KERNEL - 1)];
+    }
+    return 0;
+}
+
+static void qw6_gated_delta_net_single(float *out, float *state,
+                                       const float *q16, const float *k16,
+                                       const float *v, const float *gate,
+                                       const float *beta) {
+    const float scale = 1.0f / sqrtf((float)QW6_VALUE_HEAD_DIM);
+    for (int vh = 0; vh < QW6_NUM_VALUE_HEADS; vh++) {
+        const int kh = vh % QW6_NUM_KEY_HEADS;
+        const float *q = q16 + kh * QW6_KEY_HEAD_DIM;
+        const float *k = k16 + kh * QW6_KEY_HEAD_DIM;
+        const float *vv = v + vh * QW6_VALUE_HEAD_DIM;
+        float *oo = out + vh * QW6_VALUE_HEAD_DIM;
+        float *s = state + (size_t)vh * QW6_VALUE_HEAD_DIM * QW6_VALUE_HEAD_DIM;
+        float decay = expf(gate[vh]);
+        float b = beta[vh];
+
+        for (int j = 0; j < QW6_VALUE_HEAD_DIM; j++) {
+            float *row = s + j * QW6_VALUE_HEAD_DIM;
+            for (int i = 0; i < QW6_VALUE_HEAD_DIM; i++) row[i] *= decay;
+
+            float pred = 0.0f;
+            for (int i = 0; i < QW6_VALUE_HEAD_DIM; i++) pred += row[i] * k[i];
+            float delta = (vv[j] - pred) * b;
+            for (int i = 0; i < QW6_VALUE_HEAD_DIM; i++) row[i] += delta * k[i];
+
+            float sum = 0.0f;
+            for (int i = 0; i < QW6_VALUE_HEAD_DIM; i++) sum += row[i] * q[i];
+            oo[j] = sum * scale;
+        }
+    }
+}
+
+static int qw6_probe_layer0_deltanet_forward(qw6_model_t *m) {
+    QW6_ASSERT_PTR(m);
+    qw6_tensor_t *qkv_t = &m->layers[0].attn_q;
+    qw6_tensor_t *z_t = &m->layers[0].attn_gate;
+    qw6_tensor_t *alpha_t = &m->layers[0].dn_alpha;
+    qw6_tensor_t *beta_t = &m->layers[0].dn_beta;
+    qw6_tensor_t *out_t = &m->layers[0].dn_out;
+    if (!qkv_t->data || !z_t->data || !alpha_t->data || !beta_t->data ||
+        !m->layers[0].conv1d.data || !m->layers[0].dn_norm.data ||
+        !m->layers[0].dn_dt.data || !m->layers[0].dn_a.data || !out_t->data)
+        return -1;
+
+    float *hidden = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *norm_w = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *normed = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *qkv = calloc(QW6_LINEAR_QKV_DIM, sizeof(float));
+    float *conv = calloc(QW6_LINEAR_QKV_DIM, sizeof(float));
+    float *z = calloc(QW6_LINEAR_VALUE_DIM, sizeof(float));
+    float *beta = calloc(QW6_NUM_VALUE_HEADS, sizeof(float));
+    float *alpha = calloc(QW6_NUM_VALUE_HEADS, sizeof(float));
+    float *dt = calloc(QW6_NUM_VALUE_HEADS, sizeof(float));
+    float *a = calloc(QW6_NUM_VALUE_HEADS, sizeof(float));
+    float *dn_norm = calloc(QW6_VALUE_HEAD_DIM, sizeof(float));
+    float *gdn = calloc(QW6_LINEAR_VALUE_DIM, sizeof(float));
+    float *gated = calloc(QW6_LINEAR_VALUE_DIM, sizeof(float));
+    float *state = calloc((size_t)QW6_NUM_VALUE_HEADS * QW6_VALUE_HEAD_DIM * QW6_VALUE_HEAD_DIM,
+                          sizeof(float));
+    float *out = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    QW6_ASSERT_PTR(hidden); QW6_ASSERT_PTR(norm_w); QW6_ASSERT_PTR(normed);
+    QW6_ASSERT_PTR(qkv); QW6_ASSERT_PTR(conv); QW6_ASSERT_PTR(z);
+    QW6_ASSERT_PTR(beta); QW6_ASSERT_PTR(alpha); QW6_ASSERT_PTR(dt); QW6_ASSERT_PTR(a);
+    QW6_ASSERT_PTR(dn_norm); QW6_ASSERT_PTR(gdn); QW6_ASSERT_PTR(gated);
+    QW6_ASSERT_PTR(state); QW6_ASSERT_PTR(out);
+
+    int rc = qw6_tensor_dequantize_row(&m->tok_embeddings, 0, hidden);
+    if (rc == 0) rc = qw6_tensor_dequantize_row(&m->layers[0].norm, 0, norm_w);
+    if (rc == 0) {
+        qw6_cpu_rmsnorm(normed, hidden, norm_w, QW6_HIDDEN_SIZE);
+        rc = qw6_tensor_matvec(qkv, qkv_t, normed, QW6_LINEAR_QKV_DIM);
+    }
+    if (rc == 0) rc = qw6_tensor_matvec(z, z_t, normed, QW6_LINEAR_VALUE_DIM);
+    if (rc == 0) rc = qw6_tensor_matvec(beta, beta_t, normed, QW6_NUM_VALUE_HEADS);
+    if (rc == 0) rc = qw6_tensor_matvec(alpha, alpha_t, normed, QW6_NUM_VALUE_HEADS);
+    if (rc == 0) rc = qw6_tensor_dequantize_row(&m->layers[0].dn_dt, 0, dt);
+    if (rc == 0) rc = qw6_tensor_dequantize_row(&m->layers[0].dn_a, 0, a);
+    if (rc == 0) rc = qw6_tensor_dequantize_row(&m->layers[0].dn_norm, 0, dn_norm);
+    if (rc == 0) rc = qw6_ssm_conv1d_single(conv, &m->layers[0].conv1d, qkv);
+    if (rc == 0) {
+        for (int i = 0; i < QW6_LINEAR_QKV_DIM; i++) conv[i] = qw6_silu(conv[i]);
+        float *q = conv;
+        float *k = conv + QW6_NUM_KEY_HEADS * QW6_KEY_HEAD_DIM;
+        float *v = conv + 2 * QW6_NUM_KEY_HEADS * QW6_KEY_HEAD_DIM;
+        qw6_l2_norm_heads(q, QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM);
+        qw6_l2_norm_heads(k, QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM);
+        for (int h = 0; h < QW6_NUM_VALUE_HEADS; h++) {
+            beta[h] = qw6_sigmoid(beta[h]);
+            alpha[h] = qw6_softplus(alpha[h] + dt[h]) * a[h];
+        }
+        qw6_gated_delta_net_single(gdn, state, q, k, v, alpha, beta);
+        for (int h = 0; h < QW6_NUM_VALUE_HEADS; h++) {
+            float *dst = gated + h * QW6_VALUE_HEAD_DIM;
+            qw6_cpu_rmsnorm(dst, gdn + h * QW6_VALUE_HEAD_DIM, dn_norm, QW6_VALUE_HEAD_DIM);
+            for (int i = 0; i < QW6_VALUE_HEAD_DIM; i++)
+                dst[i] *= qw6_silu(z[h * QW6_VALUE_HEAD_DIM + i]);
+        }
+        rc = qw6_tensor_matvec(out, out_t, gated, QW6_HIDDEN_SIZE);
+    }
+    if (rc == 0) {
+        double sum = 0.0, abs_sum = 0.0, max_abs = 0.0;
+        for (int i = 0; i < QW6_HIDDEN_SIZE; i++) {
+            double v = out[i], av = fabs(v);
+            sum += v; abs_sum += av; if (av > max_abs) max_abs = av;
+        }
+        fprintf(stderr,
+                "qw6: probe layer0 deltanet forward sum=%.6f abs=%.6f max=%.6f first=%.6f\n",
+                sum, abs_sum, max_abs, out[0]);
+    }
+
+    free(hidden); free(norm_w); free(normed); free(qkv); free(conv); free(z);
+    free(beta); free(alpha); free(dt); free(a); free(dn_norm);
+    free(gdn); free(gated); free(state); free(out);
     return rc;
 }
 
@@ -2165,6 +2509,16 @@ int main(int argc, char **argv) {
         }
         if (qw6_probe_layer0_shared_ffn(&model) != 0) {
             fprintf(stderr, "qw6: native layer0 shared FFN probe failed\n");
+            qw6_model_free(&model);
+            return 1;
+        }
+        if (qw6_probe_layer0_routed_ffn(&model) != 0) {
+            fprintf(stderr, "qw6: native layer0 routed FFN probe failed\n");
+            qw6_model_free(&model);
+            return 1;
+        }
+        if (qw6_probe_layer0_deltanet_forward(&model) != 0) {
+            fprintf(stderr, "qw6: native layer0 DeltaNet forward probe failed\n");
             qw6_model_free(&model);
             return 1;
         }

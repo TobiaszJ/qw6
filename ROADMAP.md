@@ -29,7 +29,7 @@ forward pass can be checked against reference logits.
 - [x] packed routed-expert tensors split into per-expert views
 - [x] tokenizer encode/decode regression (`make test-tokenizer`)
 - [x] native dequant: F32, F16, BF16, Q4_K, Q5_K, Q6_K
-- [ ] native dequant: IQ2_XXS, IQ2_S, IQ3_S routed-expert formats
+- [x] native dequant: IQ2_XXS, IQ2_S, IQ3_S routed-expert formats
 - [x] generic native tensor MatVec for dequantized rows
 - [x] CPU kernels/probes:
   - [x] RMSNorm
@@ -42,8 +42,9 @@ forward pass can be checked against reference logits.
   - [x] MRoPE partial rotary reference kernel
   - [x] Gated Attention / GQA reference kernel
   - [x] attention QKV projection probe
-  - [ ] routed expert FFN gather
-  - [ ] full Gated DeltaNet layer forward
+  - [x] routed expert FFN gather
+  - [x] full Gated DeltaNet layer-0 forward probe
+  - [ ] full 40-layer forward to logits
   - [x] MTP draft layer reference kernel
 - [x] `qw6 --dump-tokens`
 - [x] `qw6 --load-only` native GGUF validation/dequant probe
@@ -54,7 +55,8 @@ forward pass can be checked against reference logits.
 
 **Current native probe path:** `./qw6 --load-only -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf`
 validates the GGUF, dequantizes real tensors, runs output/shared-expert MatVec,
-routes layer 0 top-8 experts, and runs the layer 0 shared FFN probe.
+routes layer 0 top-8 experts, runs routed/shared FFN probes, and executes a
+single-token layer-0 Gated DeltaNet forward probe through `ssm_out`.
 
 **Deliverable:** `./qw6 -p "Hello" --cpu` produces correct output matching Qwen
 reference logits.
