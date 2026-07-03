@@ -925,27 +925,46 @@ void qw6_cpu_conv1d_causal(float *out, const float *x, const void *conv_w,
 }
 
 void qw6_cpu_deltanet_update(float *state, const float *key,
-                             const float *value, float *query,
-                             int key_heads, int key_dim,
-                             int val_heads, int val_dim) {
+                              const float *value, const float *query,
+                              const float *beta,
+                              int key_heads, int key_dim,
+                              int val_heads, int val_dim) {
     QW6_ASSERT_PTR(state); QW6_ASSERT_PTR(key);
     QW6_ASSERT_PTR(value); QW6_ASSERT_PTR(query);
     QW6_ASSERT(key_heads > 0 && key_dim > 0, "key dims > 0");
-    QW6_ASSERT(val_heads > 0 && val_dim > 0, "value dims > 0");
+    QW6_ASSERT(val_heads > 0 && val_dim > 0, "val dims > 0");
 
-    /* Minimal CPU reference: additive key/value outer-product state.
-     * The production DeltaNet rule will add gating/normalisation later. */
+    /* Gated DeltaNet update (O(1) per token):
+     *   dot   = key[head] · query[head]
+     *   gate  = 1 / (1 + |beta[head] * dot|)
+     *   delta = value * gate
+     *   state += outer(key, delta)
+     * If beta is NULL, falls back to uniform beta=1.0 per head. */
     for (int kh = 0; kh < key_heads; kh++) {
         const float *k = key + kh * key_dim;
+        const float *q = query + kh * key_dim;
+        float b = beta ? beta[kh] : 1.0f;
+
+        /* dot(key, query) */
+        float dot = 0.0f;
+        for (int kd = 0; kd < key_dim; kd++)
+            dot += k[kd] * q[kd];
+
+        /* gating */
+        float gate = 1.0f / (1.0f + fabsf(b * dot));
+
         for (int vh = 0; vh < val_heads; vh++) {
             const float *v = value + vh * val_dim;
             float *s = state + (size_t)(kh * key_dim * val_heads + vh) * val_dim;
-            for (int kd = 0; kd < key_dim; kd++)
-                for (int vd = 0; vd < val_dim; vd++)
-                    s[kd * val_dim + vd] += k[kd] * v[vd];
+
+            for (int kd = 0; kd < key_dim; kd++) {
+                float key_contrib = k[kd];
+                for (int vd = 0; vd < val_dim; vd++) {
+                    s[kd * val_dim + vd] += key_contrib * (v[vd] * gate);
+                }
+            }
         }
     }
-    (void)query;
 }
 
 void qw6_cpu_deltanet_retrieve(float *out, const float *state, const float *query,
@@ -1223,7 +1242,7 @@ static int selftest_deltanet(void) {
     float query[2] = {1.0f, 2.0f};
     float out[2] = {0};
 
-    qw6_cpu_deltanet_update(state, key, value, query, 1, 2, 1, 2);
+    qw6_cpu_deltanet_update(state, key, value, query, NULL, 1, 2, 1, 2);
     qw6_cpu_deltanet_retrieve(out, state, query, 1, 2, 1, 2);
 
     int fail = 0;

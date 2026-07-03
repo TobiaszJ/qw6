@@ -217,9 +217,10 @@ void qw6_cpu_matmul_iq2m(float *out, const void *w, const float *x,
 void qw6_cpu_conv1d_causal(float *out, const float *x, const void *conv_w,
                            int dim, int kernel_size);
 void qw6_cpu_deltanet_update(float *state, const float *key,
-                             const float *value, float *query,
-                             int key_heads, int key_dim,
-                             int val_heads, int val_dim);
+                              const float *value, const float *query,
+                              const float *beta,
+                              int key_heads, int key_dim,
+                              int val_heads, int val_dim);
 void qw6_cpu_deltanet_retrieve(float *out, const float *state, const float *query,
                                 int key_heads, int key_dim,
                                 int val_heads, int val_dim);
