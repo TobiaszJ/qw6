@@ -1396,6 +1396,34 @@ static int qw6_probe_layer0_shared_ffn(qw6_model_t *m) {
     return rc;
 }
 
+static int qw6_probe_layer0_attn_qkv(qw6_model_t *m) {
+    QW6_ASSERT_PTR(m);
+    qw6_tensor_t *qkv_t = &m->layers[0].attn_q;
+    if (!qkv_t->data) return -1;
+
+    float *hidden = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *norm_w = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *normed = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float qkv[8] = {0};
+    QW6_ASSERT_PTR(hidden); QW6_ASSERT_PTR(norm_w); QW6_ASSERT_PTR(normed);
+
+    int rc = qw6_tensor_dequantize_row(&m->tok_embeddings, 0, hidden);
+    if (rc == 0) rc = qw6_tensor_dequantize_row(&m->layers[0].norm, 0, norm_w);
+    if (rc == 0) {
+        qw6_cpu_rmsnorm(normed, hidden, norm_w, QW6_HIDDEN_SIZE);
+        rc = qw6_tensor_matvec(qkv, qkv_t, normed, 8);
+    }
+    if (rc == 0) {
+        fprintf(stderr,
+                "qw6: probe layer0 attn_qkv[0..7]=%.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f\n",
+                qkv[0], qkv[1], qkv[2], qkv[3],
+                qkv[4], qkv[5], qkv[6], qkv[7]);
+    }
+
+    free(hidden); free(norm_w); free(normed);
+    return rc;
+}
+
 /* ---- CPU Kernels (Phase 1: correctness, not speed) ---- */
 
 void qw6_cpu_rmsnorm(float *out, const float *x, const float *weight, int dim) {
@@ -1641,6 +1669,52 @@ void qw6_cpu_mrope(float *q, float *k, int q_dim, int kv_dim,
             kh[i + 1] = a * s + b * c;
         }
     }
+}
+
+/* ---- Gated Attention / GQA ---- */
+
+void qw6_cpu_attention_gqa(float *out, const float *q,
+                           const float *k_cache, const float *v_cache,
+                           int seq_len, int n_q_heads, int n_kv_heads,
+                           int head_dim) {
+    QW6_ASSERT_PTR(out); QW6_ASSERT_PTR(q);
+    QW6_ASSERT_PTR(k_cache); QW6_ASSERT_PTR(v_cache);
+    QW6_ASSERT(seq_len > 0 && head_dim > 0, "attention dims > 0");
+    QW6_ASSERT(n_q_heads > 0 && n_kv_heads > 0, "attention heads > 0");
+    QW6_ASSERT(n_q_heads % n_kv_heads == 0, "GQA ratio integral");
+
+    int group = n_q_heads / n_kv_heads;
+    float *scores = malloc((size_t)seq_len * sizeof(float));
+    QW6_ASSERT_PTR(scores);
+
+    for (int h = 0; h < n_q_heads; h++) {
+        int kv_h = h / group;
+        const float *qh = q + (size_t)h * head_dim;
+        float max_score = -INFINITY;
+
+        for (int t = 0; t < seq_len; t++) {
+            const float *kh = k_cache + ((size_t)t * n_kv_heads + kv_h) * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) dot += qh[d] * kh[d];
+            scores[t] = dot / sqrtf((float)head_dim);
+            if (scores[t] > max_score) max_score = scores[t];
+        }
+
+        float sum = 0.0f;
+        for (int t = 0; t < seq_len; t++) {
+            scores[t] = expf(scores[t] - max_score);
+            sum += scores[t];
+        }
+        for (int d = 0; d < head_dim; d++) out[(size_t)h * head_dim + d] = 0.0f;
+        for (int t = 0; t < seq_len; t++) {
+            const float w = scores[t] / sum;
+            const float *vh = v_cache + ((size_t)t * n_kv_heads + kv_h) * head_dim;
+            for (int d = 0; d < head_dim; d++)
+                out[(size_t)h * head_dim + d] += w * vh[d];
+        }
+    }
+
+    free(scores);
 }
 
 /* ---- MoE Routing ---- */
@@ -1916,6 +1990,39 @@ static int selftest_mrope(void) {
     return fail;
 }
 
+static int selftest_attention_gqa(void) {
+    const float q[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    const float k[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    const float v[4] = {2.0f, 4.0f, 6.0f, 8.0f};
+    float out[4] = {0};
+
+    qw6_cpu_attention_gqa(out, q, k, v, 2, 2, 1, 2);
+    float a = expf(1.0f / sqrtf(2.0f));
+    float w0 = a / (a + 1.0f);
+    float w1 = 1.0f / (a + 1.0f);
+
+    int fail = 0;
+    fail += selftest_close(out[0], w0 * 2.0f + w1 * 6.0f, 1e-6f, "gqa_h0_0");
+    fail += selftest_close(out[1], w0 * 4.0f + w1 * 8.0f, 1e-6f, "gqa_h0_1");
+    fail += selftest_close(out[2], w1 * 2.0f + w0 * 6.0f, 1e-6f, "gqa_h1_0");
+    fail += selftest_close(out[3], w1 * 4.0f + w0 * 8.0f, 1e-6f, "gqa_h1_1");
+    if (fail) fprintf(stderr, "self-test: attention GQA failed\n");
+    return fail;
+}
+
+static int selftest_mtp_draft(void) {
+    const float hidden[3] = {1.0f, -2.0f, 0.5f};
+    const float w[6] = {1.0f, 0.0f, 2.0f, -1.0f, 0.5f, 1.0f};
+    float logits[2] = {0};
+    qw6_cpu_mtp_draft(logits, hidden, w, 2, 3);
+
+    int fail = 0;
+    fail += selftest_close(logits[0], 2.0f, 1e-6f, "mtp[0]");
+    fail += selftest_close(logits[1], -1.5f, 1e-6f, "mtp[1]");
+    if (fail) fprintf(stderr, "self-test: mtp draft failed\n");
+    return fail;
+}
+
 static int selftest_softmax_argmax(void) {
     float x[3] = {1.0f, 2.0f, 3.0f};
     qw6_cpu_softmax(x, 3);
@@ -1947,6 +2054,8 @@ static int qw6_selftest(void) {
     fail += selftest_conv1d();
     fail += selftest_deltanet();
     fail += selftest_mrope();
+    fail += selftest_attention_gqa();
+    fail += selftest_mtp_draft();
     fail += selftest_softmax_argmax();
     fail += selftest_moe_route();
     if (fail) {
@@ -2056,6 +2165,11 @@ int main(int argc, char **argv) {
         }
         if (qw6_probe_layer0_shared_ffn(&model) != 0) {
             fprintf(stderr, "qw6: native layer0 shared FFN probe failed\n");
+            qw6_model_free(&model);
+            return 1;
+        }
+        if (qw6_probe_layer0_attn_qkv(&model) != 0) {
+            fprintf(stderr, "qw6: native layer0 attn_qkv probe failed\n");
             qw6_model_free(&model);
             return 1;
         }

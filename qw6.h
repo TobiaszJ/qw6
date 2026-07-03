@@ -242,6 +242,10 @@ void qw6_cpu_deltanet_retrieve(float *out, const float *state, const float *quer
 void qw6_cpu_mrope(float *q, float *k, int q_dim, int kv_dim,
                   int n_heads, int n_kv_heads,
                   uint32_t position, int rotary_dim);
+void qw6_cpu_attention_gqa(float *out, const float *q,
+                           const float *k_cache, const float *v_cache,
+                           int seq_len, int n_q_heads, int n_kv_heads,
+                           int head_dim);
 
 /* MoE routing */
 void qw6_cpu_moe_route(int *expert_indices, float *expert_weights,

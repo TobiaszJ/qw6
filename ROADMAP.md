@@ -39,11 +39,12 @@ forward pass can be checked against reference logits.
   - [x] MoE routing top-8 from 256
   - [x] shared expert FFN probe (gate/up/down)
   - [x] argmax / greedy sampling primitive
-  - [ ] MRoPE partial rotary
-  - [ ] Gated Attention / GQA
+  - [x] MRoPE partial rotary reference kernel
+  - [x] Gated Attention / GQA reference kernel
+  - [x] attention QKV projection probe
   - [ ] routed expert FFN gather
   - [ ] full Gated DeltaNet layer forward
-  - [ ] MTP draft layer
+  - [x] MTP draft layer reference kernel
 - [x] `qw6 --dump-tokens`
 - [x] `qw6 --load-only` native GGUF validation/dequant probe
 - [ ] `qw6 --dump-logits` / `--dump-logprobs`
