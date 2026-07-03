@@ -33,6 +33,22 @@ AMD designation.
 
 ## 2. OS and Kernel
 
+### 2.0 Current Development Board Snapshot
+
+The active development board used for the current native loader work is reachable
+as `teejay@192.168.1.150` and has been verified with:
+
+- Vulkan RADV device: `AMD BC-250 (RADV GFX1013)`
+- TTM pages limit: `4194304`
+- TTM page pool size: `4194304`
+- 16 GiB swap file enabled
+- CPU governor set to `performance`
+- default boot target set to `multi-user.target`
+
+The 40-CU unlock is not currently active on this board (`active_cu_number 24`).
+This does not block CPU reference work or native loader development, but it will
+matter for Vulkan performance validation.
+
 ### 2.1 Recommended Stack
 
 | Component | Version | Notes |

@@ -71,11 +71,16 @@
 typedef enum {
     QW6_Q_FP32 = 0,
     QW6_Q_FP16,
+    QW6_Q_BF16,
     QW6_Q_Q8_0,
     QW6_Q_Q4_K_M,
     QW6_Q_Q4_K_S,
+    QW6_Q_Q5_K,
+    QW6_Q_Q6_K,
     QW6_Q_Q3_K_M,
+    QW6_Q_IQ3_S,
     QW6_Q_IQ3_XXS,
+    QW6_Q_IQ2_S,
     QW6_Q_IQ2_M,
     QW6_Q_IQ2_XXS,
 } qw6_quant_t;
@@ -86,9 +91,12 @@ typedef struct {
     char name[128];
     uint32_t rows;
     uint32_t cols;
+    uint32_t ne[4];
+    uint32_t n_dims;
     qw6_quant_t quant;
     void *data;         /* quantised data ( 格式取决于 quant) */
     size_t data_size;   /* bytes */
+    uint64_t file_offset;
 } qw6_tensor_t;
 
 /* ---- Layer types ---- */
@@ -163,6 +171,9 @@ typedef struct {
     uint32_t max_context;
     uint32_t current_context;   /* number of tokens in cache */
     size_t total_weight_bytes;
+    void *weight_map;
+    size_t weight_map_size;
+    int weight_fd;
 } qw6_model_t;
 
 /* ---- Session ---- */
@@ -211,6 +222,8 @@ void qw6_cpu_matmul_q4km(float *out, const void *w, const float *x,
                          int rows, int cols);
 void qw6_cpu_matmul_iq2m(float *out, const void *w, const float *x,
                          int rows, int cols);
+int qw6_tensor_matvec(float *out, const qw6_tensor_t *t, const float *x,
+                      uint32_t max_rows);
 
 /* Gated DeltaNet operations */
 /* x is laid out as [kernel_size, dim] from newest sample to oldest sample. */
@@ -309,6 +322,16 @@ typedef enum {
     GGML_TYPE_IQ4_XS  = 23,
     GGML_TYPE_I8      = 24,
     GGML_TYPE_I16     = 25,
+    GGML_TYPE_I32     = 26,
+    GGML_TYPE_I64     = 27,
+    GGML_TYPE_F64     = 28,
+    GGML_TYPE_IQ1_M   = 29,
+    GGML_TYPE_BF16    = 30,
+    GGML_TYPE_Q4_0_4_4 = 31,
+    GGML_TYPE_Q4_0_4_8 = 32,
+    GGML_TYPE_Q4_0_8_8 = 33,
+    GGML_TYPE_TQ1_0   = 34,
+    GGML_TYPE_TQ2_0   = 35,
 } ggml_type_t;
 
 /* GGUF metadata KV pair */
@@ -359,6 +382,7 @@ typedef struct {
     uint32_t tensors_parsed;
     uint32_t alignment;
     uint64_t data_offset;
+    uint64_t file_size;
 } gguf_ctx_t;
 
 /* API */

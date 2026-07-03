@@ -14,6 +14,7 @@ make test       # Run regression tests
 make test-tokenizer # Run tokenizer regression tests when tokenizer data is available
 make bench      # Run benchmarks
 ./qw6 --self-test # Run CPU self-tests without model/tokenizer data
+./qw6 --load-only -m model.gguf # Validate and probe native GGUF weight access
 ```
 
 **CPU build** works on any Linux machine. It is for correctness checking only —
@@ -55,13 +56,22 @@ make test
 # Optional tokenizer regression test (requires tokenizer/tokenizer.json):
 make test-tokenizer
 
+# Native Qwen3.6 GGUF loader/dequant probe:
+./qw6 --load-only -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf
+
 # Planned full regression runner:
 ./qw6_test --logprob-vectors      # Compare local logprobs vs API test vectors
 ./qw6_test --server               # Server API smoke test
 ```
 
-A regression test failure means tokeniser, template, attention, or DeltaNet
-state has diverged from the reference. Fix before submitting a PR.
+`--load-only` currently validates the Qwen3.6 GGUF metadata, maps real tensor
+data, dequantizes supported formats, runs native MatVec probes, routes layer 0
+experts, and runs the layer 0 shared-FFN probe. It does not yet perform full
+native generation.
+
+A regression test failure means tokenizer, tensor loading, quantization,
+template handling, attention, or DeltaNet state has diverged from the reference.
+Fix before submitting a PR.
 
 ### Debugging
 
@@ -96,6 +106,7 @@ Following the project's coding standards:
 - [ ] `make cpu` succeeds
 - [ ] `make test` passes (tokenizer-free CPU self-test)
 - [ ] `make test-tokenizer` passes when `tokenizer/tokenizer.json` is available
+- [ ] `./qw6 --load-only -m <Qwen3.6 GGUF>` passes when real weights are available
 - [ ] Logprob vector tests pass once Phase 1 inference is complete
 - [ ] Style: 60-line function limit, 2+ assertions per function, strict linter
 - [ ] No new memory leaks (`valgrind --leak-check=full ./qw6 --cpu -p "test"`)

@@ -5,6 +5,32 @@ C program that runs Qwen 3.6-35B-A3B on an AMD BC-250 using Vulkan compute.
 
 ---
 
+## Current Implementation Status
+
+`qw6` is still pre-alpha. The current code is building the native CPU reference
+path before the Vulkan backend:
+
+- GGUF v3 metadata parsing and Qwen3.6 model validation are implemented.
+- Unsloth/llama.cpp `qwen35moe` GGUF layouts are supported for tensor indexing.
+- Model weights are accessed through `mmap`; tensors store real file offsets,
+  shapes, quant types, byte spans, and data pointers.
+- Packed 3D routed-expert tensors are split into per-expert views.
+- Native dequantization currently covers F32, F16, BF16, Q4_K, Q5_K, and Q6_K.
+- Native probes run output projection MatVec, layer-0 RMSNorm, router top-k, and
+  shared-expert FFN against real Qwen3.6 weights.
+
+Not yet implemented:
+
+- native IQ2_XXS, IQ2_S, and IQ3_S dequantization for routed experts
+- full routed MoE forward pass
+- full Gated DeltaNet / GQA layer forward
+- end-to-end native token generation
+
+The old experimental external `llama.cpp` generation bridge is not part of the
+native engine path.
+
+---
+
 ## 1. Model Architecture: Qwen 3.6-35B-A3B
 
 ### 1.1 Overview

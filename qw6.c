@@ -24,6 +24,10 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <inttypes.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
 
 /* ---- Assertions ---- */
 
@@ -36,6 +40,10 @@
 } while (0)
 
 #define QW6_ASSERT_PTR(p) QW6_ASSERT((p) != NULL, "null pointer: " #p)
+
+#ifndef QW6_QK_K
+#define QW6_QK_K 256
+#endif
 
 /* ---- GGUF reader ---- */
 
@@ -293,6 +301,16 @@ static const char *ggml_type_name(ggml_type_t t) {
         case GGML_TYPE_IQ4_XS:  return "IQ4_XS";
         case GGML_TYPE_I8:      return "I8";
         case GGML_TYPE_I16:     return "I16";
+        case GGML_TYPE_I32:     return "I32";
+        case GGML_TYPE_I64:     return "I64";
+        case GGML_TYPE_F64:     return "F64";
+        case GGML_TYPE_IQ1_M:   return "IQ1_M";
+        case GGML_TYPE_BF16:    return "BF16";
+        case GGML_TYPE_Q4_0_4_4: return "Q4_0_4_4";
+        case GGML_TYPE_Q4_0_4_8: return "Q4_0_4_8";
+        case GGML_TYPE_Q4_0_8_8: return "Q4_0_8_8";
+        case GGML_TYPE_TQ1_0:   return "TQ1_0";
+        case GGML_TYPE_TQ2_0:   return "TQ2_0";
         default: return "?";
     }
 }
@@ -302,14 +320,213 @@ static bool qw6_gguf_type_supported(ggml_type_t t) {
     switch (t) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_S:
             return true;
         default:
             return false;
     }
+}
+
+static qw6_quant_t qw6_gguf_to_quant(ggml_type_t t);
+
+static uint64_t qw6_file_size(FILE *f) {
+    QW6_ASSERT_PTR(f);
+    long here = ftell(f);
+    if (here < 0) return 0;
+    if (fseek(f, 0, SEEK_END) != 0) return 0;
+    long end = ftell(f);
+    if (fseek(f, here, SEEK_SET) != 0) return 0;
+    return end < 0 ? 0 : (uint64_t)end;
+}
+
+static uint64_t gguf_tensor_span(const gguf_ctx_t *ctx, uint32_t i,
+                                 uint64_t file_size) {
+    QW6_ASSERT_PTR(ctx);
+    QW6_ASSERT(i < ctx->tensors_parsed, "tensor index in range");
+
+    uint64_t start = ctx->data_offset + ctx->tensors[i].offset;
+    uint64_t end = file_size;
+    for (uint32_t j = 0; j < ctx->tensors_parsed; j++) {
+        uint64_t candidate = ctx->data_offset + ctx->tensors[j].offset;
+        if (candidate > start && candidate < end) end = candidate;
+    }
+    return end > start ? end - start : 0;
+}
+
+static int tensor_layer_index(const char *name) {
+    QW6_ASSERT_PTR(name);
+    if (strncmp(name, "blk.", 4) != 0) return -1;
+    char *end = NULL;
+    long idx = strtol(name + 4, &end, 10);
+    if (!end || *end != '.') return -1;
+    if (idx < 0 || idx >= QW6_NUM_LAYERS) return -1;
+    return (int)idx;
+}
+
+static void qw6_tensor_bind(qw6_tensor_t *dst, const gguf_tensor_info_t *ti,
+                            uint8_t *base, uint64_t abs_offset,
+                            uint64_t span) {
+    QW6_ASSERT_PTR(dst);
+    QW6_ASSERT_PTR(ti);
+    snprintf(dst->name, sizeof(dst->name), "%s", ti->name);
+    dst->n_dims = ti->n_dims;
+    for (uint32_t i = 0; i < GGUF_MAX_DIMS; i++)
+        dst->ne[i] = i < ti->n_dims ? (uint32_t)ti->dims[i] : 1u;
+    dst->cols = ti->n_dims > 0 ? (uint32_t)ti->dims[0] : 1u;
+    dst->rows = ti->n_dims > 1 ? (uint32_t)ti->dims[1] : 1u;
+    dst->file_offset = abs_offset;
+    dst->data_size = (size_t)span;
+    dst->data = base ? (void *)(base + abs_offset) : NULL;
+    dst->quant = qw6_gguf_to_quant(ti->type);
+}
+
+static bool name_has_suffix(const char *name, const char *suffix) {
+    QW6_ASSERT_PTR(name);
+    QW6_ASSERT_PTR(suffix);
+    size_t n = strlen(name), s = strlen(suffix);
+    return n >= s && strcmp(name + n - s, suffix) == 0;
+}
+
+static size_t qw6_quant_block_size(qw6_quant_t q) {
+    switch (q) {
+        case QW6_Q_FP32: return sizeof(float);
+        case QW6_Q_FP16:
+        case QW6_Q_BF16: return sizeof(uint16_t);
+        case QW6_Q_Q4_K_M:
+        case QW6_Q_Q4_K_S: return 144;
+        case QW6_Q_Q5_K: return 176;
+        case QW6_Q_Q6_K: return 210;
+        case QW6_Q_IQ2_XXS: return 66;
+        case QW6_Q_IQ2_S: return 74;
+        case QW6_Q_IQ3_S: return 110;
+        default: return 0;
+    }
+}
+
+static size_t qw6_tensor_row_size_for(qw6_quant_t q, uint32_t cols) {
+    size_t bs = qw6_quant_block_size(q);
+    if (bs == 0) return 0;
+    if (q == QW6_Q_FP32 || q == QW6_Q_FP16 || q == QW6_Q_BF16)
+        return (size_t)cols * bs;
+    if (cols % QW6_QK_K != 0) return 0;
+    return (size_t)(cols / QW6_QK_K) * bs;
+}
+
+static void bind_expert_pack(qw6_tensor_t *dst, const gguf_tensor_info_t *ti,
+                             uint8_t *base, uint64_t abs_offset,
+                             uint64_t span) {
+    QW6_ASSERT_PTR(dst); QW6_ASSERT_PTR(ti);
+    if (ti->n_dims != 3 || ti->dims[2] != QW6_NUM_EXPERTS) return;
+
+    qw6_quant_t q = qw6_gguf_to_quant(ti->type);
+    uint32_t cols = (uint32_t)ti->dims[0];
+    uint32_t rows = (uint32_t)ti->dims[1];
+    size_t row_size = qw6_tensor_row_size_for(q, cols);
+    size_t expert_size = row_size * rows;
+    if (row_size == 0 || expert_size == 0 ||
+        expert_size * QW6_NUM_EXPERTS > span) return;
+
+    for (uint32_t e = 0; e < QW6_NUM_EXPERTS; e++) {
+        snprintf(dst[e].name, sizeof(dst[e].name), "%.100s#%03u", ti->name, e);
+        dst[e].cols = cols;
+        dst[e].rows = rows;
+        dst[e].n_dims = 2;
+        dst[e].ne[0] = cols;
+        dst[e].ne[1] = rows;
+        dst[e].ne[2] = 1;
+        dst[e].ne[3] = 1;
+        dst[e].quant = q;
+        dst[e].file_offset = abs_offset + (uint64_t)e * expert_size;
+        dst[e].data_size = expert_size;
+        dst[e].data = base ? (void *)(base + dst[e].file_offset) : NULL;
+    }
+}
+
+static int bind_layer_tensor(qw6_model_t *m, int layer,
+                             const gguf_tensor_info_t *ti,
+                             uint8_t *base, uint64_t abs_offset,
+                             uint64_t span) {
+    QW6_ASSERT_PTR(m);
+    QW6_ASSERT_PTR(ti);
+    QW6_ASSERT(layer >= 0 && layer < QW6_NUM_LAYERS, "layer in range");
+
+    char prefix[32];
+    snprintf(prefix, sizeof(prefix), "blk.%d.", layer);
+    const char *local = ti->name + strlen(prefix);
+    qw6_tensor_t *dst = NULL;
+
+    if (strcmp(local, "attn_norm.weight") == 0) dst = &m->layers[layer].norm;
+    else if (strcmp(local, "attn_qkv.weight") == 0) dst = &m->layers[layer].attn_q;
+    else if (strcmp(local, "attn_output.weight") == 0) dst = &m->layers[layer].attn_o;
+    else if (strcmp(local, "attn_gate.weight") == 0) dst = &m->layers[layer].attn_gate;
+    else if (strcmp(local, "ssm_conv1d.weight") == 0) dst = &m->layers[layer].conv1d;
+    else if (strcmp(local, "ssm_in.weight") == 0) dst = &m->layers[layer].dn_key;
+    else if (strcmp(local, "ssm_out.weight") == 0) dst = &m->layers[layer].dn_out;
+    else if (strcmp(local, "ssm_norm.weight") == 0) dst = &m->layers[layer].dn_norm;
+    else if (strcmp(local, "ffn_gate_inp.weight") == 0) dst = &m->layers[layer].moe_router;
+    else if (strcmp(local, "ffn_gate_exps.weight") == 0) {
+        bind_expert_pack(m->layers[layer].expert_gate, ti, base, abs_offset, span);
+        return 1;
+    } else if (strcmp(local, "ffn_up_exps.weight") == 0) {
+        bind_expert_pack(m->layers[layer].expert_up, ti, base, abs_offset, span);
+        return 1;
+    } else if (strcmp(local, "ffn_down_exps.weight") == 0) {
+        bind_expert_pack(m->layers[layer].expert_down, ti, base, abs_offset, span);
+        return 1;
+    }
+    else if (strcmp(local, "ffn_gate_shexp.weight") == 0) dst = &m->layers[layer].shared_gate;
+    else if (strcmp(local, "ffn_up_shexp.weight") == 0) dst = &m->layers[layer].shared_up;
+    else if (strcmp(local, "ffn_down_shexp.weight") == 0) dst = &m->layers[layer].shared_down;
+    else if (name_has_suffix(local, ".weight") &&
+             (strstr(local, "ssm_") || strstr(local, "ffn_") ||
+              strstr(local, "attn_"))) {
+        return 0;
+    }
+
+    if (!dst) return 0;
+    qw6_tensor_bind(dst, ti, base, abs_offset, span);
+    return 1;
+}
+
+static int qw6_validate_qwen_metadata(const gguf_ctx_t *ctx) {
+    QW6_ASSERT_PTR(ctx);
+    const gguf_kv_t *arch = qw6_gguf_find_kv(ctx, "general.architecture");
+    const gguf_kv_t *layers = qw6_gguf_find_kv(ctx, "qwen3_5_moe.block_count");
+    const gguf_kv_t *hidden = qw6_gguf_find_kv(ctx, "qwen3_5_moe.embedding_length");
+
+    if (!arch || arch->type != GGUF_TYPE_STRING) {
+        fprintf(stderr, "qw6: missing general.architecture\n");
+        return -1;
+    }
+    if (strcmp(arch->str, "qwen3_5_moe") != 0 &&
+        strcmp(arch->str, "qwen3.5moe") != 0 &&
+        strcmp(arch->str, "qwen35moe") != 0) {
+        fprintf(stderr, "qw6: expected qwen3_5_moe architecture, got %s\n",
+                arch->str);
+        return -1;
+    }
+    if (!layers) layers = qw6_gguf_find_kv(ctx, "qwen35moe.block_count");
+    if (!hidden) hidden = qw6_gguf_find_kv(ctx, "qwen35moe.embedding_length");
+    if (layers && layers->type == GGUF_TYPE_UINT32 &&
+        layers->val.u32 != QW6_NUM_LAYERS) {
+        fprintf(stderr, "qw6: expected %d layers, got %u\n",
+                QW6_NUM_LAYERS, layers->val.u32);
+        return -1;
+    }
+    if (hidden && hidden->type == GGUF_TYPE_UINT32 &&
+        hidden->val.u32 != QW6_HIDDEN_SIZE) {
+        fprintf(stderr, "qw6: expected hidden size %d, got %u\n",
+                QW6_HIDDEN_SIZE, hidden->val.u32);
+        return -1;
+    }
+    return 0;
 }
 
 /* Parse a GGUF file: header + metadata KV + tensor info table.
@@ -325,6 +542,7 @@ int qw6_gguf_parse(const char *path, gguf_ctx_t *ctx) {
         fprintf(stderr, "qw6: cannot open GGUF file: %s\n", path);
         return -1;
     }
+    ctx->file_size = qw6_file_size(f);
 
     /* --- Header --- */
     uint32_t magic, version;
@@ -525,10 +743,14 @@ static qw6_quant_t qw6_gguf_to_quant(ggml_type_t t) {
     switch (t) {
         case GGML_TYPE_F32:     return QW6_Q_FP32;
         case GGML_TYPE_F16:    return QW6_Q_FP16;
+        case GGML_TYPE_BF16:   return QW6_Q_BF16;
         case GGML_TYPE_Q8_0:   return QW6_Q_Q8_0;
+        case GGML_TYPE_Q5_K:   return QW6_Q_Q5_K;
+        case GGML_TYPE_Q6_K:   return QW6_Q_Q6_K;
         case GGML_TYPE_Q4_K:   return QW6_Q_Q4_K_M;
-        case GGML_TYPE_Q6_K:   return QW6_Q_Q4_K_M;  /* placeholder—add Q6_K to enum */
+        case GGML_TYPE_IQ2_S:  return QW6_Q_IQ2_S;
         case GGML_TYPE_IQ2_XXS: return QW6_Q_IQ2_XXS;
+        case GGML_TYPE_IQ3_S:  return QW6_Q_IQ3_S;
         default:                return QW6_Q_FP32;   /* safe fallback */
     }
 }
@@ -540,6 +762,10 @@ int qw6_gguf_read_file(const char *path, qw6_model_t *m) {
 
     gguf_ctx_t ctx;
     if (qw6_gguf_parse(path, &ctx) != 0) return -1;
+    if (qw6_validate_qwen_metadata(&ctx) != 0) {
+        qw6_gguf_free(&ctx);
+        return -1;
+    }
 
     /* Extract key metadata */
     const gguf_kv_t *kv;
@@ -569,44 +795,95 @@ int qw6_gguf_read_file(const char *path, qw6_model_t *m) {
     }
 
     /* Check all tensor types are supported */
+    int unsupported = 0;
     for (uint32_t i = 0; i < ctx.tensors_parsed; i++) {
         if (!qw6_gguf_type_supported(ctx.tensors[i].type)) {
             fprintf(stderr, "qw6: WARNING: tensor '%s' uses unsupported type %s\n",
                     ctx.tensors[i].name, ggml_type_name(ctx.tensors[i].type));
+            unsupported++;
         }
     }
 
-    /* For Phase 1: we only parse and report. Tensor data loading is next. */
+    /* Build a lightweight tensor index. Actual tensor bytes are loaded lazily
+     * by the future forward path; this keeps Phase 1 metadata checks cheap. */
     m->max_context = QW6_DEFAULT_CTX;
     m->total_weight_bytes = 0;
+    m->weight_fd = open(path, O_RDONLY);
+    if (m->weight_fd < 0) {
+        fprintf(stderr, "qw6: cannot open GGUF for mmap: %s\n", path);
+        qw6_gguf_free(&ctx);
+        return -1;
+    }
+    m->weight_map_size = (size_t)ctx.file_size;
+    m->weight_map = mmap(NULL, m->weight_map_size, PROT_READ, MAP_PRIVATE,
+                         m->weight_fd, 0);
+    if (m->weight_map == MAP_FAILED) {
+        fprintf(stderr, "qw6: mmap failed for GGUF weights\n");
+        close(m->weight_fd);
+        m->weight_fd = -1;
+        m->weight_map = NULL;
+        qw6_gguf_free(&ctx);
+        return -1;
+    }
+    uint8_t *weight_base = (uint8_t *)m->weight_map;
 
-    /* Calculate total tensor data size */
+    uint32_t layer_seen[QW6_NUM_LAYERS] = {0};
+    uint32_t ssm_tensors = 0, attn_tensors = 0, moe_tensors = 0;
+    uint32_t token_embd = 0, output = 0, output_norm = 0;
+
     for (uint32_t i = 0; i < ctx.tensors_parsed; i++) {
-        uint64_t elements = 1;
-        for (uint32_t d = 0; d < ctx.tensors[i].n_dims; d++)
-            elements *= (uint64_t)ctx.tensors[i].dims[d];
-
-        /* Approximate bytes per element by type */
-        size_t bpe = 0;
-        switch (ctx.tensors[i].type) {
-            case GGML_TYPE_F32:  bpe = 4; break;
-            case GGML_TYPE_F16:  bpe = 2; break;
-            case GGML_TYPE_Q8_0: bpe = 1; break;  /* 34 bytes per 32 elements */
-            case GGML_TYPE_Q4_K: bpe = 1; break;  /* approx */
-            case GGML_TYPE_Q6_K: bpe = 1; break;  /* approx */
-            default: bpe = 1; break;
+        const char *name = ctx.tensors[i].name;
+        uint64_t span = gguf_tensor_span(&ctx, i, ctx.file_size);
+        if (span > (uint64_t)SIZE_MAX - m->total_weight_bytes) {
+            fprintf(stderr, "qw6: tensor byte count overflow\n");
+            qw6_gguf_free(&ctx);
+            return -1;
         }
-        m->total_weight_bytes += (size_t)elements * bpe;
+        m->total_weight_bytes += (size_t)span;
+
+        if (strcmp(name, "token_embd.weight") == 0) token_embd++;
+        if (strcmp(name, "output.weight") == 0) output++;
+        if (strcmp(name, "output_norm.weight") == 0) output_norm++;
+        if (strstr(name, ".ssm_")) ssm_tensors++;
+        if (strstr(name, ".attn_")) attn_tensors++;
+        if (strstr(name, ".ffn_")) moe_tensors++;
+
+        int layer = tensor_layer_index(name);
+        if (layer >= 0) layer_seen[layer]++;
+
+        uint64_t abs_offset = ctx.data_offset + ctx.tensors[i].offset;
+        if (strcmp(name, "token_embd.weight") == 0)
+            qw6_tensor_bind(&m->tok_embeddings, &ctx.tensors[i],
+                            weight_base, abs_offset, span);
+        else if (strcmp(name, "output.weight") == 0)
+            qw6_tensor_bind(&m->output, &ctx.tensors[i],
+                            weight_base, abs_offset, span);
+        else if (layer >= 0)
+            (void)bind_layer_tensor(m, layer, &ctx.tensors[i],
+                                    weight_base, abs_offset, span);
     }
 
-    fprintf(stderr, "qw6: ~%zu MB tensor data (approximate)\n",
-            m->total_weight_bytes / (1024 * 1024));
+    uint32_t layers_with_tensors = 0;
+    for (uint32_t i = 0; i < QW6_NUM_LAYERS; i++)
+        if (layer_seen[i] > 0) layers_with_tensors++;
+
+    fprintf(stderr, "qw6: indexed %.2f GiB tensor data\n",
+            (double)m->total_weight_bytes / (1024.0 * 1024.0 * 1024.0));
+    fprintf(stderr, "qw6: tensor groups: emb=%u output=%u norm=%u layers=%u/%u attn=%u ssm=%u moe=%u\n",
+            token_embd, output, output_norm, layers_with_tensors,
+            QW6_NUM_LAYERS, attn_tensors, ssm_tensors, moe_tensors);
+
+    if (unsupported > 0 || token_embd != 1 || output != 1 ||
+        layers_with_tensors != QW6_NUM_LAYERS || ssm_tensors == 0 ||
+        attn_tensors == 0 || moe_tensors == 0) {
+        fprintf(stderr, "qw6: GGUF does not match required Qwen3.6 tensor layout\n");
+        qw6_gguf_free(&ctx);
+        return -1;
+    }
 
     qw6_gguf_free(&ctx);
-
-    /* Phase 1: metadata parsed, tensor data loading still TODO */
-    fprintf(stderr, "qw6: GGUF metadata parsed. Tensor data loading not yet implemented.\n");
-    return -1;  /* return -1 until tensor data is actually loaded */
+    fprintf(stderr, "qw6: GGUF tensor index ready (data loading is next Phase 1 step)\n");
+    return 0;
 }
 
 /* Inspect a GGUF file — print header + metadata + tensor table */
@@ -699,6 +976,7 @@ int qw6_model_load(qw6_model_t *m, const char *gguf_path) {
     QW6_ASSERT_PTR(gguf_path);
 
     memset(m, 0, sizeof(*m));
+    m->weight_fd = -1;
     m->max_context = QW6_DEFAULT_CTX;
     return qw6_gguf_read_file(gguf_path, m);
 }
@@ -706,39 +984,15 @@ int qw6_model_load(qw6_model_t *m, const char *gguf_path) {
 void qw6_model_free(qw6_model_t *m) {
     QW6_ASSERT_PTR(m);
 
-    if (m->tok_embeddings.data) free(m->tok_embeddings.data);
-    if (m->output.data) free(m->output.data);
-
     for (int i = 0; i < QW6_NUM_LAYERS; i++) {
-        if (m->layers[i].norm.data) free(m->layers[i].norm.data);
-        if (m->layers[i].attn_q.data) free(m->layers[i].attn_q.data);
-        if (m->layers[i].attn_k.data) free(m->layers[i].attn_k.data);
-        if (m->layers[i].attn_v.data) free(m->layers[i].attn_v.data);
-        if (m->layers[i].attn_o.data) free(m->layers[i].attn_o.data);
-        if (m->layers[i].attn_gate.data) free(m->layers[i].attn_gate.data);
-        if (m->layers[i].conv1d.data) free(m->layers[i].conv1d.data);
-        if (m->layers[i].dn_key.data) free(m->layers[i].dn_key.data);
-        if (m->layers[i].dn_value.data) free(m->layers[i].dn_value.data);
-        if (m->layers[i].dn_query.data) free(m->layers[i].dn_query.data);
-        if (m->layers[i].dn_out.data) free(m->layers[i].dn_out.data);
-        if (m->layers[i].dn_gate.data) free(m->layers[i].dn_gate.data);
-        if (m->layers[i].dn_norm.data) free(m->layers[i].dn_norm.data);
-        if (m->layers[i].moe_router.data) free(m->layers[i].moe_router.data);
-        for (int j = 0; j < QW6_NUM_EXPERTS; j++) {
-            if (m->layers[i].expert_gate[j].data) free(m->layers[i].expert_gate[j].data);
-            if (m->layers[i].expert_up[j].data) free(m->layers[i].expert_up[j].data);
-            if (m->layers[i].expert_down[j].data) free(m->layers[i].expert_down[j].data);
-        }
-        if (m->layers[i].shared_gate.data) free(m->layers[i].shared_gate.data);
-        if (m->layers[i].shared_up.data) free(m->layers[i].shared_up.data);
-        if (m->layers[i].shared_down.data) free(m->layers[i].shared_down.data);
         if (m->deltanet_state[i]) free(m->deltanet_state[i]);
         if (m->k_cache[i]) free(m->k_cache[i]);
         if (m->v_cache[i]) free(m->v_cache[i]);
     }
 
-    if (m->mtp.norm.data) free(m->mtp.norm.data);
-    if (m->mtp.embed.data) free(m->mtp.embed.data);
+    if (m->weight_map && m->weight_map != MAP_FAILED)
+        munmap(m->weight_map, m->weight_map_size);
+    if (m->weight_fd >= 0) close(m->weight_fd);
     memset(m, 0, sizeof(*m));
 }
 
@@ -756,20 +1010,8 @@ int qw6_session_init(qw6_session_t *s, qw6_model_t *m, uint32_t max_tokens) {
     s->logits = calloc(QW6_VOCAB_SIZE, sizeof(float));
     QW6_ASSERT_PTR(s->logits);
 
-    for (int i = 0; i < QW6_NUM_LAYERS; i++) {
-        if (qw6_layer_type(i) == QW6_LAYER_LINEAR_ATTN) {
-            size_t sz = (size_t)QW6_NUM_KEY_HEADS * QW6_KEY_HEAD_DIM *
-                        QW6_NUM_VALUE_HEADS * QW6_VALUE_HEAD_DIM;
-            m->deltanet_state[i] = calloc(sz, sizeof(float));
-            QW6_ASSERT_PTR(m->deltanet_state[i]);
-        } else {
-            size_t kv_sz = (size_t)m->max_context * QW6_NUM_KV_HEADS * QW6_HEAD_DIM;
-            m->k_cache[i] = calloc(kv_sz, sizeof(float));
-            m->v_cache[i] = calloc(kv_sz, sizeof(float));
-            QW6_ASSERT_PTR(m->k_cache[i]);
-            QW6_ASSERT_PTR(m->v_cache[i]);
-        }
-    }
+    /* Runtime caches are intentionally lazy in Phase 1. The forward path is
+     * still stubbed, so eager DeltaNet/KV allocation would only waste memory. */
     return 0;
 }
 
@@ -778,6 +1020,380 @@ void qw6_session_free(qw6_session_t *s) {
     if (s->tokens) free(s->tokens);
     if (s->logits) free(s->logits);
     memset(s, 0, sizeof(*s));
+}
+
+/* ---- Native GGML block dequantization ---- */
+
+#ifndef QW6_QK_K
+#define QW6_QK_K 256
+#endif
+#define QW6_K_SCALE_SIZE 12
+
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t scales[QW6_K_SCALE_SIZE];
+    uint8_t qs[QW6_QK_K / 2];
+} qw6_block_q4_k_t;
+
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t scales[QW6_K_SCALE_SIZE];
+    uint8_t qh[QW6_QK_K / 8];
+    uint8_t qs[QW6_QK_K / 2];
+} qw6_block_q5_k_t;
+
+typedef struct {
+    uint8_t ql[QW6_QK_K / 2];
+    uint8_t qh[QW6_QK_K / 4];
+    int8_t scales[QW6_QK_K / 16];
+    uint16_t d;
+} qw6_block_q6_k_t;
+
+static float qw6_fp16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    uint32_t exp = (h >> 10) & 0x1f;
+    uint32_t mant = h & 0x03ff;
+    uint32_t out;
+
+    if (exp == 0) {
+        if (mant == 0) out = sign;
+        else {
+            exp = 1;
+            while ((mant & 0x0400) == 0) { mant <<= 1; exp--; }
+            mant &= 0x03ff;
+            out = sign | ((exp + 112) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        out = sign | 0x7f800000u | (mant << 13);
+    } else {
+        out = sign | ((exp + 112) << 23) | (mant << 13);
+    }
+
+    float f;
+    memcpy(&f, &out, sizeof(f));
+    return f;
+}
+
+static float qw6_bf16_to_f32(uint16_t h) {
+    uint32_t u = (uint32_t)h << 16;
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+static void qw6_get_scale_min_k4(int j, const uint8_t *q, uint8_t *d,
+                                 uint8_t *m) {
+    QW6_ASSERT_PTR(q); QW6_ASSERT_PTR(d); QW6_ASSERT_PTR(m);
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0x0f) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+static int qw6_dequantize_row_q4_k(const void *src, float *dst, int k) {
+    QW6_ASSERT_PTR(src); QW6_ASSERT_PTR(dst);
+    QW6_ASSERT(k > 0 && k % QW6_QK_K == 0, "q4_k row multiple");
+    const qw6_block_q4_k_t *x = (const qw6_block_q4_k_t *)src;
+    int nb = k / QW6_QK_K;
+
+    for (int i = 0; i < nb; i++) {
+        const uint8_t *q = x[i].qs;
+        const float d = qw6_fp16_to_f32(x[i].d);
+        const float min = qw6_fp16_to_f32(x[i].dmin);
+        int is = 0;
+        for (int j = 0; j < QW6_QK_K; j += 64) {
+            uint8_t sc, m;
+            qw6_get_scale_min_k4(is + 0, x[i].scales, &sc, &m);
+            float d1 = d * sc, m1 = min * m;
+            qw6_get_scale_min_k4(is + 1, x[i].scales, &sc, &m);
+            float d2 = d * sc, m2 = min * m;
+            for (int l = 0; l < 32; l++) *dst++ = d1 * (q[l] & 0x0f) - m1;
+            for (int l = 0; l < 32; l++) *dst++ = d2 * (q[l] >> 4) - m2;
+            q += 32;
+            is += 2;
+        }
+    }
+    return 0;
+}
+
+static int qw6_dequantize_row_q5_k(const void *src, float *dst, int k) {
+    QW6_ASSERT_PTR(src); QW6_ASSERT_PTR(dst);
+    QW6_ASSERT(k > 0 && k % QW6_QK_K == 0, "q5_k row multiple");
+    const qw6_block_q5_k_t *x = (const qw6_block_q5_k_t *)src;
+    int nb = k / QW6_QK_K;
+
+    for (int i = 0; i < nb; i++) {
+        const uint8_t *ql = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const float d = qw6_fp16_to_f32(x[i].d);
+        const float min = qw6_fp16_to_f32(x[i].dmin);
+        uint8_t u1 = 1, u2 = 2;
+        int is = 0;
+        for (int j = 0; j < QW6_QK_K; j += 64) {
+            uint8_t sc, m;
+            qw6_get_scale_min_k4(is + 0, x[i].scales, &sc, &m);
+            float d1 = d * sc, m1 = min * m;
+            qw6_get_scale_min_k4(is + 1, x[i].scales, &sc, &m);
+            float d2 = d * sc, m2 = min * m;
+            for (int l = 0; l < 32; l++)
+                *dst++ = d1 * ((ql[l] & 0x0f) + (qh[l] & u1 ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; l++)
+                *dst++ = d2 * ((ql[l] >> 4) + (qh[l] & u2 ? 16 : 0)) - m2;
+            ql += 32;
+            u1 <<= 2;
+            u2 <<= 2;
+            is += 2;
+        }
+    }
+    return 0;
+}
+
+static int qw6_dequantize_row_q6_k(const void *src, float *dst, int k) {
+    QW6_ASSERT_PTR(src); QW6_ASSERT_PTR(dst);
+    QW6_ASSERT(k > 0 && k % QW6_QK_K == 0, "q6_k row multiple");
+    const qw6_block_q6_k_t *x = (const qw6_block_q6_k_t *)src;
+    int nb = k / QW6_QK_K;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = qw6_fp16_to_f32(x[i].d);
+        const uint8_t *ql = x[i].ql;
+        const uint8_t *qh = x[i].qh;
+        const int8_t *sc = x[i].scales;
+        for (int n = 0; n < QW6_QK_K; n += 128) {
+            for (int l = 0; l < 32; l++) {
+                int q1 = ((ql[l +  0] & 0x0f) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int q2 = ((ql[l + 32] & 0x0f) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int q3 = ((ql[l +  0] >> 4)   | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int q4 = ((ql[l + 32] >> 4)   | (((qh[l] >> 6) & 3) << 4)) - 32;
+                dst[n + l +  0] = d * sc[(n / 16) + 0] * q1;
+                dst[n + l + 32] = d * sc[(n / 16) + 2] * q2;
+                dst[n + l + 64] = d * sc[(n / 16) + 4] * q3;
+                dst[n + l + 96] = d * sc[(n / 16) + 6] * q4;
+            }
+            ql += 64;
+            qh += 32;
+        }
+        dst += QW6_QK_K;
+    }
+    return 0;
+}
+
+static int qw6_tensor_dequantize_row(const qw6_tensor_t *t, uint32_t row,
+                                     float *dst) {
+    QW6_ASSERT_PTR(t); QW6_ASSERT_PTR(dst);
+    QW6_ASSERT(t->data != NULL, "tensor has data");
+    QW6_ASSERT(row < t->rows, "row in tensor");
+
+    uint32_t cols = t->cols;
+    if (t->quant == QW6_Q_FP32) {
+        const float *src = (const float *)t->data + (size_t)row * cols;
+        memcpy(dst, src, (size_t)cols * sizeof(float));
+        return 0;
+    }
+    if (t->quant == QW6_Q_FP16 || t->quant == QW6_Q_BF16) {
+        const uint16_t *src = (const uint16_t *)t->data + (size_t)row * cols;
+        for (uint32_t i = 0; i < cols; i++)
+            dst[i] = t->quant == QW6_Q_FP16 ? qw6_fp16_to_f32(src[i])
+                                            : qw6_bf16_to_f32(src[i]);
+        return 0;
+    }
+
+    size_t block_size = 0;
+    if (t->quant == QW6_Q_Q4_K_M || t->quant == QW6_Q_Q4_K_S)
+        block_size = sizeof(qw6_block_q4_k_t);
+    else if (t->quant == QW6_Q_Q5_K)
+        block_size = sizeof(qw6_block_q5_k_t);
+    else if (t->quant == QW6_Q_Q6_K)
+        block_size = sizeof(qw6_block_q6_k_t);
+    else
+        return -1;
+
+    QW6_ASSERT(cols % QW6_QK_K == 0, "k quant row multiple");
+    size_t row_size = (size_t)(cols / QW6_QK_K) * block_size;
+    const uint8_t *src = (const uint8_t *)t->data + (size_t)row * row_size;
+    if (t->quant == QW6_Q_Q4_K_M || t->quant == QW6_Q_Q4_K_S)
+        return qw6_dequantize_row_q4_k(src, dst, (int)cols);
+    if (t->quant == QW6_Q_Q5_K)
+        return qw6_dequantize_row_q5_k(src, dst, (int)cols);
+    return qw6_dequantize_row_q6_k(src, dst, (int)cols);
+}
+
+static int qw6_probe_tensor_row(const char *label, const qw6_tensor_t *t) {
+    QW6_ASSERT_PTR(label);
+    QW6_ASSERT_PTR(t);
+    if (!t->data || t->cols == 0 || t->rows == 0) {
+        fprintf(stderr, "qw6: probe %-18s unavailable\n", label);
+        return -1;
+    }
+
+    float *row = calloc(t->cols, sizeof(float));
+    QW6_ASSERT_PTR(row);
+    int rc = qw6_tensor_dequantize_row(t, 0, row);
+    if (rc != 0) {
+        fprintf(stderr, "qw6: probe %-18s unsupported quant=%d tensor=%s\n",
+                label, (int)t->quant, t->name);
+        free(row);
+        return -1;
+    }
+
+    double sum = 0.0, abs_sum = 0.0, max_abs = 0.0;
+    for (uint32_t i = 0; i < t->cols; i++) {
+        double v = row[i];
+        double av = fabs(v);
+        sum += v;
+        abs_sum += av;
+        if (av > max_abs) max_abs = av;
+    }
+    fprintf(stderr,
+            "qw6: probe %-18s quant=%d shape=[%u,%u] sum=%.6f abs=%.6f max=%.6f first=%.6f\n",
+            label, (int)t->quant, t->cols, t->rows,
+            sum, abs_sum, max_abs, row[0]);
+    free(row);
+    return 0;
+}
+
+static int qw6_model_probe_dequant(qw6_model_t *m) {
+    QW6_ASSERT_PTR(m);
+    int fail = 0;
+    fail += qw6_probe_tensor_row("output.weight", &m->output) != 0;
+    fail += qw6_probe_tensor_row("shared_gate", &m->layers[0].shared_gate) != 0;
+    fail += qw6_probe_tensor_row("shared_down", &m->layers[0].shared_down) != 0;
+    return fail == 0 ? 0 : -1;
+}
+
+int qw6_tensor_matvec(float *out, const qw6_tensor_t *t, const float *x,
+                      uint32_t max_rows) {
+    QW6_ASSERT_PTR(out); QW6_ASSERT_PTR(t); QW6_ASSERT_PTR(x);
+    QW6_ASSERT(t->cols > 0 && t->rows > 0, "tensor shape valid");
+
+    uint32_t rows = t->rows;
+    if (max_rows > 0 && max_rows < rows) rows = max_rows;
+    float *row = malloc((size_t)t->cols * sizeof(float));
+    QW6_ASSERT_PTR(row);
+
+    for (uint32_t r = 0; r < rows; r++) {
+        if (qw6_tensor_dequantize_row(t, r, row) != 0) {
+            free(row);
+            return -1;
+        }
+        float acc = 0.0f;
+        for (uint32_t c = 0; c < t->cols; c++) acc += row[c] * x[c];
+        out[r] = acc;
+    }
+
+    free(row);
+    return 0;
+}
+
+static int qw6_probe_matvec(qw6_model_t *m) {
+    QW6_ASSERT_PTR(m);
+    if (!m->tok_embeddings.data || !m->output.data) return -1;
+
+    float *hidden = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float logits[8] = {0};
+    QW6_ASSERT_PTR(hidden);
+
+    if (qw6_tensor_dequantize_row(&m->tok_embeddings, 0, hidden) != 0) {
+        free(hidden);
+        return -1;
+    }
+    if (qw6_tensor_matvec(logits, &m->output, hidden, 8) != 0) {
+        free(hidden);
+        return -1;
+    }
+
+    fprintf(stderr,
+            "qw6: probe native matvec logits[0..7]=%.5f %.5f %.5f %.5f %.5f %.5f %.5f %.5f\n",
+            logits[0], logits[1], logits[2], logits[3],
+            logits[4], logits[5], logits[6], logits[7]);
+    free(hidden);
+    return 0;
+}
+
+static int qw6_probe_layer0_router(qw6_model_t *m) {
+    QW6_ASSERT_PTR(m);
+    qw6_tensor_t *norm_t = &m->layers[0].norm;
+    qw6_tensor_t *router_t = &m->layers[0].moe_router;
+    if (!norm_t->data || !router_t->data) return -1;
+
+    float *hidden = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *norm_w = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *normed = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float router_logits[QW6_NUM_EXPERTS] = {0};
+    int expert_idx[QW6_EXPERTS_PER_TOK] = {0};
+    float expert_w[QW6_EXPERTS_PER_TOK] = {0};
+    QW6_ASSERT_PTR(hidden); QW6_ASSERT_PTR(norm_w); QW6_ASSERT_PTR(normed);
+
+    int rc = qw6_tensor_dequantize_row(&m->tok_embeddings, 0, hidden);
+    if (rc == 0) rc = qw6_tensor_dequantize_row(norm_t, 0, norm_w);
+    if (rc == 0) {
+        qw6_cpu_rmsnorm(normed, hidden, norm_w, QW6_HIDDEN_SIZE);
+        rc = qw6_tensor_matvec(router_logits, router_t, normed, QW6_NUM_EXPERTS);
+    }
+    if (rc == 0) {
+        qw6_cpu_moe_route(expert_idx, expert_w, router_logits,
+                          QW6_NUM_EXPERTS, QW6_EXPERTS_PER_TOK);
+        fprintf(stderr, "qw6: probe layer0 router top8:");
+        for (int i = 0; i < QW6_EXPERTS_PER_TOK; i++)
+            fprintf(stderr, " %d:%.4f", expert_idx[i], expert_w[i]);
+        fprintf(stderr, "\n");
+        const qw6_tensor_t *eg = &m->layers[0].expert_gate[expert_idx[0]];
+        fprintf(stderr,
+                "qw6: probe top expert gate tensor=%s quant=%d shape=[%u,%u] bytes=%zu\n",
+                eg->name, (int)eg->quant, eg->cols, eg->rows, eg->data_size);
+    }
+
+    free(hidden); free(norm_w); free(normed);
+    return rc;
+}
+
+static int qw6_probe_layer0_shared_ffn(qw6_model_t *m) {
+    QW6_ASSERT_PTR(m);
+    qw6_tensor_t *gate_t = &m->layers[0].shared_gate;
+    qw6_tensor_t *up_t = &m->layers[0].shared_up;
+    qw6_tensor_t *down_t = &m->layers[0].shared_down;
+    if (!gate_t->data || !up_t->data || !down_t->data) return -1;
+
+    float *hidden = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *norm_w = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *normed = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *gate = calloc(QW6_SHARED_INTER, sizeof(float));
+    float *up = calloc(QW6_SHARED_INTER, sizeof(float));
+    float *mid = calloc(QW6_SHARED_INTER, sizeof(float));
+    float *out = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    QW6_ASSERT_PTR(hidden); QW6_ASSERT_PTR(norm_w); QW6_ASSERT_PTR(normed);
+    QW6_ASSERT_PTR(gate); QW6_ASSERT_PTR(up); QW6_ASSERT_PTR(mid); QW6_ASSERT_PTR(out);
+
+    int rc = qw6_tensor_dequantize_row(&m->tok_embeddings, 0, hidden);
+    if (rc == 0) rc = qw6_tensor_dequantize_row(&m->layers[0].norm, 0, norm_w);
+    if (rc == 0) {
+        qw6_cpu_rmsnorm(normed, hidden, norm_w, QW6_HIDDEN_SIZE);
+        rc = qw6_tensor_matvec(gate, gate_t, normed, QW6_SHARED_INTER);
+    }
+    if (rc == 0) rc = qw6_tensor_matvec(up, up_t, normed, QW6_SHARED_INTER);
+    if (rc == 0) {
+        for (int i = 0; i < QW6_SHARED_INTER; i++) mid[i] = qw6_silu(gate[i]) * up[i];
+        rc = qw6_tensor_matvec(out, down_t, mid, QW6_HIDDEN_SIZE);
+    }
+    if (rc == 0) {
+        double sum = 0.0, abs_sum = 0.0, max_abs = 0.0;
+        for (int i = 0; i < QW6_HIDDEN_SIZE; i++) {
+            double v = out[i], av = fabs(v);
+            sum += v; abs_sum += av; if (av > max_abs) max_abs = av;
+        }
+        fprintf(stderr,
+                "qw6: probe layer0 shared ffn sum=%.6f abs=%.6f max=%.6f first=%.6f\n",
+                sum, abs_sum, max_abs, out[0]);
+    }
+
+    free(hidden); free(norm_w); free(normed); free(gate);
+    free(up); free(mid); free(out);
+    return rc;
 }
 
 /* ---- CPU Kernels (Phase 1: correctness, not speed) ---- */
@@ -1358,6 +1974,7 @@ static void usage(void) {
         "  --vulkan        Vulkan backend (Phase 2)\n"
         "  --dump-tokens   Tokenise prompt and exit\n"
         "  --inspect-gguf  Inspect GGUF header and exit\n"
+        "  --load-only     Load and validate model metadata, then exit\n"
         "  --self-test     Run CPU kernel self-tests and exit\n"
         "  --bench         Run benchmark\n"
         "  -h, --help      This help\n\n"
@@ -1374,6 +1991,7 @@ int main(int argc, char **argv) {
     int ctx = QW6_DEFAULT_CTX;
     float temp = 0.0f;
     bool nothink = false, dump_tokens = false, bench = false, self_test = false;
+    bool load_only = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i+1 < argc) model_path = argv[++i];
@@ -1385,6 +2003,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--temp") == 0 && i+1 < argc) temp = (float)atof(argv[++i]);
         else if (strcmp(argv[i], "--nothink") == 0) nothink = true;
         else if (strcmp(argv[i], "--dump-tokens") == 0) dump_tokens = true;
+        else if (strcmp(argv[i], "--load-only") == 0) load_only = true;
         else if (strcmp(argv[i], "--self-test") == 0) self_test = true;
         else if (strcmp(argv[i], "--bench") == 0) bench = true;
         else if (strcmp(argv[i], "--cpu") == 0) { /* default */ }
@@ -1401,11 +2020,49 @@ int main(int argc, char **argv) {
     if (self_test) return qw6_selftest();
     if (inspect_path) return qw6_gguf_inspect_file(inspect_path);
 
-    if (!prompt && !bench) { fprintf(stderr, "qw6: -p <prompt> required\n"); return 1; }
+    if (!prompt && !bench && !load_only) {
+        fprintf(stderr, "qw6: -p <prompt> required\n");
+        return 1;
+    }
 
     fprintf(stderr, "qw6 %s -- Phase %d (CPU reference)\n", QW6_VERSION, QW6_BUILD_PHASE);
     fprintf(stderr, "Model: Qwen 3.6-35B-A3B (35B total, 3B active, 256 experts)\n");
     fprintf(stderr, "Architecture: hybrid attention (30 Gated DeltaNet + 10 Gated Attention)\n\n");
+
+    if (load_only) {
+        if (!model_path) {
+            fprintf(stderr, "qw6: -m <model.gguf> required for --load-only\n");
+            return 1;
+        }
+        qw6_model_t model;
+        if (qw6_model_load(&model, model_path) != 0) {
+            fprintf(stderr, "qw6: model metadata validation failed\n");
+            return 1;
+        }
+        if (qw6_model_probe_dequant(&model) != 0) {
+            fprintf(stderr, "qw6: model tensor dequant probe failed\n");
+            qw6_model_free(&model);
+            return 1;
+        }
+        if (qw6_probe_matvec(&model) != 0) {
+            fprintf(stderr, "qw6: native matvec probe failed\n");
+            qw6_model_free(&model);
+            return 1;
+        }
+        if (qw6_probe_layer0_router(&model) != 0) {
+            fprintf(stderr, "qw6: native layer0 router probe failed\n");
+            qw6_model_free(&model);
+            return 1;
+        }
+        if (qw6_probe_layer0_shared_ffn(&model) != 0) {
+            fprintf(stderr, "qw6: native layer0 shared FFN probe failed\n");
+            qw6_model_free(&model);
+            return 1;
+        }
+        fprintf(stderr, "qw6: model metadata validation passed\n");
+        qw6_model_free(&model);
+        return 0;
+    }
 
     /* Load tokenizer */
     qw6_tokenizer_t tokenizer;

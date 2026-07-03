@@ -38,9 +38,23 @@ project builds on top of that.
 
 ## Status
 
-**Pre-alpha. CPU reference scaffolding, tokenizer work, design, and documentation phase.**
+**Pre-alpha. Native CPU reference path in progress.**
 
-Full inference is not functional yet. The repository currently contains early CPU engine code, a tokenizer implementation, CLI scaffolding, kernel stubs, and design documentation:
+Full end-to-end generation is not functional yet, but `qw6` now performs real
+native work against Qwen 3.6 GGUF weights:
+
+- GGUF v3 metadata parsing and model validation for Unsloth/llama.cpp Qwen3.6 layouts (`qwen35moe`)
+- `mmap`-backed weight access with tensor offsets, shapes, quant types, and byte spans
+- packed routed-expert tensors split into per-expert views
+- tokenizer loading and token dump path
+- CPU kernels and probes for RMSNorm, top-k MoE routing, shared-expert FFN, and native matvec
+- native dequantization for F32, F16, BF16, Q4_K, Q5_K, and Q6_K
+
+Routed expert formats `IQ2_XXS`, `IQ2_S`, and `IQ3_S` still need native
+decoders before routed MoE and full forward inference can run.
+
+The repository currently contains CPU engine code, tokenizer implementation,
+native GGUF loader/indexing, kernel scaffolding, and design documentation:
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — Engine design (Vulkan compute pipeline, MoE routing, Gated DeltaNet, Gated Attention, MTP, server API)
 - [MODEL_CARD.md](MODEL_CARD.md) — Qwen 3.6-35B-A3B specifications, tensor layout, quantisation plan
@@ -55,6 +69,18 @@ tokenizer test vectors:
 make test        # builds qw6 and runs ./qw6 --self-test
 ./qw6 --inspect-gguf model.gguf  # inspect a GGUF header without loading tensors
 ```
+
+With real Qwen3.6 GGUF weights available, the native loader/dequant probes can
+be run with:
+
+```bash
+./qw6 --load-only -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf
+```
+
+Expected current behavior: model metadata validation passes and native probes
+print tensor checksums, router top-k experts, and shared-FFN summary values.
+Normal prompt generation is still a Phase 1 TODO until the remaining native
+forward path is implemented.
 
 ## Acknowledgements
 

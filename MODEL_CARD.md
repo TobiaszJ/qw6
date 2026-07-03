@@ -164,6 +164,39 @@ Chat template: ChatML-style with Qwen extensions for thinking and tool calling.
 
 ## 3. Tensor Layout (qw6 GGUF)
 
+### 3.0 Current Supported GGUF Layout
+
+The current native loader supports the Unsloth/llama.cpp GGUF naming used by
+`unsloth/Qwen3.6-35B-A3B-GGUF`:
+
+```
+general.architecture = "qwen35moe"
+
+token_embd.weight
+output.weight
+output_norm.weight
+
+blk.{i}.attn_norm.weight
+blk.{i}.attn_qkv.weight
+blk.{i}.attn_output.weight
+blk.{i}.attn_gate.weight
+
+blk.{i}.ssm_*.weight / blk.{i}.ssm_* parameters
+
+blk.{i}.ffn_gate_inp.weight
+blk.{i}.ffn_gate_exps.weight       # packed [hidden, inter, 256]
+blk.{i}.ffn_up_exps.weight         # packed [hidden, inter, 256]
+blk.{i}.ffn_down_exps.weight       # packed [inter, hidden, 256]
+blk.{i}.ffn_gate_shexp.weight
+blk.{i}.ffn_up_shexp.weight
+blk.{i}.ffn_down_shexp.weight
+```
+
+The loader maps packed routed-expert tensors into 256 per-expert views without
+copying. Native dequantization currently supports F32, F16, BF16, Q4_K, Q5_K,
+and Q6_K. Routed expert IQ2/IQ3 formats are the next required step for full
+native MoE inference.
+
 ### 3.1 Naming Convention
 
 ```
