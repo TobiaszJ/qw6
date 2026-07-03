@@ -51,7 +51,7 @@
 #define QW6_MTP_LAYERS         1
 
 /* MRoPE */
-#define QW6_PARTIAL_ROTY       0.25f
+#define QW6_PARTIAL_ROTARY      0.25f
 #define QW6_MROPE_SECTIONS      3
 #define QW6_MROPE_SEC_T        11
 #define QW6_MROPE_SEC_H        11
@@ -198,6 +198,7 @@ int qw6_token_decode(const uint32_t *tokens, uint32_t n, char **out_text);
 void qw6_cpu_rmsnorm(float *out, const float *x, const float *weight, int dim);
 void qw6_cpu_matmul_f16(float *out, const void *w, const float *x,
                         int rows, int cols, qw6_quant_t quant);
+/* CPU reference Q8 layout: [rows float scales][rows*cols int8 weights]. */
 void qw6_cpu_matmul_q8(float *out, const void *w, const float *x,
                        int rows, int cols);
 void qw6_cpu_matmul_q4km(float *out, const void *w, const float *x,
@@ -206,6 +207,7 @@ void qw6_cpu_matmul_iq2m(float *out, const void *w, const float *x,
                          int rows, int cols);
 
 /* Gated DeltaNet operations */
+/* x is laid out as [kernel_size, dim] from newest sample to oldest sample. */
 void qw6_cpu_conv1d_causal(float *out, const float *x, const void *conv_w,
                            int dim, int kernel_size);
 void qw6_cpu_deltanet_update(float *state, const float *key,
