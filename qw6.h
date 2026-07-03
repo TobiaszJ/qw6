@@ -252,8 +252,116 @@ static inline qw6_layer_type_t qw6_layer_type(int layer_idx) {
         : QW6_LAYER_LINEAR_ATTN;
 }
 
-/* GGUF reader (minimal, qw6-specific) */
+/* ---- GGUF reader ---- */
+
+#define GGUF_MAGIC       0x46554747u  /* "GGUF" little-endian */
+#define GGUF_VERSION     3u
+#define GGUF_MAX_TENSORS 4096
+#define GGUF_MAX_KV     512
+#define GGUF_MAX_DIMS   4
+#define GGUF_DEFAULT_ALIGNMENT 32u
+
+/* GGUF value types (match gguf.h enum) */
+typedef enum {
+    GGUF_TYPE_UINT8   = 0,
+    GGUF_TYPE_INT8    = 1,
+    GGUF_TYPE_UINT16  = 2,
+    GGUF_TYPE_INT16   = 3,
+    GGUF_TYPE_UINT32  = 4,
+    GGUF_TYPE_INT32   = 5,
+    GGUF_TYPE_FLOAT32 = 6,
+    GGUF_TYPE_BOOL    = 7,
+    GGUF_TYPE_STRING  = 8,
+    GGUF_TYPE_ARRAY   = 9,
+    GGUF_TYPE_UINT64  = 10,
+    GGUF_TYPE_INT64   = 11,
+    GGUF_TYPE_FLOAT64 = 12,
+} gguf_type_t;
+
+/* GGML tensor data types (subset, match ggml.h) */
+typedef enum {
+    GGML_TYPE_F32  = 0,
+    GGML_TYPE_F16  = 1,
+    GGML_TYPE_Q4_0 = 2,
+    GGML_TYPE_Q4_1 = 3,
+    GGML_TYPE_Q5_0 = 6,
+    GGML_TYPE_Q5_1 = 7,
+    GGML_TYPE_Q8_0 = 8,
+    GGML_TYPE_Q8_1 = 9,
+    GGML_TYPE_Q2_K = 10,
+    GGML_TYPE_Q3_K = 11,
+    GGML_TYPE_Q4_K = 12,
+    GGML_TYPE_Q5_K = 13,
+    GGML_TYPE_Q6_K = 14,
+    GGML_TYPE_Q8_K = 15,
+    GGML_TYPE_IQ2_XXS = 16,
+    GGML_TYPE_IQ2_XS  = 17,
+    GGML_TYPE_IQ3_XXS = 18,
+    GGML_TYPE_IQ1_S   = 19,
+    GGML_TYPE_IQ4_NL  = 20,
+    GGML_TYPE_IQ3_S   = 21,
+    GGML_TYPE_IQ2_S   = 22,
+    GGML_TYPE_IQ4_XS  = 23,
+    GGML_TYPE_I8      = 24,
+    GGML_TYPE_I16     = 25,
+} ggml_type_t;
+
+/* GGUF metadata KV pair */
+typedef struct {
+    char key[128];
+    gguf_type_t type;
+    union {
+        uint8_t  u8;
+        int8_t   i8;
+        uint16_t u16;
+        int16_t  i16;
+        uint32_t u32;
+        int32_t  i32;
+        float    f32;
+        bool     b;
+        uint64_t u64;
+        int64_t  i64;
+        double   f64;
+    } val;
+    /* For STRING type: points into raw data buffer */
+    char *str;       /* owned, null-terminated */
+    uint64_t str_len;
+
+    /* For ARRAY type */
+    gguf_type_t arr_type;
+    uint64_t arr_count;
+    void *arr_data;  /* owned, raw elements */
+    char **arr_strs; /* owned, for string arrays */
+} gguf_kv_t;
+
+/* GGUF tensor info */
+typedef struct {
+    char name[128];
+    uint32_t n_dims;
+    int64_t dims[GGUF_MAX_DIMS];
+    ggml_type_t type;
+    uint64_t offset;
+} gguf_tensor_info_t;
+
+/* GGUF context — result of parsing */
+typedef struct {
+    uint32_t version;
+    uint64_t tensor_count;
+    uint64_t kv_count;
+    gguf_kv_t kv[GGUF_MAX_KV];
+    uint32_t kv_parsed;
+    gguf_tensor_info_t tensors[GGUF_MAX_TENSORS];
+    uint32_t tensors_parsed;
+    uint32_t alignment;
+    uint64_t data_offset;
+} gguf_ctx_t;
+
+/* API */
 int qw6_gguf_read_file(const char *path, qw6_model_t *m);
+int qw6_gguf_parse(const char *path, gguf_ctx_t *ctx);
+void qw6_gguf_free(gguf_ctx_t *ctx);
+const gguf_kv_t *qw6_gguf_find_kv(const gguf_ctx_t *ctx, const char *key);
+ggml_type_t qw6_gguf_type_to_qw6(ggml_type_t ggml_type, qw6_quant_t *out_quant);
 
 /* Debug */
 void qw6_dump_tokens(const uint32_t *tokens, uint32_t n);
@@ -261,6 +369,6 @@ void qw6_dump_logits(const float *logits, int n, int top_k);
 
 /* Version */
 #define QW6_VERSION "0.0.1-prealpha"
-#define QW6_BUILD_PHASE 0  /* 0=research, 1=cpu-ref, 2=vulkan */
+#define QW6_BUILD_PHASE 1  /* 0=research, 1=cpu-ref, 2=vulkan */
 
 #endif /* QW6_H */

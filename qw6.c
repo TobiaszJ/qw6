@@ -37,58 +37,288 @@
 
 #define QW6_ASSERT_PTR(p) QW6_ASSERT((p) != NULL, "null pointer: " #p)
 
-/* ---- GGUF reader (minimal) ---- */
+/* ---- GGUF reader ---- */
 
-#define GGUF_MAGIC 0x46554747  /* "GGUF" little-endian */
+/* Note: GGUF_MAGIC, types, and structs are declared in qw6.h. */
 
-typedef struct {
-    uint32_t magic;
-    uint32_t version;
-    uint64_t tensor_count;
-    uint64_t metadata_kv_count;
-} gguf_header_t;
-
-int qw6_gguf_read_file(const char *path, qw6_model_t *m) {
-    QW6_ASSERT_PTR(path);
-    QW6_ASSERT_PTR(m);
-
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "qw6: cannot open model file: %s\n", path);
-        return -1;
+/* Size of a single GGUF scalar value (excluding strings/arrays) */
+static size_t gguf_type_size(gguf_type_t t) {
+    switch (t) {
+        case GGUF_TYPE_UINT8:   return 1;
+        case GGUF_TYPE_INT8:    return 1;
+        case GGUF_TYPE_UINT16:  return 2;
+        case GGUF_TYPE_INT16:   return 2;
+        case GGUF_TYPE_UINT32:  return 4;
+        case GGUF_TYPE_INT32:   return 4;
+        case GGUF_TYPE_FLOAT32: return 4;
+        case GGUF_TYPE_BOOL:    return 1;
+        case GGUF_TYPE_UINT64:  return 8;
+        case GGUF_TYPE_INT64:   return 8;
+        case GGUF_TYPE_FLOAT64: return 8;
+        default: return 0;  /* STRING and ARRAY are variable-size */
     }
-
-    gguf_header_t hdr;
-    if (fread(&hdr, sizeof(hdr), 1, f) != 1) {
-        fprintf(stderr, "qw6: cannot read GGUF header\n");
-        fclose(f);
-        return -1;
-    }
-
-    if (hdr.magic != GGUF_MAGIC) {
-        fprintf(stderr, "qw6: not a GGUF file (magic=0x%08x)\n", hdr.magic);
-        fclose(f);
-        return -1;
-    }
-
-    if (hdr.version != 3) {
-        fprintf(stderr, "qw6: unsupported GGUF version %u\n", hdr.version);
-        fclose(f);
-        return -1;
-    }
-
-    fprintf(stderr, "qw6: GGUF v%u, %llu tensors, %llu metadata KV pairs\n",
-            hdr.version,
-            (unsigned long long)hdr.tensor_count,
-            (unsigned long long)hdr.metadata_kv_count);
-
-    /* Phase 1 TODO: parse metadata KV pairs and tensor info */
-    fclose(f);
-    return -1;
 }
 
-static int qw6_gguf_inspect_file(const char *path) {
+/* Read a GGUF string: uint64_t length + chars (no null terminator) */
+static int gguf_read_str(FILE *f, char **out_str, uint64_t *out_len) {
+    QW6_ASSERT_PTR(f);
+    QW6_ASSERT_PTR(out_str);
+
+    uint64_t len;
+    if (fread(&len, sizeof(len), 1, f) != 1) {
+        fprintf(stderr, "qw6: GGUF string length read failed\n");
+        return -1;
+    }
+
+    /* Sanity-check: no string in a real GGUF should exceed 1MB */
+    if (len > (1u << 20)) {
+        fprintf(stderr, "qw6: GGUF string length %llu unreasonably large\n",
+                (unsigned long long)len);
+        return -1;
+    }
+
+    char *s = malloc((size_t)len + 1);
+    QW6_ASSERT_PTR(s);
+    if (len > 0 && fread(s, 1, (size_t)len, f) != (size_t)len) {
+        fprintf(stderr, "qw6: GGUF string data read failed\n");
+        free(s);
+        return -1;
+    }
+    s[len] = '\0';
+
+    *out_str = s;
+    if (out_len) *out_len = len;
+    return 0;
+}
+
+/* Read a single GGUF scalar value into a kv union */
+static int gguf_read_scalar(FILE *f, gguf_type_t type, gguf_kv_t *kv) {
+    QW6_ASSERT_PTR(f);
+    QW6_ASSERT_PTR(kv);
+
+    switch (type) {
+        case GGUF_TYPE_UINT8: {
+            uint8_t v;
+            if (fread(&v, 1, 1, f) != 1) return -1;
+            kv->val.u8 = v;
+            break;
+        }
+        case GGUF_TYPE_INT8: {
+            int8_t v;
+            if (fread(&v, 1, 1, f) != 1) return -1;
+            kv->val.i8 = v;
+            break;
+        }
+        case GGUF_TYPE_UINT16: {
+            uint16_t v;
+            if (fread(&v, 2, 1, f) != 1) return -1;
+            kv->val.u16 = v;
+            break;
+        }
+        case GGUF_TYPE_INT16: {
+            int16_t v;
+            if (fread(&v, 2, 1, f) != 1) return -1;
+            kv->val.i16 = v;
+            break;
+        }
+        case GGUF_TYPE_UINT32: {
+            uint32_t v;
+            if (fread(&v, 4, 1, f) != 1) return -1;
+            kv->val.u32 = v;
+            break;
+        }
+        case GGUF_TYPE_INT32: {
+            int32_t v;
+            if (fread(&v, 4, 1, f) != 1) return -1;
+            kv->val.i32 = v;
+            break;
+        }
+        case GGUF_TYPE_FLOAT32: {
+            float v;
+            if (fread(&v, 4, 1, f) != 1) return -1;
+            kv->val.f32 = v;
+            break;
+        }
+        case GGUF_TYPE_BOOL: {
+            int8_t v;
+            if (fread(&v, 1, 1, f) != 1) return -1;
+            kv->val.b = (v != 0);
+            break;
+        }
+        case GGUF_TYPE_UINT64: {
+            uint64_t v;
+            if (fread(&v, 8, 1, f) != 1) return -1;
+            kv->val.u64 = v;
+            break;
+        }
+        case GGUF_TYPE_INT64: {
+            int64_t v;
+            if (fread(&v, 8, 1, f) != 1) return -1;
+            kv->val.i64 = v;
+            break;
+        }
+        case GGUF_TYPE_FLOAT64: {
+            double v;
+            if (fread(&v, 8, 1, f) != 1) return -1;
+            kv->val.f64 = v;
+            break;
+        }
+        default:
+            return -1;
+    }
+    return 0;
+}
+
+/* Read a GGUF array value */
+static int gguf_read_array(FILE *f, gguf_kv_t *kv) {
+    QW6_ASSERT_PTR(f);
+    QW6_ASSERT_PTR(kv);
+
+    /* Read array element type (int32_t) */
+    int32_t arr_type_raw;
+    if (fread(&arr_type_raw, 4, 1, f) != 1) return -1;
+    if (arr_type_raw < 0 || arr_type_raw > (int32_t)GGUF_TYPE_FLOAT64) {
+        fprintf(stderr, "qw6: GGUF array type %d out of range\n", arr_type_raw);
+        return -1;
+    }
+    gguf_type_t elem_type = (gguf_type_t)arr_type_raw;
+    kv->arr_type = elem_type;
+
+    /* Read array count (uint64_t) */
+    uint64_t count;
+    if (fread(&count, 8, 1, f) != 1) return -1;
+    kv->arr_count = count;
+
+    /* Sanity-check: no array should exceed 10M elements */
+    if (count > (10ull * 1024 * 1024)) {
+        fprintf(stderr, "qw6: GGUF array count %llu unreasonably large\n",
+                (unsigned long long)count);
+        return -1;
+    }
+
+    if (elem_type == GGUF_TYPE_STRING) {
+        /* Array of strings */
+        kv->arr_strs = calloc((size_t)count, sizeof(char *));
+        QW6_ASSERT_PTR(kv->arr_strs);
+        kv->arr_data = NULL;
+
+        for (uint64_t i = 0; i < count; i++) {
+            char *s = NULL;
+            if (gguf_read_str(f, &s, NULL) != 0) {
+                /* Clean up on failure */
+                for (uint64_t j = 0; j < i; j++) free(kv->arr_strs[j]);
+                free(kv->arr_strs);
+                kv->arr_strs = NULL;
+                return -1;
+            }
+            kv->arr_strs[i] = s;
+        }
+    } else {
+        /* Array of scalars — read raw bytes */
+        size_t elem_sz = gguf_type_size(elem_type);
+        if (elem_sz == 0) {
+            fprintf(stderr, "qw6: GGUF array of non-scalar type %d\n", elem_type);
+            return -1;
+        }
+
+        size_t total = (size_t)count * elem_sz;
+        kv->arr_data = malloc(total);
+        QW6_ASSERT_PTR(kv->arr_data);
+        kv->arr_strs = NULL;
+
+        if (fread(kv->arr_data, 1, total, f) != total) {
+            free(kv->arr_data);
+            kv->arr_data = NULL;
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+/* Free a single KV pair's owned data */
+static void gguf_kv_free_data(gguf_kv_t *kv) {
+    if (kv->str) { free(kv->str); kv->str = NULL; }
+    if (kv->arr_data) { free(kv->arr_data); kv->arr_data = NULL; }
+    if (kv->arr_strs) {
+        for (uint64_t i = 0; i < kv->arr_count; i++)
+            if (kv->arr_strs[i]) free(kv->arr_strs[i]);
+        free(kv->arr_strs);
+        kv->arr_strs = NULL;
+    }
+}
+
+void qw6_gguf_free(gguf_ctx_t *ctx) {
+    QW6_ASSERT_PTR(ctx);
+    for (uint32_t i = 0; i < ctx->kv_parsed; i++)
+        gguf_kv_free_data(&ctx->kv[i]);
+    memset(ctx, 0, sizeof(*ctx));
+}
+
+/* Find a KV pair by key name. Returns NULL if not found. */
+const gguf_kv_t *qw6_gguf_find_kv(const gguf_ctx_t *ctx, const char *key) {
+    QW6_ASSERT_PTR(ctx);
+    QW6_ASSERT_PTR(key);
+    for (uint32_t i = 0; i < ctx->kv_parsed; i++) {
+        if (strcmp(ctx->kv[i].key, key) == 0)
+            return &ctx->kv[i];
+    }
+    return NULL;
+}
+
+/* Map GGML tensor type → qw6 quant type. Returns GGML_TYPE count for sanity. */
+static const char *ggml_type_name(ggml_type_t t) {
+    switch (t) {
+        case GGML_TYPE_F32:  return "F32";
+        case GGML_TYPE_F16:  return "F16";
+        case GGML_TYPE_Q4_0: return "Q4_0";
+        case GGML_TYPE_Q4_1: return "Q4_1";
+        case GGML_TYPE_Q5_0: return "Q5_0";
+        case GGML_TYPE_Q5_1: return "Q5_1";
+        case GGML_TYPE_Q8_0: return "Q8_0";
+        case GGML_TYPE_Q8_1: return "Q8_1";
+        case GGML_TYPE_Q2_K: return "Q2_K";
+        case GGML_TYPE_Q3_K: return "Q3_K";
+        case GGML_TYPE_Q4_K: return "Q4_K";
+        case GGML_TYPE_Q5_K: return "Q5_K";
+        case GGML_TYPE_Q6_K: return "Q6_K";
+        case GGML_TYPE_Q8_K: return "Q8_K";
+        case GGML_TYPE_IQ2_XXS: return "IQ2_XXS";
+        case GGML_TYPE_IQ2_XS:  return "IQ2_XS";
+        case GGML_TYPE_IQ3_XXS: return "IQ3_XXS";
+        case GGML_TYPE_IQ1_S:   return "IQ1_S";
+        case GGML_TYPE_IQ4_NL:  return "IQ4_NL";
+        case GGML_TYPE_IQ3_S:   return "IQ3_S";
+        case GGML_TYPE_IQ2_S:   return "IQ2_S";
+        case GGML_TYPE_IQ4_XS:  return "IQ4_XS";
+        case GGML_TYPE_I8:      return "I8";
+        case GGML_TYPE_I16:     return "I16";
+        default: return "?";
+    }
+}
+
+/* Check if GGML type is one qw6 recognises */
+static bool qw6_gguf_type_supported(ggml_type_t t) {
+    switch (t) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_XXS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Parse a GGUF file: header + metadata KV + tensor info table.
+ * Does NOT load tensor data — just records offsets. */
+int qw6_gguf_parse(const char *path, gguf_ctx_t *ctx) {
     QW6_ASSERT_PTR(path);
+    QW6_ASSERT_PTR(ctx);
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->alignment = GGUF_DEFAULT_ALIGNMENT;
 
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -96,21 +326,370 @@ static int qw6_gguf_inspect_file(const char *path) {
         return -1;
     }
 
-    gguf_header_t hdr;
-    size_t nread = fread(&hdr, sizeof(hdr), 1, f);
+    /* --- Header --- */
+    uint32_t magic, version;
+    uint64_t tensor_count, kv_count;
+
+    if (fread(&magic, 4, 1, f) != 1) { fclose(f); return -1; }
+    if (fread(&version, 4, 1, f) != 1) { fclose(f); return -1; }
+    if (fread(&tensor_count, 8, 1, f) != 1) { fclose(f); return -1; }
+    if (fread(&kv_count, 8, 1, f) != 1) { fclose(f); return -1; }
+
+    if (magic != GGUF_MAGIC) {
+        fprintf(stderr, "qw6: not a GGUF file (magic=0x%08x)\n", magic);
+        fclose(f);
+        return -1;
+    }
+    if (version != GGUF_VERSION) {
+        fprintf(stderr, "qw6: unsupported GGUF version %u (expected %u)\n",
+                version, GGUF_VERSION);
+        fclose(f);
+        return -1;
+    }
+
+    ctx->version = version;
+    ctx->tensor_count = tensor_count;
+    ctx->kv_count = kv_count;
+
+    fprintf(stderr, "qw6: GGUF v%u, %llu tensors, %llu KV pairs\n",
+            version, (unsigned long long)tensor_count,
+            (unsigned long long)kv_count);
+
+    if (kv_count > GGUF_MAX_KV) {
+        fprintf(stderr, "qw6: too many KV pairs (%llu > %u)\n",
+                (unsigned long long)kv_count, GGUF_MAX_KV);
+        fclose(f);
+        return -1;
+    }
+    if (tensor_count > GGUF_MAX_TENSORS) {
+        fprintf(stderr, "qw6: too many tensors (%llu > %u)\n",
+                (unsigned long long)tensor_count, GGUF_MAX_TENSORS);
+        fclose(f);
+        return -1;
+    }
+
+    /* --- Metadata KV pairs --- */
+    for (uint64_t i = 0; i < kv_count; i++) {
+        gguf_kv_t *kv = &ctx->kv[ctx->kv_parsed];
+
+        /* Key string */
+        char *key_str = NULL;
+        if (gguf_read_str(f, &key_str, NULL) != 0) {
+            fprintf(stderr, "qw6: GGUF KV key read failed at pair %llu\n",
+                    (unsigned long long)i);
+            qw6_gguf_free(ctx);
+            fclose(f);
+            return -1;
+        }
+        snprintf(kv->key, sizeof(kv->key), "%s", key_str);
+        free(key_str);
+
+        /* Value type (int32_t) */
+        int32_t vtype_raw;
+        if (fread(&vtype_raw, 4, 1, f) != 1) {
+            fprintf(stderr, "qw6: GGUF KV type read failed at pair %llu\n",
+                    (unsigned long long)i);
+            qw6_gguf_free(ctx);
+            fclose(f);
+            return -1;
+        }
+        if (vtype_raw < 0 || vtype_raw > (int32_t)GGUF_TYPE_FLOAT64) {
+            fprintf(stderr, "qw6: GGUF KV type %d out of range at pair %llu\n",
+                    vtype_raw, (unsigned long long)i);
+            qw6_gguf_free(ctx);
+            fclose(f);
+            return -1;
+        }
+        gguf_type_t vtype = (gguf_type_t)vtype_raw;
+        kv->type = vtype;
+
+        /* Value data */
+        if (vtype == GGUF_TYPE_STRING) {
+            if (gguf_read_str(f, &kv->str, &kv->str_len) != 0) {
+                qw6_gguf_free(ctx);
+                fclose(f);
+                return -1;
+            }
+        } else if (vtype == GGUF_TYPE_ARRAY) {
+            if (gguf_read_array(f, kv) != 0) {
+                qw6_gguf_free(ctx);
+                fclose(f);
+                return -1;
+            }
+        } else {
+            if (gguf_read_scalar(f, vtype, kv) != 0) {
+                qw6_gguf_free(ctx);
+                fclose(f);
+                return -1;
+            }
+        }
+
+        /* Check for general.alignment override */
+        if (strcmp(kv->key, "general.alignment") == 0 && vtype == GGUF_TYPE_UINT32) {
+            ctx->alignment = kv->val.u32;
+        }
+
+        ctx->kv_parsed++;
+    }
+
+    /* --- Tensor info table --- */
+    for (uint64_t i = 0; i < tensor_count; i++) {
+        gguf_tensor_info_t *ti = &ctx->tensors[ctx->tensors_parsed];
+
+        /* Tensor name (string) */
+        char *name_str = NULL;
+        if (gguf_read_str(f, &name_str, NULL) != 0) {
+            fprintf(stderr, "qw6: tensor name read failed at tensor %llu\n",
+                    (unsigned long long)i);
+            qw6_gguf_free(ctx);
+            fclose(f);
+            return -1;
+        }
+        snprintf(ti->name, sizeof(ti->name), "%s", name_str);
+        free(name_str);
+
+        /* Number of dimensions (uint32_t) */
+        uint32_t n_dims;
+        if (fread(&n_dims, 4, 1, f) != 1) {
+            qw6_gguf_free(ctx);
+            fclose(f);
+            return -1;
+        }
+        if (n_dims > GGUF_MAX_DIMS) {
+            fprintf(stderr, "qw6: tensor '%s' has %u dims (max %u)\n",
+                    ti->name, n_dims, GGUF_MAX_DIMS);
+            qw6_gguf_free(ctx);
+            fclose(f);
+            return -1;
+        }
+        ti->n_dims = n_dims;
+
+        /* Dimension sizes (int64_t each) */
+        for (uint32_t d = 0; d < n_dims; d++) {
+            if (fread(&ti->dims[d], 8, 1, f) != 1) {
+                qw6_gguf_free(ctx);
+                fclose(f);
+                return -1;
+            }
+        }
+
+        /* Tensor data type (int32_t, maps to ggml_type_t) */
+        int32_t ttype_raw;
+        if (fread(&ttype_raw, 4, 1, f) != 1) {
+            qw6_gguf_free(ctx);
+            fclose(f);
+            return -1;
+        }
+        ti->type = (ggml_type_t)ttype_raw;
+
+        /* Tensor data offset (uint64_t, relative to data start) */
+        if (fread(&ti->offset, 8, 1, f) != 1) {
+            qw6_gguf_free(ctx);
+            fclose(f);
+            return -1;
+        }
+
+        ctx->tensors_parsed++;
+    }
+
+    /* --- Compute data offset --- */
+    /* The data section starts immediately after the metadata, aligned */
+    long meta_end = ftell(f);
+    if (meta_end < 0) {
+        fprintf(stderr, "qw6: ftell failed\n");
+        qw6_gguf_free(ctx);
+        fclose(f);
+        return -1;
+    }
+
+    uint64_t aligned_offset = (uint64_t)meta_end;
+    uint32_t align = ctx->alignment;
+    if (align == 0) align = GGUF_DEFAULT_ALIGNMENT;
+    size_t remainder = (size_t)(aligned_offset % align);
+    if (remainder > 0)
+        aligned_offset += (align - remainder);
+
+    ctx->data_offset = aligned_offset;
+
+    fprintf(stderr, "qw6: parsed %u KV pairs, %u tensors, data at offset %llu (align=%u)\n",
+            ctx->kv_parsed, ctx->tensors_parsed,
+            (unsigned long long)ctx->data_offset, ctx->alignment);
+
     fclose(f);
-    if (nread != 1) {
-        fprintf(stderr, "qw6: cannot read complete GGUF header\n");
-        return -1;
+    return 0;
+}
+
+/* Map GGML tensor type → qw6 quant enum (used by tensor data loader — Phase 1) */
+__attribute__((unused))
+static qw6_quant_t qw6_gguf_to_quant(ggml_type_t t) {
+    switch (t) {
+        case GGML_TYPE_F32:     return QW6_Q_FP32;
+        case GGML_TYPE_F16:    return QW6_Q_FP16;
+        case GGML_TYPE_Q8_0:   return QW6_Q_Q8_0;
+        case GGML_TYPE_Q4_K:   return QW6_Q_Q4_K_M;
+        case GGML_TYPE_Q6_K:   return QW6_Q_Q4_K_M;  /* placeholder—add Q6_K to enum */
+        case GGML_TYPE_IQ2_XXS: return QW6_Q_IQ2_XXS;
+        default:                return QW6_Q_FP32;   /* safe fallback */
     }
-    if (hdr.magic != GGUF_MAGIC) {
-        fprintf(stderr, "qw6: not a GGUF file (magic=0x%08x)\n", hdr.magic);
-        return -1;
+}
+
+/* Load GGUF metadata into qw6 model struct (tensor data NOT loaded yet) */
+int qw6_gguf_read_file(const char *path, qw6_model_t *m) {
+    QW6_ASSERT_PTR(path);
+    QW6_ASSERT_PTR(m);
+
+    gguf_ctx_t ctx;
+    if (qw6_gguf_parse(path, &ctx) != 0) return -1;
+
+    /* Extract key metadata */
+    const gguf_kv_t *kv;
+
+    kv = qw6_gguf_find_kv(&ctx, "general.architecture");
+    if (kv && kv->type == GGUF_TYPE_STRING) {
+        fprintf(stderr, "qw6: architecture: %s\n", kv->str);
     }
-    printf("GGUF v%u\n", hdr.version);
-    printf("tensors: %llu\n", (unsigned long long)hdr.tensor_count);
-    printf("metadata_kv: %llu\n", (unsigned long long)hdr.metadata_kv_count);
-    return hdr.version == 3 ? 0 : -1;
+
+    /* Print some metadata for debugging */
+    kv = qw6_gguf_find_kv(&ctx, "general.name");
+    if (kv && kv->type == GGUF_TYPE_STRING) {
+        fprintf(stderr, "qw6: model name: %s\n", kv->str);
+    }
+
+    /* Count tensor types */
+    int type_counts[30] = {0};
+    for (uint32_t i = 0; i < ctx.tensors_parsed; i++) {
+        int t = (int)ctx.tensors[i].type;
+        if (t >= 0 && t < 30) type_counts[t]++;
+    }
+    fprintf(stderr, "qw6: tensor type breakdown:\n");
+    for (int t = 0; t < 30; t++) {
+        if (type_counts[t] > 0)
+            fprintf(stderr, "  %s: %d tensors\n",
+                    ggml_type_name((ggml_type_t)t), type_counts[t]);
+    }
+
+    /* Check all tensor types are supported */
+    for (uint32_t i = 0; i < ctx.tensors_parsed; i++) {
+        if (!qw6_gguf_type_supported(ctx.tensors[i].type)) {
+            fprintf(stderr, "qw6: WARNING: tensor '%s' uses unsupported type %s\n",
+                    ctx.tensors[i].name, ggml_type_name(ctx.tensors[i].type));
+        }
+    }
+
+    /* For Phase 1: we only parse and report. Tensor data loading is next. */
+    m->max_context = QW6_DEFAULT_CTX;
+    m->total_weight_bytes = 0;
+
+    /* Calculate total tensor data size */
+    for (uint32_t i = 0; i < ctx.tensors_parsed; i++) {
+        uint64_t elements = 1;
+        for (uint32_t d = 0; d < ctx.tensors[i].n_dims; d++)
+            elements *= (uint64_t)ctx.tensors[i].dims[d];
+
+        /* Approximate bytes per element by type */
+        size_t bpe = 0;
+        switch (ctx.tensors[i].type) {
+            case GGML_TYPE_F32:  bpe = 4; break;
+            case GGML_TYPE_F16:  bpe = 2; break;
+            case GGML_TYPE_Q8_0: bpe = 1; break;  /* 34 bytes per 32 elements */
+            case GGML_TYPE_Q4_K: bpe = 1; break;  /* approx */
+            case GGML_TYPE_Q6_K: bpe = 1; break;  /* approx */
+            default: bpe = 1; break;
+        }
+        m->total_weight_bytes += (size_t)elements * bpe;
+    }
+
+    fprintf(stderr, "qw6: ~%zu MB tensor data (approximate)\n",
+            m->total_weight_bytes / (1024 * 1024));
+
+    qw6_gguf_free(&ctx);
+
+    /* Phase 1: metadata parsed, tensor data loading still TODO */
+    fprintf(stderr, "qw6: GGUF metadata parsed. Tensor data loading not yet implemented.\n");
+    return -1;  /* return -1 until tensor data is actually loaded */
+}
+
+/* Inspect a GGUF file — print header + metadata + tensor table */
+static int qw6_gguf_inspect_file(const char *path) {
+    QW6_ASSERT_PTR(path);
+
+    gguf_ctx_t ctx;
+    if (qw6_gguf_parse(path, &ctx) != 0) return -1;
+
+    printf("GGUF v%u\n", ctx.version);
+    printf("tensors: %u\n", ctx.tensors_parsed);
+    printf("metadata_kv: %u\n", ctx.kv_parsed);
+    printf("alignment: %u\n", ctx.alignment);
+    printf("data_offset: %llu\n\n", (unsigned long long)ctx.data_offset);
+
+    /* Print key metadata */
+    printf("--- Metadata ---\n");
+    for (uint32_t i = 0; i < ctx.kv_parsed; i++) {
+        const gguf_kv_t *kv = &ctx.kv[i];
+        printf("  %s = ", kv->key);
+        switch (kv->type) {
+            case GGUF_TYPE_STRING:
+                printf("\"%s\" (string)", kv->str);
+                break;
+            case GGUF_TYPE_UINT32:
+                printf("%u (uint32)", kv->val.u32);
+                break;
+            case GGUF_TYPE_INT32:
+                printf("%d (int32)", kv->val.i32);
+                break;
+            case GGUF_TYPE_FLOAT32:
+                printf("%f (float32)", kv->val.f32);
+                break;
+            case GGUF_TYPE_BOOL:
+                printf("%s (bool)", kv->val.b ? "true" : "false");
+                break;
+            case GGUF_TYPE_UINT64:
+                printf("%llu (uint64)", (unsigned long long)kv->val.u64);
+                break;
+            case GGUF_TYPE_INT64:
+                printf("%lld (int64)", (long long)kv->val.i64);
+                break;
+            case GGUF_TYPE_ARRAY:
+                printf("[array of %u elements, type %d]",
+                       (uint32_t)kv->arr_count, (int)kv->arr_type);
+                break;
+            case GGUF_TYPE_UINT8:
+                printf("%u (uint8)", kv->val.u8);
+                break;
+            case GGUF_TYPE_INT8:
+                printf("%d (int8)", kv->val.i8);
+                break;
+            case GGUF_TYPE_UINT16:
+                printf("%u (uint16)", kv->val.u16);
+                break;
+            case GGUF_TYPE_INT16:
+                printf("%d (int16)", kv->val.i16);
+                break;
+            case GGUF_TYPE_FLOAT64:
+                printf("%f (float64)", kv->val.f64);
+                break;
+            default:
+                printf("(type %d)", (int)kv->type);
+        }
+        printf("\n");
+    }
+
+    /* Print first 20 tensors */
+    printf("\n--- Tensors (first 20 of %u) ---\n", ctx.tensors_parsed);
+    for (uint32_t i = 0; i < ctx.tensors_parsed && i < 20; i++) {
+        const gguf_tensor_info_t *ti = &ctx.tensors[i];
+        printf("  [%3u] %-40s %s [", i, ti->name, ggml_type_name(ti->type));
+        for (uint32_t d = 0; d < ti->n_dims; d++) {
+            printf("%lld%s", (long long)ti->dims[d],
+                   d < ti->n_dims - 1 ? "," : "");
+        }
+        printf("] offset=%llu\n", (unsigned long long)ti->offset);
+    }
+    if (ctx.tensors_parsed > 20)
+        printf("  ... (%u more)\n", ctx.tensors_parsed - 20);
+
+    qw6_gguf_free(&ctx);
+    return 0;
 }
 
 /* ---- Model lifecycle ---- */
