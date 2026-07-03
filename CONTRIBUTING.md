@@ -11,7 +11,9 @@ correctness before speed.
 make cpu        # CPU-only reference/debug build (no Vulkan needed)
 make vulkan     # Vulkan build for BC-250 (requires Mesa 25.1+, Vulkan SDK)
 make test       # Run regression tests
+make test-tokenizer # Run tokenizer regression tests when tokenizer data is available
 make bench      # Run benchmarks
+./qw6 --self-test # Run CPU self-tests without model/tokenizer data
 ```
 
 **CPU build** works on any Linux machine. It is for correctness checking only —
@@ -48,6 +50,12 @@ tests/test-vectors/
 ```bash
 make test
 # or manually:
+./qw6 --self-test
+
+# Optional tokenizer regression test (requires tokenizer/tokenizer.json):
+make test-tokenizer
+
+# Planned full regression runner:
 ./qw6_test --logprob-vectors      # Compare local logprobs vs API test vectors
 ./qw6_test --server               # Server API smoke test
 ```
@@ -86,7 +94,9 @@ Following the project's coding standards:
 ## Pull Request Checklist
 
 - [ ] `make cpu` succeeds
-- [ ] `make test` passes (logprob vectors match)
+- [ ] `make test` passes (tokenizer-free CPU self-test)
+- [ ] `make test-tokenizer` passes when `tokenizer/tokenizer.json` is available
+- [ ] Logprob vector tests pass once Phase 1 inference is complete
 - [ ] Style: 60-line function limit, 2+ assertions per function, strict linter
 - [ ] No new memory leaks (`valgrind --leak-check=full ./qw6 --cpu -p "test"`)
 - [ ] Vulkan build: no validation layer errors (`vulkaninfo --validate`)

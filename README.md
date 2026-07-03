@@ -38,15 +38,23 @@ project builds on top of that.
 
 ## Status
 
-**Pre-alpha. Research, design, and documentation phase.**
+**Pre-alpha. CPU reference scaffolding, tokenizer work, design, and documentation phase.**
 
-No inference code yet. The repository currently contains:
+Full inference is not functional yet. The repository currently contains early CPU engine code, a tokenizer implementation, CLI scaffolding, kernel stubs, and design documentation:
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — Engine design (Vulkan compute pipeline, MoE routing, Gated DeltaNet, Gated Attention, MTP, server API)
 - [MODEL_CARD.md](MODEL_CARD.md) — Qwen 3.6-35B-A3B specifications, tensor layout, quantisation plan
 - [BC250_SETUP.md](BC250_SETUP.md) — Hardware setup guide (Vulkan, TTM, 40-CU unlock, oberon, memory)
 - [ROADMAP.md](ROADMAP.md) — Development phases and milestones
 - [CONTRIBUTING.md](CONTRIBUTING.md) — Build, test, regression protocol
+
+The CPU scaffolding can be checked without BC-250 hardware, model weights, or
+tokenizer test vectors:
+
+```bash
+make test        # builds qw6 and runs ./qw6 --self-test
+./qw6 --inspect-gguf model.gguf  # inspect a GGUF header without loading tensors
+```
 
 ## Acknowledgements
 

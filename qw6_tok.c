@@ -653,7 +653,13 @@ int qw6_tok_load_json(qw6_tokenizer_t *t, const char *path) {
 
     char *src = malloc(fsize + 1);
     TOK_ASSERT_PTR(src);
-    fread(src, 1, fsize, f);
+    size_t nread = fread(src, 1, (size_t)fsize, f);
+    if (nread != (size_t)fsize) {
+        fprintf(stderr, "qw6_tok: short read from %s\n", path);
+        free(src);
+        fclose(f);
+        return -1;
+    }
     src[fsize] = '\0';
     fclose(f);
 
@@ -872,6 +878,8 @@ int qw6_tok_load_json(qw6_tokenizer_t *t, const char *path) {
 }
 
 int qw6_tok_init(qw6_tokenizer_t *t, const char *tokenizer_json_path) {
+    TOK_ASSERT_PTR(t);
+    memset(t, 0, sizeof(*t));
     return qw6_tok_load_json(t, tokenizer_json_path);
 }
 

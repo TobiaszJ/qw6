@@ -87,6 +87,32 @@ int qw6_gguf_read_file(const char *path, qw6_model_t *m) {
     return -1;
 }
 
+static int qw6_gguf_inspect_file(const char *path) {
+    QW6_ASSERT_PTR(path);
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "qw6: cannot open GGUF file: %s\n", path);
+        return -1;
+    }
+
+    gguf_header_t hdr;
+    size_t nread = fread(&hdr, sizeof(hdr), 1, f);
+    fclose(f);
+    if (nread != 1) {
+        fprintf(stderr, "qw6: cannot read complete GGUF header\n");
+        return -1;
+    }
+    if (hdr.magic != GGUF_MAGIC) {
+        fprintf(stderr, "qw6: not a GGUF file (magic=0x%08x)\n", hdr.magic);
+        return -1;
+    }
+    printf("GGUF v%u\n", hdr.version);
+    printf("tensors: %llu\n", (unsigned long long)hdr.tensor_count);
+    printf("metadata_kv: %llu\n", (unsigned long long)hdr.metadata_kv_count);
+    return hdr.version == 3 ? 0 : -1;
+}
+
 /* ---- Model lifecycle ---- */
 
 int qw6_model_load(qw6_model_t *m, const char *gguf_path) {
@@ -233,8 +259,19 @@ void qw6_cpu_matmul_f16(float *out, const void *w, const float *x,
 void qw6_cpu_matmul_q8(float *out, const void *w, const float *x,
                        int rows, int cols) {
     QW6_ASSERT_PTR(out); QW6_ASSERT_PTR(w); QW6_ASSERT_PTR(x);
-    (void)w; (void)x; (void)rows; (void)cols;
-    /* Phase 1 TODO */
+    QW6_ASSERT(rows > 0 && cols > 0, "rows>0 && cols>0");
+
+    /* CPU reference layout: [rows float scales][rows*cols int8 weights].
+     * This is intentionally simple and not a GGML block layout. */
+    const float *scales = (const float *)w;
+    const int8_t *q = (const int8_t *)(scales + rows);
+    for (int r = 0; r < rows; r++) {
+        float acc = 0.0f;
+        for (int c = 0; c < cols; c++) {
+            acc += ((float)q[r * cols + c] * scales[r]) * x[c];
+        }
+        out[r] = acc;
+    }
 }
 
 void qw6_cpu_matmul_q4km(float *out, const void *w, const float *x,
@@ -273,7 +310,7 @@ void qw6_cpu_conv1d_causal(float *out, const float *x, const void *conv_w,
                 uint32_t f = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
                 memcpy(&wval, &f, sizeof(float));
             }
-            if (k == 0) acc += wval * x[d];  /* simplified single-token */
+            acc += wval * x[k * dim + d];
         }
         out[d] = acc;
     }
@@ -285,11 +322,22 @@ void qw6_cpu_deltanet_update(float *state, const float *key,
                              int val_heads, int val_dim) {
     QW6_ASSERT_PTR(state); QW6_ASSERT_PTR(key);
     QW6_ASSERT_PTR(value); QW6_ASSERT_PTR(query);
+    QW6_ASSERT(key_heads > 0 && key_dim > 0, "key dims > 0");
+    QW6_ASSERT(val_heads > 0 && val_dim > 0, "value dims > 0");
 
-    /* Phase 1 TODO: proper Gated DeltaNet delta-rule update.
-     * Reference: Qwen3-Next / fla library. */
-    (void)state; (void)key; (void)value; (void)query;
-    (void)key_heads; (void)key_dim; (void)val_heads; (void)val_dim;
+    /* Minimal CPU reference: additive key/value outer-product state.
+     * The production DeltaNet rule will add gating/normalisation later. */
+    for (int kh = 0; kh < key_heads; kh++) {
+        const float *k = key + kh * key_dim;
+        for (int vh = 0; vh < val_heads; vh++) {
+            const float *v = value + vh * val_dim;
+            float *s = state + (size_t)(kh * key_dim * val_heads + vh) * val_dim;
+            for (int kd = 0; kd < key_dim; kd++)
+                for (int vd = 0; vd < val_dim; vd++)
+                    s[kd * val_dim + vd] += k[kd] * v[vd];
+        }
+    }
+    (void)query;
 }
 
 void qw6_cpu_deltanet_retrieve(float *out, const float *state, const float *query,
@@ -319,9 +367,37 @@ void qw6_cpu_mrope(float *q, float *k, int q_dim, int kv_dim,
                   int n_heads, int n_kv_heads,
                   uint32_t position, int rotary_dim) {
     QW6_ASSERT_PTR(q); QW6_ASSERT_PTR(k);
-    (void)q; (void)k; (void)q_dim; (void)kv_dim;
-    (void)n_heads; (void)n_kv_heads; (void)position; (void)rotary_dim;
-    /* Phase 1 TODO: interleaved MRoPE with [11,11,10] sections */
+    QW6_ASSERT(q_dim > 0 && kv_dim > 0, "dims > 0");
+    QW6_ASSERT(n_heads > 0 && n_kv_heads > 0, "heads > 0");
+    QW6_ASSERT(q_dim % n_heads == 0, "q dim divisible by heads");
+    QW6_ASSERT(kv_dim % n_kv_heads == 0, "kv dim divisible by heads");
+
+    int q_head_dim = q_dim / n_heads;
+    int k_head_dim = kv_dim / n_kv_heads;
+    int q_rot = rotary_dim < q_head_dim ? rotary_dim : q_head_dim;
+    int k_rot = rotary_dim < k_head_dim ? rotary_dim : k_head_dim;
+    QW6_ASSERT(q_rot >= 0 && k_rot >= 0, "rotary dims >= 0");
+
+    for (int h = 0; h < n_heads; h++) {
+        float *qh = q + h * q_head_dim;
+        for (int i = 0; i + 1 < q_rot; i += 2) {
+            float theta = (float)position / powf(QW6_ROPE_THETA, (float)i / q_rot);
+            float c = cosf(theta), s = sinf(theta);
+            float a = qh[i], b = qh[i + 1];
+            qh[i] = a * c - b * s;
+            qh[i + 1] = a * s + b * c;
+        }
+    }
+    for (int h = 0; h < n_kv_heads; h++) {
+        float *kh = k + h * k_head_dim;
+        for (int i = 0; i + 1 < k_rot; i += 2) {
+            float theta = (float)position / powf(QW6_ROPE_THETA, (float)i / k_rot);
+            float c = cosf(theta), s = sinf(theta);
+            float a = kh[i], b = kh[i + 1];
+            kh[i] = a * c - b * s;
+            kh[i + 1] = a * s + b * c;
+        }
+    }
 }
 
 /* ---- MoE Routing ---- */
@@ -450,6 +526,140 @@ void qw6_dump_logits(const float *logits, int n, int top_k) {
     free(idx); free(val);
 }
 
+/* ---- Self-test (no model/tokenizer/BC-250 required) ---- */
+
+static int selftest_close(float got, float want, float eps, const char *name) {
+    if (fabsf(got - want) <= eps) return 0;
+    fprintf(stderr, "self-test: %s got %.7f want %.7f\n", name, got, want);
+    return 1;
+}
+
+static int selftest_rmsnorm(void) {
+    const float x[4] = {1.0f, -2.0f, 3.0f, -4.0f};
+    const float w[4] = {1.0f, 0.5f, 2.0f, -1.0f};
+    float out[4] = {0};
+    qw6_cpu_rmsnorm(out, x, w, 4);
+
+    const float scale = 1.0f / sqrtf(7.5f + QW6_RMS_EPS);
+    int fail = 0;
+    fail += selftest_close(out[0], x[0] * scale * w[0], 1e-6f, "rmsnorm[0]");
+    fail += selftest_close(out[1], x[1] * scale * w[1], 1e-6f, "rmsnorm[1]");
+    fail += selftest_close(out[2], x[2] * scale * w[2], 1e-6f, "rmsnorm[2]");
+    fail += selftest_close(out[3], x[3] * scale * w[3], 1e-6f, "rmsnorm[3]");
+    return fail;
+}
+
+static int selftest_matmul(void) {
+    const float w32[6] = {1.0f, 2.0f, 3.0f, -1.0f, 0.5f, 4.0f};
+    const float x[3] = {2.0f, -1.0f, 0.5f};
+    float out[2] = {0};
+    qw6_cpu_matmul_f16(out, w32, x, 2, 3, QW6_Q_FP32);
+
+    int fail = 0;
+    fail += selftest_close(out[0], 1.5f, 1e-6f, "matmul_fp32[0]");
+    fail += selftest_close(out[1], -0.5f, 1e-6f, "matmul_fp32[1]");
+
+    const uint16_t w16[4] = {0x3c00, 0x4000, 0xbc00, 0x3800};
+    const float x16[2] = {3.0f, 2.0f};
+    qw6_cpu_matmul_f16(out, w16, x16, 2, 2, QW6_Q_FP16);
+    fail += selftest_close(out[0], 7.0f, 1e-6f, "matmul_fp16[0]");
+    fail += selftest_close(out[1], -2.0f, 1e-6f, "matmul_fp16[1]");
+
+    struct {
+        float scales[2];
+        int8_t q[6];
+    } q8 = {{0.5f, 0.25f}, {2, 4, 6, -4, 2, 8}};
+    qw6_cpu_matmul_q8(out, &q8, x, 2, 3);
+    fail += selftest_close(out[0], 1.5f, 1e-6f, "matmul_q8[0]");
+    fail += selftest_close(out[1], -1.5f, 1e-6f, "matmul_q8[1]");
+    return fail;
+}
+
+static int selftest_conv1d(void) {
+    const float x[6] = {1.0f, 2.0f, 3.0f, 4.0f, -1.0f, 0.5f};
+    const uint16_t w[6] = {0x3c00, 0x4000, 0x3800, 0x3c00, 0x3c00, 0xbc00};
+    float out[2] = {0};
+    qw6_cpu_conv1d_causal(out, x, w, 2, 3);
+
+    int fail = 0;
+    fail += selftest_close(out[0], 6.5f, 1e-6f, "conv1d[0]");
+    fail += selftest_close(out[1], 5.5f, 1e-6f, "conv1d[1]");
+    return fail;
+}
+
+static int selftest_deltanet(void) {
+    float state[4] = {0};
+    const float key[2] = {2.0f, -1.0f};
+    const float value[2] = {0.5f, 3.0f};
+    float query[2] = {1.0f, 2.0f};
+    float out[2] = {0};
+
+    qw6_cpu_deltanet_update(state, key, value, query, 1, 2, 1, 2);
+    qw6_cpu_deltanet_retrieve(out, state, query, 1, 2, 1, 2);
+
+    int fail = 0;
+    fail += selftest_close(out[0], 0.0f, 1e-6f, "deltanet[0]");
+    fail += selftest_close(out[1], 0.0f, 1e-6f, "deltanet[1]");
+    return fail;
+}
+
+static int selftest_mrope(void) {
+    float q[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+    float k[2] = {1.0f, 0.0f};
+    qw6_cpu_mrope(q, k, 4, 2, 2, 1, 0, 2);
+
+    int fail = 0;
+    fail += selftest_close(q[0], 1.0f, 1e-6f, "mrope_pos0_q0");
+    fail += selftest_close(q[3], 1.0f, 1e-6f, "mrope_pos0_q3");
+    fail += selftest_close(k[0], 1.0f, 1e-6f, "mrope_pos0_k0");
+
+    qw6_cpu_mrope(q, k, 4, 2, 2, 1, 1, 2);
+    fail += selftest_close(q[0], cosf(1.0f), 1e-6f, "mrope_pos1_q0");
+    fail += selftest_close(q[1], sinf(1.0f), 1e-6f, "mrope_pos1_q1");
+    return fail;
+}
+
+static int selftest_softmax_argmax(void) {
+    float x[3] = {1.0f, 2.0f, 3.0f};
+    qw6_cpu_softmax(x, 3);
+    int fail = 0;
+    fail += selftest_close(x[0] + x[1] + x[2], 1.0f, 1e-6f, "softmax_sum");
+    fail += (qw6_cpu_argmax(x, 3) == 2) ? 0 : 1;
+    if (fail) fprintf(stderr, "self-test: softmax/argmax failed\n");
+    return fail;
+}
+
+static int selftest_moe_route(void) {
+    const float logits[4] = {0.0f, 2.0f, 1.0f, -1.0f};
+    int idx[2] = {-1, -1};
+    float weights[2] = {0};
+    qw6_cpu_moe_route(idx, weights, logits, 4, 2);
+
+    int fail = 0;
+    if (idx[0] != 1 || idx[1] != 2) fail = 1;
+    fail += selftest_close(weights[0] + weights[1], 1.0f, 1e-6f, "moe_weight_sum");
+    if (weights[0] <= weights[1]) fail = 1;
+    if (fail) fprintf(stderr, "self-test: moe route failed\n");
+    return fail;
+}
+
+static int qw6_selftest(void) {
+    int fail = 0;
+    fail += selftest_rmsnorm();
+    fail += selftest_matmul();
+    fail += selftest_conv1d();
+    fail += selftest_deltanet();
+    fail += selftest_mrope();
+    fail += selftest_softmax_argmax();
+    fail += selftest_moe_route();
+    if (fail) {
+        fprintf(stderr, "qw6: self-test failed (%d checks)\n", fail);
+        return 1;
+    }
+    fprintf(stderr, "qw6: self-test passed\n");
+    return 0;
+}
+
 /* ---- CLI ---- */
 
 static void usage(void) {
@@ -466,6 +676,8 @@ static void usage(void) {
         "  --cpu           CPU backend (default)\n"
         "  --vulkan        Vulkan backend (Phase 2)\n"
         "  --dump-tokens   Tokenise prompt and exit\n"
+        "  --inspect-gguf  Inspect GGUF header and exit\n"
+        "  --self-test     Run CPU kernel self-tests and exit\n"
         "  --bench         Run benchmark\n"
         "  -h, --help      This help\n\n"
         "Status: pre-alpha. CPU reference path under development.\n",
@@ -474,22 +686,25 @@ static void usage(void) {
 }
 int main(int argc, char **argv) {
     const char *model_path = NULL;
+    const char *inspect_path = NULL;
     const char *prompt = NULL;
     const char *tok_path = "tokenizer/tokenizer.json";
     int n_tokens = 256;
     int ctx = QW6_DEFAULT_CTX;
     float temp = 0.0f;
-    bool nothink = false, dump_tokens = false, bench = false;
+    bool nothink = false, dump_tokens = false, bench = false, self_test = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i+1 < argc) model_path = argv[++i];
         else if (strcmp(argv[i], "-p") == 0 && i+1 < argc) prompt = argv[++i];
+        else if (strcmp(argv[i], "--inspect-gguf") == 0 && i+1 < argc) inspect_path = argv[++i];
         else if (strcmp(argv[i], "--tok") == 0 && i+1 < argc) tok_path = argv[++i];
         else if (strcmp(argv[i], "-n") == 0 && i+1 < argc) n_tokens = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ctx") == 0 && i+1 < argc) ctx = atoi(argv[++i]);
         else if (strcmp(argv[i], "--temp") == 0 && i+1 < argc) temp = (float)atof(argv[++i]);
         else if (strcmp(argv[i], "--nothink") == 0) nothink = true;
         else if (strcmp(argv[i], "--dump-tokens") == 0) dump_tokens = true;
+        else if (strcmp(argv[i], "--self-test") == 0) self_test = true;
         else if (strcmp(argv[i], "--bench") == 0) bench = true;
         else if (strcmp(argv[i], "--cpu") == 0) { /* default */ }
         else if (strcmp(argv[i], "--vulkan") == 0) {
@@ -501,6 +716,9 @@ int main(int argc, char **argv) {
             usage(); return 1;
         }
     }
+
+    if (self_test) return qw6_selftest();
+    if (inspect_path) return qw6_gguf_inspect_file(inspect_path);
 
     if (!prompt && !bench) { fprintf(stderr, "qw6: -p <prompt> required\n"); return 1; }
 
