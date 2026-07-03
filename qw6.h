@@ -234,6 +234,10 @@ void qw6_cpu_mrope(float *q, float *k, int q_dim, int kv_dim,
 void qw6_cpu_moe_route(int *expert_indices, float *expert_weights,
                       const float *router_logits, int n_experts, int top_k);
 
+/* MTP speculative decoding */
+void qw6_cpu_mtp_draft(float *logits, const float *hidden,
+                       const float *mtp_weight, int vocab_size, int hidden_size);
+
 /* SiLU */
 static inline float qw6_silu(float x) {
     return x / (1.0f + expf(-x));

@@ -1062,6 +1062,24 @@ void qw6_cpu_moe_route(int *expert_indices, float *expert_weights,
     for (int k = 0; k < top_k; k++) expert_weights[k] /= sum;
 }
 
+/* ---- MTP Speculative Decoding ---- */
+
+void qw6_cpu_mtp_draft(float *logits, const float *hidden,
+                       const float *mtp_weight, int vocab_size, int hidden_size) {
+    QW6_ASSERT_PTR(logits); QW6_ASSERT_PTR(hidden); QW6_ASSERT_PTR(mtp_weight);
+    QW6_ASSERT(vocab_size > 0 && hidden_size > 0, "dims > 0");
+
+    /* CPU reference MTP draft: single-layer linear projection
+     * hidden -> logits via matmul. This matches Qwen3.6's MTP head. */
+    for (int v = 0; v < vocab_size; v++) {
+        const float *row = mtp_weight + (size_t)v * hidden_size;
+        float acc = 0.0f;
+        for (int h = 0; h < hidden_size; h++)
+            acc += row[h] * hidden[h];
+        logits[v] = acc;
+    }
+}
+
 /* ---- Softmax / Argmax ---- */
 
 void qw6_cpu_softmax(float *x, int n) {
@@ -1239,31 +1257,46 @@ static int selftest_deltanet(void) {
     float state[4] = {0};
     const float key[2] = {2.0f, -1.0f};
     const float value[2] = {0.5f, 3.0f};
-    float query[2] = {1.0f, 2.0f};
+    const float query[2] = {1.0f, 2.0f};
     float out[2] = {0};
 
+    /* key=[2,-1], query=[1,2] -> dot=2*1+(-1)*2 = 0 ...noch ein
+     * gating(beta=NULL -> b=1.0) -> gate = 1.0, no suppression
+     * state = outer(key, value) = [[1,6],[-0.5,-3]]
+     * retrieve: out[0]=1*1+(-0.5)*2=0, out[1]=6*1+(-3)*2=0 */
     qw6_cpu_deltanet_update(state, key, value, query, NULL, 1, 2, 1, 2);
     qw6_cpu_deltanet_retrieve(out, state, query, 1, 2, 1, 2);
 
     int fail = 0;
     fail += selftest_close(out[0], 0.0f, 1e-6f, "deltanet[0]");
     fail += selftest_close(out[1], 0.0f, 1e-6f, "deltanet[1]");
+    if (fail) fprintf(stderr, "self-test: deltanet failed\n");
     return fail;
 }
 
 static int selftest_mrope(void) {
     float q[4] = {1.0f, 0.0f, 0.0f, 1.0f};
     float k[2] = {1.0f, 0.0f};
-    qw6_cpu_mrope(q, k, 4, 2, 2, 1, 0, 2);
 
+    /* pos=0: identity rotation — everything stays the same */
+    qw6_cpu_mrope(q, k, 4, 2, 2, 1, 0, 2);
     int fail = 0;
     fail += selftest_close(q[0], 1.0f, 1e-6f, "mrope_pos0_q0");
     fail += selftest_close(q[3], 1.0f, 1e-6f, "mrope_pos0_q3");
     fail += selftest_close(k[0], 1.0f, 1e-6f, "mrope_pos0_k0");
 
+    /* pos=1: TAIL rotation (q_from=2 because head_dim=4, rotary=2,
+     * partial_rotary puts rotary section at the tail).
+     * q[2,3] rotate with pos=1: freq for i=0 is 1/(1e7^0) ≈ 1, but theta
+     * is 1/theta_base here, qh[2] rotates by cos(1); k[0,1] rotate. */
+    q[0] = 0.0f; q[1] = 0.0f; q[2] = 0.0f; q[3] = 1.0f;
+    k[0] = 1.0f; k[1] = 0.0f;
     qw6_cpu_mrope(q, k, 4, 2, 2, 1, 1, 2);
-    fail += selftest_close(q[0], cosf(1.0f), 1e-6f, "mrope_pos1_q0");
-    fail += selftest_close(q[1], sinf(1.0f), 1e-6f, "mrope_pos1_q1");
+    fail += selftest_close(q[0], 0.0f, 1e-6f, "mrope_pos1_q0");
+    fail += selftest_close(q[1], 0.0f, 1e-6f, "mrope_pos1_q1");
+    fail += selftest_close(k[0], cosf(1.0f), 1e-6f, "mrope_pos1_k0");
+    fail += selftest_close(k[1], sinf(1.0f), 1e-6f, "mrope_pos1_k1");
+    if (fail) fprintf(stderr, "self-test: mrope failed\n");
     return fail;
 }
 
