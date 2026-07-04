@@ -132,6 +132,62 @@ static int qw6_vk_device_score(const VkPhysicalDeviceProperties *props,
     return score;
 }
 
+static int qw6_vk_memory_report(qw6_vk_t *vk, const qw6_model_t *m) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(vk->physical, &mp);
+    VkDeviceSize device_local = 0;
+    VkDeviceSize host_visible = 0;
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++) {
+        if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            device_local += mp.memoryHeaps[i].size;
+        }
+        if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_MULTI_INSTANCE_BIT) {
+            continue;
+        }
+    }
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        const VkMemoryType *mt = &mp.memoryTypes[i];
+        if (mt->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+            uint32_t heap = mt->heapIndex;
+            if (heap < mp.memoryHeapCount) {
+                host_visible += mp.memoryHeaps[heap].size;
+            }
+        }
+    }
+
+    size_t kv_ctx = m->max_context > 0 ? m->max_context : QW6_DEFAULT_CTX;
+    if (kv_ctx < 4096) kv_ctx = 4096;
+    VkDeviceSize weights = (VkDeviceSize)m->total_weight_bytes + 512ull * 1024ull * 1024ull;
+    VkDeviceSize scratch = (VkDeviceSize)(QW6_HIDDEN_SIZE * 6 + QW6_LINEAR_QKV_DIM * 2 +
+                                          QW6_VOCAB_SIZE + 1 + QW6_EXPERTS_PER_TOK * 5) * sizeof(float);
+    VkDeviceSize kv = (VkDeviceSize)QW6_NUM_FULL_ATTN * kv_ctx * QW6_NUM_KV_HEADS * QW6_HEAD_DIM * sizeof(float) * 2;
+    VkDeviceSize dn = (VkDeviceSize)QW6_NUM_LINEAR_ATTN * QW6_NUM_VALUE_HEADS * QW6_VALUE_HEAD_DIM * QW6_VALUE_HEAD_DIM * sizeof(float);
+    VkDeviceSize conv = (VkDeviceSize)QW6_NUM_LINEAR_ATTN * QW6_CONV1D_KERNEL * QW6_LINEAR_QKV_DIM * sizeof(float);
+    VkDeviceSize estimated = weights + scratch + kv + dn + conv;
+    fprintf(stderr,
+            "qw6_vk: memory: device-local=%llu MiB host-visible=%llu MiB estimated=%llu MiB\n",
+            (unsigned long long)(device_local / (1024ull * 1024ull)),
+            (unsigned long long)(host_visible / (1024ull * 1024ull)),
+            (unsigned long long)(estimated / (1024ull * 1024ull)));
+    fprintf(stderr,
+            "qw6_vk: memory: weights=%llu MiB scratch=%llu MiB kv=%llu MiB dn=%llu MiB conv=%llu MiB\n",
+            (unsigned long long)(weights / (1024ull * 1024ull)),
+            (unsigned long long)(scratch / (1024ull * 1024ull)),
+            (unsigned long long)(kv / (1024ull * 1024ull)),
+            (unsigned long long)(dn / (1024ull * 1024ull)),
+            (unsigned long long)(conv / (1024ull * 1024ull)));
+    if (getenv("QW6_VK_REQUIRE_DEVICE_LOCAL")) {
+        if (device_local == 0 || estimated > device_local) {
+            fprintf(stderr,
+                    "qw6_vk: selected GPU lacks enough device-local memory for the current footprint\n");
+            fprintf(stderr,
+                    "qw6_vk: set QW6_VK_REQUIRE_DEVICE_LOCAL=0 to continue with the host-visible fallback layout\n");
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static uint32_t qw6_vk_find_memory_type(qw6_vk_t *vk, uint32_t bits,
                                         VkMemoryPropertyFlags flags) {
     VkPhysicalDeviceMemoryProperties mp;
@@ -2731,6 +2787,11 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m, bool strict) {
     ctx->profile = getenv("QW6_PROFILE") != NULL;
 
     if (qw6_vk_init(&ctx->vk) != 0) {
+        free(ctx);
+        return -1;
+    }
+    if (qw6_vk_memory_report(&ctx->vk, m) != 0) {
+        qw6_vk_free(&ctx->vk);
         free(ctx);
         return -1;
     }

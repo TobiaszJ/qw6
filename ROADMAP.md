@@ -127,7 +127,7 @@ Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders.
 
 - [ ] All buffers are currently allocated as host-visible, host-coherent memory. The 10.7 GB weights should live in device-local memory with staging uploads; host-visible weights are not a high-throughput llama.cpp-style backend.
 - [ ] Add a proper allocator for device-local weights, persistent device scratch, upload staging, and small uniform/control buffers. The current one-buffer helper is too limited.
-- [ ] Add memory-type diagnostics and fail clearly if device-local capacity is insufficient. BC-250 behavior depends on the RADV memory heaps actually selected.
+- [x] Add memory-type diagnostics and fail clearly if device-local capacity is insufficient. BC-250 behavior depends on the RADV memory heaps actually selected.
 - [x] Device selection picks the first integrated/discrete GPU. Add device listing, BC-250 preference, vendor/device ID checks, queue capability checks, and an environment or CLI override.
 - [ ] Use dedicated transfer and compute usage flags where appropriate. The current buffer usage is too generic for staging and device-local layout.
 - [ ] Stop mapping every performance-critical buffer. Persistent host mapping is acceptable for staging and small readback, not for all weights and activations.
