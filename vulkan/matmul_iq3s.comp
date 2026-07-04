@@ -1,0 +1,135 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(set = 0, binding = 3) readonly buffer Grid { uint grid[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+} pc;
+
+shared float sums[256];
+
+float fp16_to_f32(uint h) {
+    uint sign = (h >> 15) & 1;
+    uint expv = (h >> 10) & 31;
+    uint mant = h & 1023;
+    if (expv == 0) {
+        float s = sign != 0 ? -1.0 : 1.0;
+        return s * (float(mant) / 1048576.0);
+    }
+    if (expv == 31) {
+        uint bits = (sign << 31) | 0x7f800000u | (mant << 13);
+        return uintBitsToFloat(bits);
+    }
+    uint bits = (sign << 31) | ((expv + 112) << 23) | (mant << 13);
+    return uintBitsToFloat(bits);
+}
+
+uint byte_at(uint base, uint off) {
+    uint word = w[(base + off) >> 2];
+    return (word >> (((base + off) & 3) << 3)) & 255;
+}
+
+uint u16_at(uint base, uint off) {
+    return byte_at(base, off) | (byte_at(base, off + 1) << 8);
+}
+
+vec4 grid_vec(uint idx) {
+    uint raw = grid[idx];
+    return vec4(
+        float(int(raw << 24) >> 24),
+        float(int(raw << 16) >> 24),
+        float(int(raw <<  8) >> 24),
+        float(int(raw       ) >> 24)
+    );
+}
+
+/* IQ3_S block: 110 bytes per 256 elements.
+ * Layout: [FP16 d (2)] [qs (64)] [qh (8)] [signs (32)] [scales (4)]
+ * Total: 2 + 64 + 8 + 32 + 4 = 110 bytes */
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (row >= pc.rows) return;
+
+    uint n_blocks = pc.cols / 256;
+    float acc = 0.0;
+
+    for (uint b = 0; b < n_blocks; b++) {
+        uint block_base = (row * n_blocks + b) * 110;
+        float d = fp16_to_f32(u16_at(block_base, 0));
+        uint qs_base = block_base + 2;
+        uint qh_base = block_base + 66;
+        uint signs_base = block_base + 74;
+        uint scales_base = block_base + 106;
+
+        /* 8 sub-blocks (ib32: 0,2,4,6). Each sub-block processes 32 columns. */
+        for (uint sb = 0; sb < 8; sb += 2) {
+            uint scale_byte = byte_at(scales_base, sb / 2);
+            float db1 = d * (1.0 + 2.0 * float(scale_byte & 0x0f));
+            float db2 = d * (1.0 + 2.0 * float(scale_byte >> 4));
+
+            uint qs_off = (sb / 2) * 16;
+            uint qh_off = (sb / 2) * 2;
+            uint sn_off = (sb / 2) * 8;
+
+            /* First half (db1) */
+            for (int l = 0; l < 4; l++) {
+                uint qs_l = qs_base + qs_off + 2 * l;
+                uint qh_byte = byte_at(qh_base + qh_off, 0);
+                uint gi1 = uint(byte_at(qs_l, 0)) |
+                           ((qh_byte << (8 - 2 * l)) & 256);
+                uint gi2 = uint(byte_at(qs_l, 1)) |
+                           ((qh_byte << (7 - 2 * l)) & 256);
+                uint sign_byte = byte_at(signs_base + sn_off, l);
+
+                vec4 g1 = grid_vec(gi1);
+                vec4 g2 = grid_vec(gi2);
+
+                /* Each l processes 8 columns. Each thread handles one column. */
+                uint col_start = b * 256 + sb * 32 + l * 8;
+                for (int j = 0; j < 4; j++) {
+                    float s1 = (sign_byte & (1u << j)) != 0 ? -1.0 : 1.0;
+                    float s2 = (sign_byte & (1u << (j + 4))) != 0 ? -1.0 : 1.0;
+                    acc += db1 * g1[j] * s1 * x[col_start + j];
+                    acc += db1 * g2[j] * s2 * x[col_start + j + 4];
+                }
+            }
+
+            /* Second half (db2) */
+            for (int l = 0; l < 4; l++) {
+                uint qs_l = qs_base + qs_off + 8 + 2 * l;
+                uint qh_byte = byte_at(qh_base + qh_off, 1);
+                uint gi1 = uint(byte_at(qs_l, 0)) |
+                           ((qh_byte << (8 - 2 * l)) & 256);
+                uint gi2 = uint(byte_at(qs_l, 1)) |
+                           ((qh_byte << (7 - 2 * l)) & 256);
+                uint sign_byte = byte_at(signs_base + sn_off, l + 4);
+
+                vec4 g1 = grid_vec(gi1);
+                vec4 g2 = grid_vec(gi2);
+
+                uint col_start = b * 256 + (sb + 1) * 32 + l * 8;
+                for (int j = 0; j < 4; j++) {
+                    float s1 = (sign_byte & (1u << j)) != 0 ? -1.0 : 1.0;
+                    float s2 = (sign_byte & (1u << (j + 4))) != 0 ? -1.0 : 1.0;
+                    acc += db2 * g1[j] * s1 * x[col_start + j];
+                    acc += db2 * g2[j] * s2 * x[col_start + j + 4];
+                }
+            }
+        }
+    }
+
+    sums[lid] = acc;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) sums[lid] += sums[lid + stride];
+        barrier();
+    }
+    if (lid == 0) y[row] = sums[0];
+}

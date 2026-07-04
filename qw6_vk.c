@@ -2000,6 +2000,7 @@ struct qw6_vk_pipe_s {
     qw6_vk_buffer_t weights;
     size_t weight_capacity;
     qw6_vk_buffer_t iq2s_grid;
+    qw6_vk_buffer_t iq3s_grid;
 
     /* Persistent scratch buffers */
     qw6_vk_buffer_t scr_hidden;    /* [HIDDEN_SIZE] float */
@@ -2214,6 +2215,12 @@ static int qw6_vk_pipe_matvec(struct qw6_vk_pipe_s *p,
         const size_t offs4[4] = {t->vk_offset, 0, 0, 0};
         qw6_vk_buffer_t *bufs4[4] = {&p->weights, inp, out, &p->iq2s_grid};
         return qw6_vk_pipe_dispatch(p, "vulkan/matmul_iq2s.spv",
+                                    bufs4, offs4, 4, &push, sizeof(push), rows, 1, 1);
+    }
+    case QW6_Q_IQ3_S: {
+        const size_t offs4[4] = {t->vk_offset, 0, 0, 0};
+        qw6_vk_buffer_t *bufs4[4] = {&p->weights, inp, out, &p->iq3s_grid};
+        return qw6_vk_pipe_dispatch(p, "vulkan/matmul_iq3s.spv",
                                     bufs4, offs4, 4, &push, sizeof(push), rows, 1, 1);
     }
     default:
@@ -2482,6 +2489,12 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m) {
         qw6_vk_pipe_free(ctx); return -1;
     }
     memcpy(ctx->iq2s_grid.mapped, iq2s_grid, sizeof(iq2s_grid));
+
+    if (qw6_vk_buffer_create(&ctx->vk, &ctx->iq3s_grid, sizeof(iq3s_grid),
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_pipe_free(ctx); return -1;
+    }
+    memcpy(ctx->iq3s_grid.mapped, iq3s_grid, sizeof(iq3s_grid));
 
     /* ---- Allocate scratch buffers ---- */
     /* Hidden-size buffers */
@@ -2994,6 +3007,7 @@ void qw6_vk_pipe_free(qw6_vk_pipe_t *p) {
     if (p->descriptor_pool) vkDestroyDescriptorPool(p->vk.device, p->descriptor_pool, NULL);
     if (p->weights.buffer) qw6_vk_buffer_destroy(&p->vk, &p->weights);
     if (p->iq2s_grid.buffer) qw6_vk_buffer_destroy(&p->vk, &p->iq2s_grid);
+    if (p->iq3s_grid.buffer) qw6_vk_buffer_destroy(&p->vk, &p->iq3s_grid);
     if (p->scr_hidden.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_hidden);
     if (p->scr_resid.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_resid);
     if (p->scr_normed.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_normed);
