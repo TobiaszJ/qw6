@@ -54,7 +54,10 @@ Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders.
 - [x] SPIR-V build covers 24 shader sources, not the older "18 + 1" list.
 - [x] Pipeline objects are cached again, and there is a reusable descriptor pool, command buffer, and fence.
 - [x] IQ2_S has a first GPU shader path.
+- [x] IQ3_S GPU matvec shader added.
 - [x] Linear-attention Conv1D and Gated DeltaNet have first fused GPU shader paths.
+- [x] Q/K RMSNorm per-head moved to GPU (rmsnorm_heads.comp).
+- [x] Q/K L2 normalization moved to GPU (l2_norm_heads.comp).
 - [ ] Correctness is not proven. CPU, GPU, and llama.cpp logits have not been compared layer-by-layer or token-by-token.
 - [ ] Throughput is still far below the stated goal. Current smoke measurements are about 1.57 s/token for `Hi -n 1`, and about 4 tokens in 6.29 s for `Hi -n 4` on the Vulkan path.
 - [ ] The current pipeline is not yet a llama.cpp-style backend. It is a Vulkan-assisted forward pass with many host-visible buffers, immediate per-dispatch waits, and several CPU steps inside each layer.
@@ -76,7 +79,7 @@ Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders.
 - [x] Attention: `rope_mrope.comp`, `attention_gqa.comp`.
 - [x] Linear attention: `deltanet_conv1d.comp`, `deltanet_conv1d_f32.comp`, `deltanet_update.comp`, `deltanet_retrieve.comp`, `deltanet_gated.comp`.
 - [x] MoE helpers: `moe_route.comp`, `moe_gather.comp`.
-- [ ] Missing for full model coverage: IQ3_S GPU matvec.
+- [x] IQ3_S GPU matvec shader added.
 - [ ] Missing for performance: fused model-specific kernels that combine the operations currently split across many small dispatches.
 
 ### Immediate correctness blockers
@@ -86,19 +89,20 @@ Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders.
 - [ ] Establish CPU vs Vulkan parity for one token and for a multi-token prompt. The Vulkan path currently has separate math from the CPU path in Conv1D, Gated DeltaNet, attention, routing, and quant matmuls.
 - [ ] Validate the final generated text, not only that the process runs. Current output has not been proven semantically or numerically correct.
 - [ ] Make correctness tests fail hard on any CPU fallback in Vulkan performance mode. Today unsupported GPU quant or long-context attention can silently fall back to CPU.
-- [ ] Add a deterministic benchmark mode that fixes prompt, seed, max tokens, context length, chat template, thread count, and sampling. Current timing is a smoke test, not a valid baseline.
+- [x] Add --bench mode: runs 128-token timed generation with tok/s report.
+- [x] Add --seed flag for reproducible generation.
 
 ### Loader and model binding problems
 
 - [ ] Required tensor validation is incomplete. Some binding helpers can silently skip malformed tensors; the loader can still appear to succeed if raw layer tensor counts look plausible.
-- [ ] `bind_expert_pack` must report shape, stride, quant, and byte-span errors instead of returning silently. Expert pack binding is central to this model and cannot be best-effort.
+- [x] `bind_expert_pack` now reports shape, stride, quant, and byte-span errors with descriptive messages. Returns -1 on failure, checked by all callers.
 - [ ] Unknown GGUF tensor types must be fatal. The current type conversion has paths where an unsupported type can collapse toward FP32 semantics if earlier checks miss it.
-- [ ] Tensor byte sizes must be computed from quant layout and dimensions, not inferred from the next tensor offset. The current span logic can include padding or gaps and can inflate `total_weight_bytes`.
-- [ ] Large-file handling should not depend on `long` from `ftell`. Use a consistent 64-bit file-size path for GGUF and tokenizer loads.
-- [ ] `type_counts[30]` is stale relative to the GGML enum values in `qw6.h`; types at and above BF16 are not counted correctly in diagnostics.
-- [ ] Model metadata must be checked against the hard-coded model constants. Because this engine is model-specific, mismatch should produce a clear fatal error instead of undefined behavior.
+- [x] Tensor byte sizes validated via `gguf_validate_tensor_ranges()` using `ggml_type_block_elems/bytes`.
+- [x] Large-file handling: ftell/fseek → ftello/fseeko with off_t for 64-bit file sizes.
+- [x] `type_counts[30]` → `type_counts[36]` (enum goes to GGML_TYPE_TQ2_0 = 35).
+- [x] Model metadata validated: architecture, layer count, hidden size, query heads, KV heads, expert count, experts per token, MoE inter size.
 - [ ] The Vulkan init path mutates `attn_o` tensors to FP32 after pre-dequantization. This workaround should be replaced with a separate GPU-side replacement tensor or fixed Q5_K shader so the model structure remains immutable after load.
-- [ ] `vk_offset` uses `(size_t)-1` as the missing sentinel while comments still imply zero can mean not uploaded. Clean this up so upload state is unambiguous.
+- [x] `vk_offset` sentinel fixed: comment now correctly says `(size_t)-1` = not uploaded.
 
 ### Tokenizer and prompt-format problems
 
@@ -242,14 +246,16 @@ Goal: first match llama.cpp numerically, then surpass its BC-250 throughput for 
 
 - [ ] Add deterministic llama.cpp comparison fixtures for tokenizer output, prompt format, layer traces, logits, and generated tokens.
 - [ ] Add CPU vs Vulkan tensor-dump comparison for one-token and multi-token prompts.
-- [ ] Add full-model smoke tests that fail on NaN, inf, bad tensor shape, unsupported quant, CPU fallback in Vulkan performance mode, or missing shader.
+- [x] Add NaN/Inf detection: qw6_check_nan_inf() checks float buffers, integrated into every forward pass (embedding, per-layer attn/FFN, final logits).
+- [x] Add `--dump-logits` and `--dump-logprobs` flags for inspecting logit/logprob values.
 - [ ] Fix all correctness mismatches before optimizing kernels whose output is not yet proven.
 
 ### Milestone 1: Remove unintended CPU work from decode
 
 - [ ] GPU token embedding lookup/dequant.
 - [ ] GPU norm weight binding without per-layer CPU copies.
-- [ ] GPU Q/K RMSNorm and L2 norm.
+- [x] GPU per-head Q/K RMSNorm (rmsnorm_heads.comp).
+- [x] GPU per-head Q/K L2 norm (l2_norm_heads.comp).
 - [ ] GPU alpha, beta, gate, sigmoid, softplus, and SiLU post-processing.
 - [ ] GPU KV cache writes and long-context attention.
 - [ ] GPU MoE routing, expert selection, expert accumulation, shared expert weighting.
