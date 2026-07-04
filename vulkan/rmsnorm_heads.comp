@@ -1,0 +1,45 @@
+#version 450
+
+/* Batched per-head RMSNorm for attention Q/K heads.
+ * Each workgroup processes one head.
+ * x: input buffer [heads * dim] (in-place)
+ * w: weight buffer [dim]
+ * push: heads, dim, eps
+ */
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer W { float w[]; };
+
+layout(push_constant) uniform Push {
+    uint heads;
+    uint dim;
+    float eps;
+} pc;
+
+shared float ssum[256];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (h >= pc.heads) return;
+
+    uint base = h * pc.dim;
+    float acc = 0.0;
+    for (uint i = lid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float v = x[base + i];
+        acc += v * v;
+    }
+    ssum[lid] = acc;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) ssum[lid] += ssum[lid + stride];
+        barrier();
+    }
+
+    float scale = inversesqrt(ssum[0] / float(pc.dim) + pc.eps);
+    for (uint i = lid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        x[base + i] = x[base + i] * scale * w[i];
+    }
+}

@@ -1,0 +1,44 @@
+#version 450
+
+/* Per-head L2 normalization for linear-attention Q/K heads.
+ * Each workgroup = one head: normalize the vector to unit length.
+ * x: input buffer [heads * dim]
+ * y: output buffer [heads * dim]
+ * push: heads, dim
+ */
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint heads;
+    uint dim;
+} pc;
+
+shared float ssum[256];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (h >= pc.heads) return;
+
+    uint base = h * pc.dim;
+    float acc = 0.0;
+    for (uint i = lid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float v = x[base + i];
+        acc += v * v;
+    }
+    ssum[lid] = acc;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) ssum[lid] += ssum[lid + stride];
+        barrier();
+    }
+
+    float inv_norm = inversesqrt(ssum[0] / float(pc.dim) + 1e-6);
+    for (uint i = lid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        y[base + i] = x[base + i] * inv_norm;
+    }
+}

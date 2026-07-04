@@ -2431,6 +2431,42 @@ __attribute__((unused)) static int qw6_vk_pipe_moe_gather(struct qw6_vk_pipe_s *
                                 (dim + 255) / 256, 1, 1);
 }
 
+typedef struct {
+    uint32_t heads;
+    uint32_t dim;
+} qw6_vk_l2_norm_push_t;
+
+typedef struct {
+    uint32_t heads;
+    uint32_t dim;
+    float eps;
+} qw6_vk_rmsnorm_heads_push_t;
+
+static int qw6_vk_pipe_l2_norm_heads(struct qw6_vk_pipe_s *p,
+                                      qw6_vk_buffer_t *buf,
+                                      size_t offset,
+                                      uint32_t heads, uint32_t dim) {
+    const size_t offs[2] = {offset, offset};
+    qw6_vk_buffer_t *bufs[2] = {buf, buf};
+    qw6_vk_l2_norm_push_t push = {.heads = heads, .dim = dim};
+    return qw6_vk_pipe_dispatch(p, "vulkan/l2_norm_heads.spv",
+                                bufs, offs, 2, &push, sizeof(push),
+                                heads, 1, 1);
+}
+
+static int qw6_vk_pipe_rmsnorm_heads(struct qw6_vk_pipe_s *p,
+                                     qw6_vk_buffer_t *buf,
+                                     const qw6_tensor_t *w,
+                                     uint32_t heads, uint32_t dim) {
+    if (!w || w->vk_offset == (size_t)-1) return -1;
+    const size_t offs[2] = {0, w->vk_offset};
+    qw6_vk_buffer_t *bufs[2] = {buf, &p->weights};
+    qw6_vk_rmsnorm_heads_push_t push = {.heads = heads, .dim = dim, .eps = QW6_RMS_EPS};
+    return qw6_vk_pipe_dispatch(p, "vulkan/rmsnorm_heads.spv",
+                                bufs, offs, 2, &push, sizeof(push),
+                                heads, 1, 1);
+}
+
 /* ---- Init ---- */
 
 int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m) {
@@ -2751,12 +2787,17 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                 }
             }
 
-            /* Split QKV, L2-normalize heads */
+            /* Split QKV, L2-normalize heads (GPU with CPU fallback) */
             float *q = conv_out;
             float *k = conv_out + QW6_NUM_KEY_HEADS * QW6_KEY_HEAD_DIM;
             float *v = conv_out + 2 * QW6_NUM_KEY_HEADS * QW6_KEY_HEAD_DIM;
-            qw6_l2_norm_heads(q, QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM);
-            qw6_l2_norm_heads(k, QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM);
+            size_t k_off = (size_t)QW6_NUM_KEY_HEADS * QW6_KEY_HEAD_DIM * sizeof(float);
+            if (qw6_vk_pipe_l2_norm_heads(p, s0, 0,
+                                          QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM) != 0)
+                qw6_l2_norm_heads(q, QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM);
+            if (qw6_vk_pipe_l2_norm_heads(p, s0, k_off,
+                                          QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM) != 0)
+                qw6_l2_norm_heads(k, QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM);
 
             /* Apply sigmoid/softplus to beta/alpha */
             float *dt_cpu = (float *)m->layers[l].dn_dt.data;
@@ -2808,24 +2849,27 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                       QW6_NUM_KV_HEADS * QW6_HEAD_DIM, QW6_HIDDEN_SIZE);
 
             /* Q/K norms */
-            float *q_norm_w = (float *)m->layers[l].attn_q_norm.data;
-            float *k_norm_w = (float *)m->layers[l].attn_k_norm.data;
             float *k_cpu = (float *)s1->mapped;
-
-            /* Split Q and gate */
-            float *q_cpu = (float *)s0->mapped; /* first half */
+            float *q_cpu = (float *)s0->mapped;
             float *gate_cpu = (float *)s0->mapped + QW6_NUM_Q_HEADS * QW6_HEAD_DIM;
-            /* Already laid out as [Q, gate] interleaved per head */
 
-            /* Apply Q/K RMSNorm per head */
-            for (int h = 0; h < QW6_NUM_Q_HEADS; h++)
-                qw6_cpu_rmsnorm(q_cpu + h * QW6_HEAD_DIM,
-                                q_cpu + h * QW6_HEAD_DIM,
-                                q_norm_w, QW6_HEAD_DIM);
-            for (int h = 0; h < QW6_NUM_KV_HEADS; h++)
-                qw6_cpu_rmsnorm(k_cpu + h * QW6_HEAD_DIM,
-                                k_cpu + h * QW6_HEAD_DIM,
-                                k_norm_w, QW6_HEAD_DIM);
+            /* Apply Q/K RMSNorm per head (GPU with CPU fallback) */
+            if (qw6_vk_pipe_rmsnorm_heads(p, s0, &m->layers[l].attn_q_norm,
+                                          QW6_NUM_Q_HEADS, QW6_HEAD_DIM) != 0) {
+                float *qnw = (float *)m->layers[l].attn_q_norm.data;
+                for (int h = 0; h < QW6_NUM_Q_HEADS; h++)
+                    qw6_cpu_rmsnorm(q_cpu + h * QW6_HEAD_DIM,
+                                    q_cpu + h * QW6_HEAD_DIM,
+                                    qnw, QW6_HEAD_DIM);
+            }
+            if (qw6_vk_pipe_rmsnorm_heads(p, s1, &m->layers[l].attn_k_norm,
+                                          QW6_NUM_KV_HEADS, QW6_HEAD_DIM) != 0) {
+                float *knw = (float *)m->layers[l].attn_k_norm.data;
+                for (int h = 0; h < QW6_NUM_KV_HEADS; h++)
+                    qw6_cpu_rmsnorm(k_cpu + h * QW6_HEAD_DIM,
+                                    k_cpu + h * QW6_HEAD_DIM,
+                                    knw, QW6_HEAD_DIM);
+            }
 
             /* MRoPE */
             {
