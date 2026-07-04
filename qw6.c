@@ -2716,6 +2716,38 @@ void qw6_dump_logits(const float *logits, int n, int top_k) {
     free(idx); free(val);
 }
 
+void qw6_dump_logprobs(const float *logits, int n, int top_k) {
+    QW6_ASSERT_PTR(logits);
+    double max_val = (double)logits[0];
+    for (int i = 1; i < n; i++) {
+        if ((double)logits[i] > max_val) max_val = (double)logits[i];
+    }
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) {
+        sum += exp((double)logits[i] - max_val);
+    }
+    double log_sum = log(sum);
+
+    int *idx = malloc((size_t)top_k * sizeof(int));
+    float *val = malloc((size_t)top_k * sizeof(float));
+    if (!idx || !val) { free(idx); free(val); return; }
+
+    for (int k = 0; k < top_k; k++) { idx[k] = -1; val[k] = -INFINITY; }
+    for (int i = 0; i < n; i++) {
+        float lp = (float)((double)logits[i] - max_val - log_sum);
+        for (int k = 0; k < top_k; k++) {
+            if (lp > val[k]) {
+                for (int j = top_k - 1; j > k; j--) { val[j] = val[j-1]; idx[j] = idx[j-1]; }
+                val[k] = lp; idx[k] = i; break;
+            }
+        }
+    }
+    printf("Top-%d logprobs:\n", top_k);
+    for (int k = 0; k < top_k; k++)
+        printf("  token %d: %.6f (prob=%.4f)\n", idx[k], val[k], expf(val[k]));
+    free(idx); free(val);
+}
+
 /* ---- Self-test (no model/tokenizer/BC-250 required) ---- */
 
 static int selftest_close(float got, float want, float eps, const char *name) {
@@ -2933,6 +2965,8 @@ static void usage(void) {
         "  --vulkan        Vulkan backend (Phase 2)\n"
         "  --vulkan-self-test Run Vulkan compute backend self-test\n"
         "  --dump-tokens   Tokenise prompt and exit\n"
+        "  --dump-logits   Dump top-10 logits after prefill and each generated token\n"
+        "  --dump-logprobs Dump top-10 log-probabilities with token probabilities\n"
         "  --inspect-gguf  Inspect GGUF header and exit\n"
         "  --load-only     Load and validate model metadata, then exit\n"
         "  --self-test     Run CPU kernel self-tests and exit\n"
@@ -2950,7 +2984,8 @@ int main(int argc, char **argv) {
     int n_tokens = 256;
     int ctx = QW6_DEFAULT_CTX;
     float temp = 0.0f;
-    bool nothink = false, dump_tokens = false, bench = false, self_test = false;
+    bool nothink = false, dump_tokens = false, dump_logits = false, dump_logprobs = false;
+    bool bench = false, self_test = false;
     bool use_vulkan = false, vulkan_self_test = false;
     bool load_only = false, raw_prompt = false;
 #ifdef QW6_VULKAN
@@ -2968,6 +3003,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--temp") == 0 && i+1 < argc) temp = (float)atof(argv[++i]);
         else if (strcmp(argv[i], "--nothink") == 0) nothink = true;
         else if (strcmp(argv[i], "--dump-tokens") == 0) dump_tokens = true;
+        else if (strcmp(argv[i], "--dump-logits") == 0) dump_logits = true;
+        else if (strcmp(argv[i], "--dump-logprobs") == 0) dump_logprobs = true;
         else if (strcmp(argv[i], "--load-only") == 0) load_only = true;
         else if (strcmp(argv[i], "--self-test") == 0) self_test = true;
         else if (strcmp(argv[i], "--bench") == 0) bench = true;
@@ -3202,6 +3239,16 @@ int main(int argc, char **argv) {
             return 1;
         }
 
+        /* Dump logits/logprobs after prefill (last prompt token) */
+        if (dump_logits) {
+            fprintf(stderr, "\n=== Prefill logits (last prompt token) ===\n");
+            qw6_dump_logits(session.logits, QW6_VOCAB_SIZE, 10);
+        }
+        if (dump_logprobs) {
+            fprintf(stderr, "\n=== Prefill logprobs (last prompt token) ===\n");
+            qw6_dump_logprobs(session.logits, QW6_VOCAB_SIZE, 10);
+        }
+
         fprintf(stderr, "qw6: generating %d tokens...\n", n_tokens);
         clock_t start = clock();
         int gen = qw6_generate(&session, (uint32_t)n_tokens, temp, 0.9f);
@@ -3211,6 +3258,17 @@ int main(int argc, char **argv) {
             if (qw6_tok_decode(&tokenizer, session.tokens + n, (uint32_t)gen, &decoded) == 0) {
                 fprintf(stderr, "qw6: generated text: \"%s\"\n", decoded);
                 free(decoded);
+            }
+        }
+        if (gen > 0) {
+            /* Dump logits/logprobs after last generated token */
+            if (dump_logits) {
+                fprintf(stderr, "\n=== Post-generation logits (last generated token) ===\n");
+                qw6_dump_logits(session.logits, QW6_VOCAB_SIZE, 10);
+            }
+            if (dump_logprobs) {
+                fprintf(stderr, "\n=== Post-generation logprobs (last generated token) ===\n");
+                qw6_dump_logprobs(session.logits, QW6_VOCAB_SIZE, 10);
             }
         }
         fprintf(stderr, "qw6: %d tokens in %.2fs\n", gen, elapsed);
