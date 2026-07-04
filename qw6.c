@@ -2774,11 +2774,10 @@ int qw6_token_decode(const uint32_t *tokens, uint32_t n, char **out_text) {
 void qw6_dump_tokens(const uint32_t *tokens, uint32_t n) {
     QW6_ASSERT_PTR(tokens);
     printf("[");
-    for (uint32_t i = 0; i < n && i < 20; i++) {
+    for (uint32_t i = 0; i < n; i++) {
+        if (i) printf(", ");
         printf("%u", tokens[i]);
-        if (i < n - 1 && i < 19) printf(", ");
     }
-    if (n > 20) printf(", ...");
     printf("] (%u tokens)\n", n);
 }
 
@@ -2840,6 +2839,20 @@ void qw6_dump_logprobs(const float *logits, int n, int top_k) {
     for (int k = 0; k < top_k; k++)
         printf("  token %d: %.6f (prob=%.4f)\n", idx[k], val[k], expf(val[k]));
     free(idx); free(val);
+}
+
+int qw6_dump_full_logits(const float *logits, int n, const char *path) {
+    QW6_ASSERT_PTR(logits); QW6_ASSERT_PTR(path);
+    FILE *f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "qw6: failed to open %s for writing\n", path); return -1; }
+    size_t written = fwrite(logits, sizeof(float), (size_t)n, f);
+    fclose(f);
+    if ((int)written != n) {
+        fprintf(stderr, "qw6: wrote %zu/%d floats to %s\n", written, n, path);
+        return -1;
+    }
+    fprintf(stderr, "qw6: wrote %d logits to %s\n", n, path);
+    return 0;
 }
 
 static void qw6_json_escape(FILE *f, const char *s) {
@@ -3172,6 +3185,7 @@ static void usage(void) {
         "  --dump-tokens   Tokenise prompt and exit\n"
         "  --dump-logits   Dump top-10 logits after prefill and each generated token\n"
         "  --dump-logprobs Dump top-10 log-probabilities with token probabilities\n"
+        "  --dump-full-logits <FILE> Write full logit vector as raw float32 binary\n"
         "  --trace-json <P> Write a structured trace JSON file after generation\n"
         "  --inspect-gguf  Inspect GGUF header and exit\n"
         "  --load-only     Load and validate model metadata, then exit\n"
@@ -3189,6 +3203,7 @@ int main(int argc, char **argv) {
     const char *prompt = NULL;
     const char *tok_path = "tokenizer/tokenizer.json";
     const char *trace_json_path = NULL;
+    const char *dump_full_logits_path = NULL;
     int n_tokens = 256;
     int ctx = QW6_DEFAULT_CTX;
     float temp = 0.0f;
@@ -3218,6 +3233,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--dump-logits") == 0) dump_logits = true;
         else if (strcmp(argv[i], "--dump-logprobs") == 0) dump_logprobs = true;
         else if (strcmp(argv[i], "--trace-json") == 0 && i+1 < argc) trace_json_path = argv[++i];
+        else if (strcmp(argv[i], "--dump-full-logits") == 0 && i+1 < argc) dump_full_logits_path = argv[++i];
         else if (strcmp(argv[i], "--load-only") == 0) load_only = true;
         else if (strcmp(argv[i], "--self-test") == 0) self_test = true;
         else if (strcmp(argv[i], "--bench") == 0) bench = true;
@@ -3477,6 +3493,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "\n=== Prefill logprobs (last prompt token) ===\n");
             qw6_dump_logprobs(session.logits, QW6_VOCAB_SIZE, 10);
         }
+        if (dump_full_logits_path) {
+            qw6_dump_full_logits(session.logits, QW6_VOCAB_SIZE, dump_full_logits_path);
+        }
         if (trace_json_path) {
             prefill_logits_snapshot = malloc((size_t)QW6_VOCAB_SIZE * sizeof(float));
             if (prefill_logits_snapshot) {
@@ -3505,6 +3524,14 @@ int main(int argc, char **argv) {
             if (dump_logprobs) {
                 fprintf(stderr, "\n=== Post-generation logprobs (last generated token) ===\n");
                 qw6_dump_logprobs(session.logits, QW6_VOCAB_SIZE, 10);
+            }
+            if (dump_full_logits_path) {
+                /* Append ".gen" suffix for the generation logits file */
+                char gen_path[1024];
+                int r = snprintf(gen_path, sizeof(gen_path), "%s.gen", dump_full_logits_path);
+                if (r > 0 && (size_t)r < sizeof(gen_path)) {
+                    qw6_dump_full_logits(session.logits, QW6_VOCAB_SIZE, gen_path);
+                }
             }
         }
         if (trace_json_path && prefill_logits_snapshot) {

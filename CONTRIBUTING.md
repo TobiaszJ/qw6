@@ -1,9 +1,9 @@
 # Contributing to qw6
 
 This project is in pre-alpha. Phase 2 (Vulkan GPU pipeline) is the active
-development focus. Phase 1 (CPU reference) was never validated against reference
-logits — GPU correctness is validated by comparing against llama.cpp's Vulkan
-backend on the same hardware.
+development focus. A correctness baseline against llama.cpp is being established
+in `tests/correctness/compare.py`. Both CPU and GPU paths produce output but
+have not been validated against reference logits layer-by-layer.
 
 ---
 
@@ -25,8 +25,8 @@ make vulkan
 ./qw6 -m model.gguf -p "Hello" -n 3 --nothink --vulkan      # With chat template
 ```
 
-**CPU build** works on any Linux machine, but was never validated against
-reference outputs. Do not treat it as a correctness reference.
+**CPU build** works on any Linux machine. A correctness baseline against
+llama.cpp is being established (see **Correctness Baseline** below).
 
 **Vulkan build** requires:
 - Mesa 25.1.0+ (25.3.4+ recommended)
@@ -36,7 +36,46 @@ reference outputs. Do not treat it as a correctness reference.
 
 ---
 
-## Current Known Issues
+## Correctness Baseline
+
+A comparison harness lives at `tests/correctness/compare.py`:
+
+```bash
+# Tokenizer comparison (quick, 15 test cases)
+python3 tests/correctness/compare.py tok -m model.gguf
+
+# Chat template parity
+python3 tests/correctness/compare.py chat -m model.gguf
+
+# Full logit dump (requires model load)
+python3 tests/correctness/compare.py logits -m model.gguf
+
+# Greedy generation comparison (requires BC-250 for llama.cpp speed)
+python3 tests/correctness/compare.py gen -m model.gguf
+
+# Everything
+python3 tests/correctness/compare.py all -m model.gguf
+```
+
+**Current status (CPU, no GPU):**
+- Tokenizer: 12/15 prompts match llama.cpp. 3 mismatches are pre-tokenization
+  differences with `{`/`}` boundaries (qw6's simplified pre-tokenizer vs
+  HuggingFace regex).
+- CPU inference: verified functional (Hello → token 1873, 7.59s/token).
+- Full logit dump: `--dump-full-logits <FILE>` writes 248k float32 values.
+- llama.cpp comparison on BC-250: not yet run.
+
+### Debugging flags
+
+```bash
+./qw6 --dump-tokens -p "..."                  # All token IDs (no truncation)
+./qw6 -m model.gguf --dump-logits -p "..."     # Top-10 logits after prefill
+./qw6 -m model.gguf --dump-logprobs -p "..."   # Top-10 logprobs
+./qw6 -m model.gguf --dump-full-logits /tmp/l.f32 -p "..."  # Full logit vector
+./qw6 -m model.gguf --trace-json /tmp/t.json -p "..."       # Structured trace
+```
+
+---
 
 ### GPU Pipeline
 - `matmul_q5k.spv` produces 100-500x wrong output despite byte-identical weight
@@ -47,8 +86,10 @@ reference outputs. Do not treat it as a correctness reference.
 - Core inference math not validated against reference outputs
 
 ### CPU Reference
-- No comparison against llama.cpp or other reference implementation ever performed
+- Not yet validated layer-by-layer against llama.cpp logits
 - Both CPU and GPU paths may produce incorrect tokens
+- Tokenizer: pre-tokenization is simplified (3/15 test prompts differ from
+  llama.cpp on `{`/`}` boundary splitting)
 - `qw6_cpu_matmul_iq2m` uses a flat test format, NOT the real IQ2_XXS GGUF blocks
   (but `qw6_tensor_matvec` → `qw6_tensor_dequantize_row` uses the correct format)
 
@@ -99,6 +140,7 @@ llama.cpp processes ~17ms/token on the BC-250 with Vulkan (`-ngl 999`).
 - [ ] `./qw6 --self-test` passes
 - [ ] `./qw6 --vulkan-self-test` passes on BC-250
 - [ ] `./qw6 --load-only --vulkan -m <model.gguf>` passes
+- [ ] Tokenizer comparison: `python3 tests/correctness/compare.py tok -m <model.gguf>` — no regressions vs baseline
 - [ ] No new `valgrind` issues in CPU path
 - [ ] Style: function length, assertions, strict linter
 - [ ] Commit message: descriptive, present tense

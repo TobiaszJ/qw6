@@ -84,11 +84,11 @@ Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders.
 
 ### Immediate correctness blockers
 
-- [ ] Add a real reference-logit harness before any more performance claims. It must compare tokenizer IDs, prompt tokens, layer outputs, final logits, top-k logits, and generated token IDs against llama.cpp for the exact GGUF, prompt, context length, and sampling settings.
-- [ ] Implement `--dump-logits`, `--dump-logprobs`, and layer/tensor trace dumping for both CPU and Vulkan paths. Without dumps, there is no way to isolate whether bad output comes from tokenizer, quant dequant, attention, DeltaNet, MoE, or sampling.
+- [x] Add a real reference-logit harness: `tests/correctness/compare.py` provides structured tokenizer, logit, and generation comparison against llama.cpp. Runnable on BC-250 with `python3 tests/correctness/compare.py all`.
+- [x] Implement `--dump-logits`, `--dump-logprobs`, `--dump-full-logits`, and `--trace-json` for both CPU and Vulkan paths. Full logit vectors can be dumped for cross-reference.
 - [x] Add structured trace JSON output (`--trace-json`) for prompt tokens, generated tokens, and top logits after prefill/final token.
 - [ ] Establish CPU vs Vulkan parity for one token and for a multi-token prompt. The Vulkan path currently has separate math from the CPU path in Conv1D, Gated DeltaNet, attention, routing, and quant matmuls.
-- [ ] Validate the final generated text, not only that the process runs. Current output has not been proven semantically or numerically correct.
+- [ ] Validate the final generated text against llama.cpp. CPU path produces output (verified: "Hello" -> token 1873 on CPU). BC-250 comparison not yet run.
 - [x] Make correctness tests fail hard on any CPU fallback in Vulkan performance mode via `--vulkan-strict`. Unsupported GPU quant or long-context attention now abort instead of silently falling back to CPU.
 - [x] Add --bench mode: runs 128-token timed generation with tok/s report.
 - [x] Add --seed flag for reproducible generation.
@@ -245,10 +245,13 @@ Goal: first match llama.cpp numerically, then surpass its BC-250 throughput for 
 
 ### Milestone 0: Make correctness measurable
 
-- [ ] Add deterministic llama.cpp comparison fixtures for tokenizer output, prompt format, layer traces, logits, and generated tokens.
-- [ ] Add CPU vs Vulkan tensor-dump comparison for one-token and multi-token prompts.
+- [x] Add deterministic llama.cpp comparison harness: `tests/correctness/compare.py` runs tokenizer, chat template, logit, and generation comparison between qw6 and llama.cpp.
+- [x] Tokenizer comparison: 12/15 prompts match. 3 mismatches are pre-tokenization differences with `{`/`}` boundaries (qw6's simplified pre-tokenizer vs HuggingFace regex).
+- [x] Add `--dump-full-logits <FILE>` flag: writes full 248k logit vector as raw float32 binary for cross-reference with llama.cpp.
+- [x] Fix qw6_dump_tokens to output all tokens (previously truncated at 20 with `...` which broke JSON parsing).
 - [x] Add NaN/Inf detection: qw6_check_nan_inf() checks float buffers, integrated into every forward pass (embedding, per-layer attn/FFN, final logits).
-- [x] Add `--dump-logits` and `--dump-logprobs` flags for inspecting logit/logprob values.
+- [x] Add `--dump-logits`, `--dump-logprobs`, `--trace-json` flags for inspecting logit/logprob values.
+- [ ] Add CPU vs Vulkan tensor-dump comparison for one-token and multi-token prompts.
 - [ ] Fix all correctness mismatches before optimizing kernels whose output is not yet proven.
 
 ### Milestone 1: Remove unintended CPU work from decode

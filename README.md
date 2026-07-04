@@ -103,16 +103,24 @@ make vulkan                    # build with Vulkan support
 | `-m model.gguf` | Model file (required for inference) |
 | `-p "prompt"` | Prompt text |
 | `-n N` | Number of tokens to generate |
+| `--ctx N` | Context window size (default: 65536) |
 | `--temp T` | Sampling temperature (0 = greedy) |
+| `--seed N` | Random seed for deterministic generation |
 | `--vulkan` | Use GPU pipeline (Phase 2) |
 | `--cpu` | Use CPU reference path (default) |
 | `--nothink` | Disable thinking mode |
 | `--raw` | Skip chat template (raw prompt only) |
+| `--vulkan-strict` | Fail on any GPU fallback |
 | `--vulkan-self-test` | Run Vulkan compute shader self-test |
 | `--load-only` | Load model and run probes only |
 | `--self-test` | Run CPU self-test |
 | `--inspect-gguf` | Print GGUF metadata and tensor table |
-| `--dump-tokens` | Tokenize prompt and print token IDs |
+| `--dump-tokens` | Tokenize prompt and print all token IDs |
+| `--dump-logits` | Dump top-10 logits after prefill and each generated token |
+| `--dump-logprobs` | Dump top-10 log-probabilities with token probabilities |
+| `--dump-full-logits <FILE>` | Write full logit vector as raw float32 binary |
+| `--trace-json <FILE>` | Write structured trace JSON after generation |
+| `--bench` | Run 128-token timed benchmark |
 
 ### Output example
 ```
