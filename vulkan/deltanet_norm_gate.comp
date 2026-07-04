@@ -1,0 +1,52 @@
+#version 450
+
+/* Fused Gated DeltaNet output processing:
+ *   For each value head h:
+ *     RMSNorm: out[h*dim + i] = gdn[h*dim+i] / sqrt(mean_sq + eps) * w[h*dim+i]
+ *     SiLU gate: out *= silu(z[h*dim+i])
+ * where w are per-head norm weights (full [val_heads*dim]) and z is the gate.
+ *
+ * One workgroup per value head. */
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer Gdn { float gdn[]; };
+layout(set = 0, binding = 1) readonly buffer W { float w[]; };
+layout(set = 0, binding = 2) readonly buffer Z { float z[]; };
+layout(set = 0, binding = 3) writeonly buffer Out { float outv[]; };
+
+layout(push_constant) uniform Push {
+    uint val_heads;
+    uint dim;
+    float eps;
+} pc;
+
+shared float ssum[128];
+
+float silu(float x) {
+    return x / (1.0 + exp(-x));
+}
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (h >= pc.val_heads) return;
+
+    uint base = h * pc.dim;
+    float acc = 0.0;
+    for (uint i = lid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float v = gdn[base + i];
+        acc += v * v;
+    }
+    ssum[lid] = acc;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) ssum[lid] += ssum[lid + stride];
+        barrier();
+    }
+    float scale = inversesqrt(ssum[0] / float(pc.dim) + pc.eps);
+
+    for (uint i = lid; i < pc.dim; i += gl_WorkGroupSize.x) {
+        float nv = gdn[base + i] * scale * w[base + i];
+        outv[base + i] = nv * silu(z[base + i]);
+    }
+}

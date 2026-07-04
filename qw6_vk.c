@@ -2534,6 +2534,31 @@ static int qw6_vk_pipe_sigmoid_mul(struct qw6_vk_pipe_s *p,
                                 (n + 255) / 256, 1, 1);
 }
 
+typedef struct {
+    uint32_t val_heads;
+    uint32_t dim;
+    float eps;
+} qw6_vk_deltanet_norm_gate_push_t;
+
+static int qw6_vk_pipe_deltanet_norm_gate(struct qw6_vk_pipe_s *p,
+                                           qw6_vk_buffer_t *gdn,
+                                           const qw6_tensor_t *norm_w,
+                                           qw6_vk_buffer_t *z,
+                                           qw6_vk_buffer_t *out,
+                                           uint32_t val_heads, uint32_t dim) {
+    if (!norm_w || norm_w->vk_offset == (size_t)-1) return -1;
+    const size_t offs[4] = {0, norm_w->vk_offset, 0, 0};
+    qw6_vk_buffer_t *bufs[4] = {gdn, &p->weights, z, out};
+    qw6_vk_deltanet_norm_gate_push_t push = {
+        .val_heads = val_heads,
+        .dim = dim,
+        .eps = QW6_RMS_EPS,
+    };
+    return qw6_vk_pipe_dispatch(p, "vulkan/deltanet_norm_gate.spv",
+                                bufs, offs, 4, &push, sizeof(push),
+                                val_heads, 1, 1);
+}
+
 /* ---- Init ---- */
 
 int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m) {
@@ -2895,17 +2920,24 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                        (size_t)QW6_NUM_VALUE_HEADS * QW6_VALUE_HEAD_DIM * QW6_VALUE_HEAD_DIM * sizeof(float));
             }
 
-            /* RMSNorm the GDN output, multiply by SiLU(z) */
-            float *dn_norm_w = (float *)m->layers[l].dn_norm.data;
-            float *gated = (float *)s1->mapped; /* reuse s1 */
-            for (int h = 0; h < QW6_NUM_VALUE_HEADS; h++) {
-                float *dst = gated + h * QW6_VALUE_HEAD_DIM;
-                qw6_cpu_rmsnorm(dst, gdn + h * QW6_VALUE_HEAD_DIM,
-                                dn_norm_w, QW6_VALUE_HEAD_DIM);
-                for (int i = 0; i < QW6_VALUE_HEAD_DIM; i++)
-                    dst[i] *= qw6_silu(z[h * QW6_VALUE_HEAD_DIM + i]);
+            /* Fused output RMSNorm + SiLU(z) gate (GPU with CPU fallback) */
+            if (qw6_vk_pipe_deltanet_norm_gate(p, nrm, &m->layers[l].dn_norm,
+                                               s0, s1,
+                                               QW6_NUM_VALUE_HEADS,
+                                               QW6_VALUE_HEAD_DIM) != 0) {
+                float *dn_norm_w = (float *)m->layers[l].dn_norm.data;
+                float *gated = (float *)s1->mapped;
+                float *gdn_cpu = (float *)nrm->mapped;
+                for (int h = 0; h < QW6_NUM_VALUE_HEADS; h++) {
+                    float *dst = gated + h * QW6_VALUE_HEAD_DIM;
+                    qw6_cpu_rmsnorm(dst, gdn_cpu + h * QW6_VALUE_HEAD_DIM,
+                                    dn_norm_w + h * QW6_VALUE_HEAD_DIM,
+                                    QW6_VALUE_HEAD_DIM);
+                    for (int i = 0; i < QW6_VALUE_HEAD_DIM; i++)
+                        dst[i] *= qw6_silu(z[h * QW6_VALUE_HEAD_DIM + i]);
+                }
+                memcpy(s1->mapped, gated, QW6_LINEAR_VALUE_DIM * sizeof(float));
             }
-            memcpy(s1->mapped, gated, QW6_LINEAR_VALUE_DIM * sizeof(float));
 
             /* Output projection: dn_out * gated -> attn */
             VK_MATMUL(&m->layers[l].dn_out, s1, att,
