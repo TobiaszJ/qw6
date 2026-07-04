@@ -86,6 +86,7 @@ Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders.
 
 - [ ] Add a real reference-logit harness before any more performance claims. It must compare tokenizer IDs, prompt tokens, layer outputs, final logits, top-k logits, and generated token IDs against llama.cpp for the exact GGUF, prompt, context length, and sampling settings.
 - [ ] Implement `--dump-logits`, `--dump-logprobs`, and layer/tensor trace dumping for both CPU and Vulkan paths. Without dumps, there is no way to isolate whether bad output comes from tokenizer, quant dequant, attention, DeltaNet, MoE, or sampling.
+- [x] Add structured trace JSON output (`--trace-json`) for prompt tokens, generated tokens, and top logits after prefill/final token.
 - [ ] Establish CPU vs Vulkan parity for one token and for a multi-token prompt. The Vulkan path currently has separate math from the CPU path in Conv1D, Gated DeltaNet, attention, routing, and quant matmuls.
 - [ ] Validate the final generated text, not only that the process runs. Current output has not been proven semantically or numerically correct.
 - [ ] Make correctness tests fail hard on any CPU fallback in Vulkan performance mode. Today unsupported GPU quant or long-context attention can silently fall back to CPU.

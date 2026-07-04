@@ -2782,12 +2782,10 @@ void qw6_dump_tokens(const uint32_t *tokens, uint32_t n) {
     printf("] (%u tokens)\n", n);
 }
 
-void qw6_dump_logits(const float *logits, int n, int top_k) {
+static int qw6_topk_logits(const float *logits, int n, int top_k,
+                           int *idx, float *val) {
     QW6_ASSERT_PTR(logits);
-    int *idx = malloc((size_t)top_k * sizeof(int));
-    float *val = malloc((size_t)top_k * sizeof(float));
     QW6_ASSERT_PTR(idx); QW6_ASSERT_PTR(val);
-
     for (int k = 0; k < top_k; k++) { idx[k] = -1; val[k] = -INFINITY; }
     for (int i = 0; i < n; i++) {
         for (int k = 0; k < top_k; k++) {
@@ -2797,6 +2795,16 @@ void qw6_dump_logits(const float *logits, int n, int top_k) {
             }
         }
     }
+    return 0;
+}
+
+void qw6_dump_logits(const float *logits, int n, int top_k) {
+    QW6_ASSERT_PTR(logits);
+    int *idx = malloc((size_t)top_k * sizeof(int));
+    float *val = malloc((size_t)top_k * sizeof(float));
+    QW6_ASSERT_PTR(idx); QW6_ASSERT_PTR(val);
+
+    qw6_topk_logits(logits, n, top_k, idx, val);
     printf("Top-%d logits:\n", top_k);
     for (int k = 0; k < top_k; k++) printf("  token %d: %.6f\n", idx[k], val[k]);
     free(idx); free(val);
@@ -2832,6 +2840,98 @@ void qw6_dump_logprobs(const float *logits, int n, int top_k) {
     for (int k = 0; k < top_k; k++)
         printf("  token %d: %.6f (prob=%.4f)\n", idx[k], val[k], expf(val[k]));
     free(idx); free(val);
+}
+
+static void qw6_json_escape(FILE *f, const char *s) {
+    fputc('"', f);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
+        case '\\': fputs("\\\\", f); break;
+        case '"': fputs("\\\"", f); break;
+        case '\b': fputs("\\b", f); break;
+        case '\f': fputs("\\f", f); break;
+        case '\n': fputs("\\n", f); break;
+        case '\r': fputs("\\r", f); break;
+        case '\t': fputs("\\t", f); break;
+        default:
+            if (*p < 0x20) fprintf(f, "\\u%04x", *p);
+            else fputc(*p, f);
+            break;
+        }
+    }
+    fputc('"', f);
+}
+
+static void qw6_json_write_topk(FILE *f, const float *logits, int n, int top_k,
+                                bool logprob_mode) {
+    int *idx = malloc((size_t)top_k * sizeof(int));
+    float *val = malloc((size_t)top_k * sizeof(float));
+    if (!idx || !val) {
+        free(idx); free(val);
+        fputs("[]", f);
+        return;
+    }
+
+    if (logprob_mode) {
+        double max_val = (double)logits[0];
+        for (int i = 1; i < n; i++) if ((double)logits[i] > max_val) max_val = (double)logits[i];
+        double sum = 0.0;
+        for (int i = 0; i < n; i++) sum += exp((double)logits[i] - max_val);
+        double log_sum = log(sum);
+        for (int k = 0; k < top_k; k++) { idx[k] = -1; val[k] = -INFINITY; }
+        for (int i = 0; i < n; i++) {
+            float lp = (float)((double)logits[i] - max_val - log_sum);
+            for (int k = 0; k < top_k; k++) {
+                if (lp > val[k]) {
+                    for (int j = top_k - 1; j > k; j--) { val[j] = val[j-1]; idx[j] = idx[j-1]; }
+                    val[k] = lp; idx[k] = i; break;
+                }
+            }
+        }
+    } else {
+        qw6_topk_logits(logits, n, top_k, idx, val);
+    }
+
+    fputc('[', f);
+    for (int k = 0; k < top_k; k++) {
+        if (k) fputs(", ", f);
+        fprintf(f, "{\"token\":%d,\"value\":%.6f}", idx[k], val[k]);
+    }
+    fputc(']', f);
+    free(idx); free(val);
+}
+
+static int qw6_write_trace_json(const char *path, const char *model_path,
+                                const char *prompt, const char *backend,
+                                const uint32_t *prompt_tokens, uint32_t prompt_n,
+                                const uint32_t *generated_tokens, uint32_t gen_n,
+                                const float *prefill_logits, const float *final_logits) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fprintf(f, "{\n");
+    fprintf(f, "  \"model_path\": ");
+    qw6_json_escape(f, model_path ? model_path : "");
+    fprintf(f, ",\n  \"backend\": ");
+    qw6_json_escape(f, backend ? backend : "cpu");
+    fprintf(f, ",\n  \"prompt\": ");
+    qw6_json_escape(f, prompt ? prompt : "");
+    fprintf(f, ",\n  \"prompt_tokens\": [");
+    for (uint32_t i = 0; i < prompt_n; i++) {
+        if (i) fputs(", ", f);
+        fprintf(f, "%u", prompt_tokens[i]);
+    }
+    fprintf(f, "],\n  \"generated_tokens\": [");
+    for (uint32_t i = 0; i < gen_n; i++) {
+        if (i) fputs(", ", f);
+        fprintf(f, "%u", generated_tokens[i]);
+    }
+    fprintf(f, "],\n  \"prefill_top_logits\": ");
+    qw6_json_write_topk(f, prefill_logits, QW6_VOCAB_SIZE, 10, false);
+    fprintf(f, ",\n  \"final_top_logits\": ");
+    qw6_json_write_topk(f, final_logits, QW6_VOCAB_SIZE, 10, false);
+    fprintf(f, "\n}\n");
+    fclose(f);
+    return 0;
 }
 
 /* ---- NaN/Inf detection ---- */
@@ -3071,6 +3171,7 @@ static void usage(void) {
         "  --dump-tokens   Tokenise prompt and exit\n"
         "  --dump-logits   Dump top-10 logits after prefill and each generated token\n"
         "  --dump-logprobs Dump top-10 log-probabilities with token probabilities\n"
+        "  --trace-json <P> Write a structured trace JSON file after generation\n"
         "  --inspect-gguf  Inspect GGUF header and exit\n"
         "  --load-only     Load and validate model metadata, then exit\n"
         "  --self-test     Run CPU kernel self-tests and exit\n"
@@ -3086,6 +3187,7 @@ int main(int argc, char **argv) {
     const char *inspect_path = NULL;
     const char *prompt = NULL;
     const char *tok_path = "tokenizer/tokenizer.json";
+    const char *trace_json_path = NULL;
     int n_tokens = 256;
     int ctx = QW6_DEFAULT_CTX;
     float temp = 0.0f;
@@ -3094,6 +3196,7 @@ int main(int argc, char **argv) {
     bool bench = false, self_test = false;
     bool use_vulkan = false, vulkan_self_test = false;
     bool load_only = false, raw_prompt = false;
+    const char *backend = "cpu";
 #ifdef QW6_VULKAN
     void *pipe = NULL;
     int vk_pipe_ok = 0;
@@ -3112,6 +3215,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--dump-tokens") == 0) dump_tokens = true;
         else if (strcmp(argv[i], "--dump-logits") == 0) dump_logits = true;
         else if (strcmp(argv[i], "--dump-logprobs") == 0) dump_logprobs = true;
+        else if (strcmp(argv[i], "--trace-json") == 0 && i+1 < argc) trace_json_path = argv[++i];
         else if (strcmp(argv[i], "--load-only") == 0) load_only = true;
         else if (strcmp(argv[i], "--self-test") == 0) self_test = true;
         else if (strcmp(argv[i], "--bench") == 0) bench = true;
@@ -3296,6 +3400,7 @@ int main(int argc, char **argv) {
     if (use_vulkan) {
         fprintf(stderr, "qw6: using %s for inference\n",
                 vk_pipe_ok ? "Vulkan GPU pipeline" : "CPU fallback");
+        backend = vk_pipe_ok ? "vulkan" : "cpu-fallback";
     }
 #endif
     session.greedy = (temp <= 0.0f);
@@ -3303,6 +3408,7 @@ int main(int argc, char **argv) {
     session.dump_logprobs = dump_logprobs;
 
     if (prompt) {
+        float *prefill_logits_snapshot = NULL;
         if (seed == 0) seed = (unsigned int)time(NULL);
         srand(seed);
         fprintf(stderr, "qw6: prompt: \"%s\"\n", prompt);
@@ -3360,6 +3466,13 @@ int main(int argc, char **argv) {
             fprintf(stderr, "\n=== Prefill logprobs (last prompt token) ===\n");
             qw6_dump_logprobs(session.logits, QW6_VOCAB_SIZE, 10);
         }
+        if (trace_json_path) {
+            prefill_logits_snapshot = malloc((size_t)QW6_VOCAB_SIZE * sizeof(float));
+            if (prefill_logits_snapshot) {
+                memcpy(prefill_logits_snapshot, session.logits,
+                       (size_t)QW6_VOCAB_SIZE * sizeof(float));
+            }
+        }
 
         fprintf(stderr, "qw6: generating %d tokens...\n", n_tokens);
         clock_t start = clock();
@@ -3383,6 +3496,18 @@ int main(int argc, char **argv) {
                 qw6_dump_logprobs(session.logits, QW6_VOCAB_SIZE, 10);
             }
         }
+        if (trace_json_path && prefill_logits_snapshot) {
+            const uint32_t *gen_tokens = (gen > 0) ? (session.tokens + n) : NULL;
+            uint32_t gen_n = gen > 0 ? (uint32_t)gen : 0;
+            if (qw6_write_trace_json(trace_json_path, model_path, prompt, backend,
+                                     tokens, n, gen_tokens, gen_n,
+                                     prefill_logits_snapshot, session.logits) != 0) {
+                fprintf(stderr, "qw6: failed to write trace JSON to %s\n", trace_json_path);
+            } else {
+                fprintf(stderr, "qw6: wrote trace JSON to %s\n", trace_json_path);
+            }
+        }
+        free(prefill_logits_snapshot);
         fprintf(stderr, "qw6: %d tokens in %.2fs\n", gen, elapsed);
         free(tokens);
     }
