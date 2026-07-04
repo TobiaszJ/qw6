@@ -2013,6 +2013,8 @@ struct qw6_vk_pipe_s {
     qw6_vk_buffer_t scr_s1;        /* [HIDDEN_SIZE*2] float */
     qw6_vk_buffer_t scr_logits;    /* [VOCAB_SIZE] float */
     qw6_vk_buffer_t scr_sample;    /* [1] uint32_t */
+    qw6_vk_buffer_t scr_moe_idx;   /* [QW6_EXPERTS_PER_TOK] uint32_t */
+    qw6_vk_buffer_t scr_moe_w;     /* [QW6_EXPERTS_PER_TOK] float */
 
     /* KV cache for full-attn layers */
     qw6_vk_buffer_t k_cache[QW6_NUM_LAYERS];
@@ -2401,7 +2403,7 @@ __attribute__((unused)) static int qw6_vk_pipe_deltanet_update(struct qw6_vk_pip
                                 (state_n + 255) / 256, 1, 1);
 }
 
-__attribute__((unused)) static int qw6_vk_pipe_moe_route(struct qw6_vk_pipe_s *p,
+static int qw6_vk_pipe_moe_route(struct qw6_vk_pipe_s *p,
                                   qw6_vk_buffer_t *logits,
                                   qw6_vk_buffer_t *indices,
                                   qw6_vk_buffer_t *weights,
@@ -2559,6 +2561,23 @@ static int qw6_vk_pipe_deltanet_norm_gate(struct qw6_vk_pipe_s *p,
                                 val_heads, 1, 1);
 }
 
+typedef struct {
+    uint32_t n;
+    float a;
+} qw6_vk_axpy_push_t;
+
+static int qw6_vk_pipe_axpy(struct qw6_vk_pipe_s *p,
+                             qw6_vk_buffer_t *y,
+                             qw6_vk_buffer_t *x,
+                             float a, uint32_t n) {
+    const size_t zero[2] = {0, 0};
+    qw6_vk_buffer_t *bufs[2] = {y, x};
+    qw6_vk_axpy_push_t push = {.n = n, .a = a};
+    return qw6_vk_pipe_dispatch(p, "vulkan/vec_axpy.spv",
+                                bufs, zero, 2, &push, sizeof(push),
+                                (n + 255) / 256, 1, 1);
+}
+
 /* ---- Init ---- */
 
 int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m) {
@@ -2642,6 +2661,14 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m) {
     VK_BUF_SZ(scr_logits, QW6_VOCAB_SIZE);
     /* Small uint32 sample output buffer */
     if (qw6_vk_buffer_create(&ctx->vk, &ctx->scr_sample, sizeof(uint32_t),
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0)
+        { qw6_vk_pipe_free(ctx); return -1; }
+    if (qw6_vk_buffer_create(&ctx->vk, &ctx->scr_moe_idx,
+                             QW6_EXPERTS_PER_TOK * sizeof(uint32_t),
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0)
+        { qw6_vk_pipe_free(ctx); return -1; }
+    if (qw6_vk_buffer_create(&ctx->vk, &ctx->scr_moe_w,
+                             QW6_EXPERTS_PER_TOK * sizeof(float),
                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0)
         { qw6_vk_pipe_free(ctx); return -1; }
 #undef VK_BUF_SZ
@@ -3060,12 +3087,21 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
         VK_MATMUL(&m->layers[l].moe_router, nrm, s0,
                   QW6_NUM_EXPERTS, QW6_HIDDEN_SIZE);
 
-        /* Read back router logits and do CPU MoE routing */
-        float *router_logits = (float *)s0->mapped;
+        /* GPU MoE routing with CPU fallback */
         int idx[QW6_EXPERTS_PER_TOK] = {0};
         float w[QW6_EXPERTS_PER_TOK] = {0};
-        qw6_cpu_moe_route(idx, w, router_logits,
-                          QW6_NUM_EXPERTS, QW6_EXPERTS_PER_TOK);
+        if (qw6_vk_pipe_moe_route(p, s0, &p->scr_moe_idx, &p->scr_moe_w,
+                                  QW6_NUM_EXPERTS, QW6_EXPERTS_PER_TOK) != 0) {
+            float *router_logits = (float *)s0->mapped;
+            qw6_cpu_moe_route(idx, w, router_logits,
+                              QW6_NUM_EXPERTS, QW6_EXPERTS_PER_TOK);
+        } else {
+            /* Read back GPU routing results (only 8 indices + 8 weights) */
+            uint32_t idx32[QW6_EXPERTS_PER_TOK];
+            memcpy(idx32, p->scr_moe_idx.mapped, sizeof(idx32));
+            memcpy(w, p->scr_moe_w.mapped, sizeof(w));
+            for (int e = 0; e < QW6_EXPERTS_PER_TOK; e++) idx[e] = (int)idx32[e];
+        }
 
         /* Zero out FFN output on GPU */
         memset(ffn->mapped, 0, QW6_HIDDEN_SIZE * sizeof(float));
@@ -3087,12 +3123,15 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
             /* down = expert_down * mid  (reuse nrm buffer) */
             VK_MATMUL(ed, s0, nrm, QW6_HIDDEN_SIZE, QW6_MOE_INTER);
 
-            /* Accumulate: ffn += w[e] * nrm */
-            float *ffn_p = (float *)ffn->mapped;
-            float *tmp_p = (float *)nrm->mapped;
-            for (int i = 0; i < QW6_HIDDEN_SIZE; i++)
-                ffn_p[i] += w[e] * tmp_p[i];
-            memcpy(ffn->mapped, ffn_p, QW6_HIDDEN_SIZE * sizeof(float));
+            /* Accumulate: ffn += w[e] * nrm (GPU axpy with CPU fallback) */
+            if (qw6_vk_pipe_axpy(p, ffn, nrm, w[e],
+                                 QW6_HIDDEN_SIZE) != 0) {
+                float *ffn_p = (float *)ffn->mapped;
+                float *tmp_p = (float *)nrm->mapped;
+                for (int i = 0; i < QW6_HIDDEN_SIZE; i++)
+                    ffn_p[i] += w[e] * tmp_p[i];
+                memcpy(ffn->mapped, ffn_p, QW6_HIDDEN_SIZE * sizeof(float));
+            }
         }
 
         /* Shared expert */
@@ -3116,11 +3155,15 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
             VK_MATMUL(&m->layers[l].shared_down, s0, nrm,
                       QW6_HIDDEN_SIZE, QW6_SHARED_INTER);
 
-            float *ffn_p = (float *)ffn->mapped;
-            float *tmp_p = (float *)nrm->mapped;
-            for (int i = 0; i < QW6_HIDDEN_SIZE; i++)
-                ffn_p[i] += shared_weight * tmp_p[i];
-            memcpy(ffn->mapped, ffn_p, QW6_HIDDEN_SIZE * sizeof(float));
+            /* Accumulate: ffn += shared_weight * nrm (GPU axpy with CPU fallback) */
+            if (qw6_vk_pipe_axpy(p, ffn, nrm, shared_weight,
+                                 QW6_HIDDEN_SIZE) != 0) {
+                float *ffn_p = (float *)ffn->mapped;
+                float *tmp_p = (float *)nrm->mapped;
+                for (int i = 0; i < QW6_HIDDEN_SIZE; i++)
+                    ffn_p[i] += shared_weight * tmp_p[i];
+                memcpy(ffn->mapped, ffn_p, QW6_HIDDEN_SIZE * sizeof(float));
+            }
         }
 
         /* Residual: hidden = resid + ffn */
@@ -3201,6 +3244,8 @@ void qw6_vk_pipe_free(qw6_vk_pipe_t *p) {
     if (p->scr_s1.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_s1);
     if (p->scr_logits.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_logits);
     if (p->scr_sample.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_sample);
+    if (p->scr_moe_idx.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_moe_idx);
+    if (p->scr_moe_w.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_moe_w);
     for (int i = 0; i < QW6_NUM_LAYERS; i++) {
         if (qw6_layer_type(i) == QW6_LAYER_FULL_ATTN) {
             if (p->k_cache[i].buffer) qw6_vk_buffer_destroy(&p->vk, &p->k_cache[i]);

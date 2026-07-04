@@ -1,0 +1,20 @@
+#version 450
+
+/* Element-wise: y[i] += a * x[i]
+ * Used for weighted MoE expert accumulation. */
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Y { float y[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+
+layout(push_constant) uniform Push {
+    uint n;
+    float a;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    y[i] += pc.a * x[i];
+}
