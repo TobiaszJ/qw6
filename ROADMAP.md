@@ -73,11 +73,12 @@ reference logits.
 Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders. Match or
 exceed llama.cpp Vulkan performance as baseline.
 
-- [ ] Vulkan device initialization
-- [ ] memory management for GTT-backed unified buffers
+- [x] Vulkan device initialization
+- [x] host-visible buffer allocation and compute dispatch self-test
+- [x] SPIR-V shader build via `glslc`
 - [ ] `matmul_iq2.comp` for IQ2 routed experts
 - [ ] `matmul_q4k.comp`, `matmul_q5k.comp`, `matmul_q6k.comp`
-- [ ] `rmsnorm.comp`
+- [ ] `rmsnorm.comp` (partial: reduction shader scaffold)
 - [ ] `rope_mrope.comp`
 - [ ] `attention_gqa.comp`
 - [ ] `deltanet_conv1d.comp`
@@ -86,13 +87,19 @@ exceed llama.cpp Vulkan performance as baseline.
 - [ ] `moe_route.comp`
 - [ ] `moe_gather.comp`
 - [ ] `mtp_draft.comp`
-- [ ] `argmax.comp` / `sampling.comp`
-- [ ] pipeline barriers and dispatch orchestration
-- [ ] `make vulkan` build target
+- [ ] `argmax.comp` / `sampling.comp` (partial: single-dispatch scaffold)
+- [ ] pipeline barriers and dispatch orchestration (partial: backend self-test only)
+- [x] `make vulkan` build target
 - [ ] performance benchmark vs llama.cpp Vulkan baseline
 
-**Deliverable:** `./qw6 -p "Hello" --vulkan` at or above the current BC-250
-llama.cpp baseline.
+**Current Vulkan smoke path:** `make vulkan && ./qw6 --vulkan-self-test`
+compiles SPIR-V shaders, selects the BC-250 RADV device, dispatches a compute
+shader, and validates results on the host. `./qw6 ... --vulkan` currently
+initializes the Phase 2 binary path but still falls back to CPU kernels for
+full model inference.
+
+**Deliverable:** `./qw6 -p "Hello" --vulkan` with all 40 layers on GPU at or
+above the current BC-250 llama.cpp baseline.
 
 ---
 

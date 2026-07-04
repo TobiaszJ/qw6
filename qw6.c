@@ -19,6 +19,9 @@
 #include "qw6.h"
 #include "qw6_tok.h"
 #include "qw6_iq_tables.h"
+#ifdef QW6_VULKAN
+#include "qw6_vk.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -2720,6 +2723,7 @@ static void usage(void) {
         "  --nothink       Disable thinking mode\n"
         "  --cpu           CPU backend (default)\n"
         "  --vulkan        Vulkan backend (Phase 2)\n"
+        "  --vulkan-self-test Run Vulkan compute backend self-test\n"
         "  --dump-tokens   Tokenise prompt and exit\n"
         "  --inspect-gguf  Inspect GGUF header and exit\n"
         "  --load-only     Load and validate model metadata, then exit\n"
@@ -2739,6 +2743,7 @@ int main(int argc, char **argv) {
     int ctx = QW6_DEFAULT_CTX;
     float temp = 0.0f;
     bool nothink = false, dump_tokens = false, bench = false, self_test = false;
+    bool use_vulkan = false, vulkan_self_test = false;
     bool load_only = false;
 
     for (int i = 1; i < argc; i++) {
@@ -2754,10 +2759,10 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--load-only") == 0) load_only = true;
         else if (strcmp(argv[i], "--self-test") == 0) self_test = true;
         else if (strcmp(argv[i], "--bench") == 0) bench = true;
-        else if (strcmp(argv[i], "--cpu") == 0) { /* default */ }
-        else if (strcmp(argv[i], "--vulkan") == 0) {
-            fprintf(stderr, "qw6: Vulkan backend not yet available (Phase 2)\n");
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+        else if (strcmp(argv[i], "--cpu") == 0) { use_vulkan = false; }
+        else if (strcmp(argv[i], "--vulkan") == 0) { use_vulkan = true; }
+        else if (strcmp(argv[i], "--vulkan-self-test") == 0) { vulkan_self_test = true; }
+        else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(); return 0;
         } else {
             fprintf(stderr, "qw6: unknown option: %s\n", argv[i]);
@@ -2766,6 +2771,14 @@ int main(int argc, char **argv) {
     }
 
     if (self_test) return qw6_selftest();
+#ifdef QW6_VULKAN
+    if (vulkan_self_test) return qw6_vk_selftest();
+#else
+    if (vulkan_self_test) {
+        fprintf(stderr, "qw6: built without Vulkan support; use make vulkan\n");
+        return 1;
+    }
+#endif
     if (inspect_path) return qw6_gguf_inspect_file(inspect_path);
 
     if (!prompt && !bench && !load_only) {
@@ -2773,7 +2786,18 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    fprintf(stderr, "qw6 %s -- Phase %d (CPU reference)\n", QW6_VERSION, QW6_BUILD_PHASE);
+    fprintf(stderr, "qw6 %s -- Phase %d (%s)\n", QW6_VERSION, QW6_BUILD_PHASE,
+            use_vulkan ? "Vulkan requested" : "CPU reference");
+#ifndef QW6_VULKAN
+    if (use_vulkan) {
+        fprintf(stderr, "qw6: this binary was built without Vulkan; use make vulkan\n");
+        return 1;
+    }
+#else
+    if (use_vulkan) {
+        fprintf(stderr, "qw6: Vulkan runtime is available; full inference still uses CPU fallback kernels\n");
+    }
+#endif
     fprintf(stderr, "Model: Qwen 3.6-35B-A3B (35B total, 3B active, 256 experts)\n");
     fprintf(stderr, "Architecture: hybrid attention (30 Gated DeltaNet + 10 Gated Attention)\n\n");
 

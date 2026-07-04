@@ -1,0 +1,52 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) writeonly buffer Out {
+    uint idx;
+    uint val_bits;
+} outv;
+layout(set = 0, binding = 2) buffer Scratch {
+    uvec2 partial[];
+} scratch;
+
+layout(push_constant) uniform Push {
+    uint n;
+} pc;
+
+shared uint sidx[256];
+shared float sval[256];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+    uint best_i = 0;
+    float best_v = -3.4028234663852886e38;
+    for (uint i = gid; i < pc.n; i += gl_WorkGroupSize.x * gl_NumWorkGroups.x) {
+        float v = x[i];
+        if (v > best_v) {
+            best_v = v;
+            best_i = i;
+        }
+    }
+    sidx[lid] = best_i;
+    sval[lid] = best_v;
+    barrier();
+
+    for (uint stride = gl_WorkGroupSize.x >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride && sval[lid + stride] > sval[lid]) {
+            sval[lid] = sval[lid + stride];
+            sidx[lid] = sidx[lid + stride];
+        }
+        barrier();
+    }
+
+    if (lid == 0) {
+        scratch.partial[gl_WorkGroupID.x] = uvec2(sidx[0], floatBitsToUint(sval[0]));
+        if (gl_NumWorkGroups.x == 1) {
+            outv.idx = sidx[0];
+            outv.val_bits = floatBitsToUint(sval[0]);
+        }
+    }
+}

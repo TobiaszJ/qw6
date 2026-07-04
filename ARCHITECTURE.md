@@ -22,12 +22,16 @@ path before the Vulkan backend:
   probe against real Qwen3.6 weights.
 - Native greedy generation has a CPU smoke path through all 40 layers with
   KV cache, DeltaNet state, Conv1D state, final norm, and output logits.
+- Phase 2 has a Vulkan runtime smoke layer: device selection, host-visible
+  buffers, descriptor/pipeline creation, SPIR-V shader build, and a verified
+  compute dispatch on BC-250 RADV.
 
 Not yet implemented:
 
 - reference-logit parity for the 40-layer native forward pass
 - optimized/chunked prefill
 - text-quality validation beyond smoke generation
+- GPU dispatch orchestration for full 40-layer model inference
 
 The old experimental external `llama.cpp` generation bridge is not part of the
 native engine path.

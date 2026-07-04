@@ -11,7 +11,10 @@ VULKAN_LIBS ?= $(shell pkg-config --libs vulkan 2>/dev/null || echo "-lvulkan")
 
 # Sources
 SRCS = qw6.c qw6_tok.c
+VULKAN_SRCS = qw6.c qw6_tok.c qw6_vk.c
 SERVER_SRCS = qw6.c qw6_tok.c qw6-server.c
+VULKAN_SHADERS = vulkan/rmsnorm.comp vulkan/vec_add.comp vulkan/silu_mul.comp vulkan/argmax.comp
+VULKAN_SPV = $(VULKAN_SHADERS:.comp=.spv)
 
 # Output binaries
 BIN = qw6
@@ -19,7 +22,7 @@ SERVER = qw6-server
 TEST_BUILD_DIR = .build
 TEST_TOK_BIN = $(TEST_BUILD_DIR)/test_tok
 
-.PHONY: all cpu vulkan server test bench clean help
+.PHONY: all cpu vulkan shaders server test bench clean help
 
 all: cpu
 
@@ -41,7 +44,13 @@ cpu: $(BIN)
 # Vulkan build (Phase 2)
 vulkan: CFLAGS += -DQW6_VULKAN $(VULKAN_CFLAGS)
 vulkan: LDFLAGS += $(VULKAN_LIBS)
-vulkan: $(BIN)
+vulkan: shaders
+	$(CC) $(CFLAGS) -o $(BIN) $(VULKAN_SRCS) $(LDFLAGS)
+
+shaders: $(VULKAN_SPV)
+
+%.spv: %.comp
+	glslc -O $< -o $@
 
 # Server build (Phase 4)
 server: $(SERVER)
@@ -71,4 +80,4 @@ bench: $(BIN)
 
 clean:
 	rm -rf $(TEST_BUILD_DIR)
-	rm -f $(BIN) $(SERVER) *.o *.obj
+	rm -f $(BIN) $(SERVER) *.o *.obj $(VULKAN_SPV)

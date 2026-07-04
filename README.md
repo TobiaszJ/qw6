@@ -40,8 +40,7 @@ project builds on top of that.
 
 **Pre-alpha. Native CPU reference path in progress.**
 
-Full end-to-end generation is not functional yet, but `qw6` now performs real
-native work against Qwen 3.6 GGUF weights:
+`qw6` now performs real native work against Qwen 3.6 GGUF weights:
 
 - GGUF v3 metadata parsing and model validation for Unsloth/llama.cpp Qwen3.6 layouts (`qwen35moe`)
 - `mmap`-backed weight access with tensor offsets, shapes, quant types, and byte spans
@@ -50,6 +49,8 @@ native work against Qwen 3.6 GGUF weights:
 - CPU kernels and probes for RMSNorm, top-k MoE routing, routed/shared-expert FFN, and native matvec
 - native dequantization for F32, F16, BF16, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_S, and IQ3_S
 - layer-0 Gated DeltaNet single-token forward probe through SSM conv, GDN update, gated norm, and `ssm_out`
+- 40-layer CPU greedy generation smoke path
+- Phase 2 Vulkan runtime smoke path with SPIR-V shader build and compute dispatch self-test
 
 The repository currently contains CPU engine code, tokenizer implementation,
 native GGUF loader/indexing, kernel scaffolding, and design documentation:
@@ -74,13 +75,16 @@ be run with:
 ```bash
 ./qw6 --load-only -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf
 ./qw6 -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf -p "Hello" -n 2 --nothink
+make vulkan && ./qw6 --vulkan-self-test
 ```
 
 Expected current behavior: model metadata validation passes and native probes
 print tensor checksums, router top-k experts, routed/shared-FFN summaries, and a
 layer-0 DeltaNet forward checksum. The generation command runs a native
 40-layer CPU smoke path and prints greedy token IDs plus decoded text; reference
-logit parity and performance work are still pending.
+logit parity and performance work are still pending. The Vulkan self-test
+selects the BC-250 RADV device and validates a real compute dispatch; full
+model inference still uses CPU fallback kernels when `--vulkan` is requested.
 
 ## Acknowledgements
 

@@ -1,0 +1,32 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer W { float w[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(set = 0, binding = 3) buffer Scratch { float partial[]; };
+
+layout(push_constant) uniform Push {
+    uint n;
+    float eps;
+} pc;
+
+shared float sums[256];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+    float s = 0.0;
+    for (uint i = gid; i < pc.n; i += gl_WorkGroupSize.x * gl_NumWorkGroups.x) {
+        s += x[i] * x[i];
+    }
+    sums[lid] = s;
+    barrier();
+
+    for (uint stride = gl_WorkGroupSize.x >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) sums[lid] += sums[lid + stride];
+        barrier();
+    }
+    if (lid == 0) partial[gl_WorkGroupID.x] = sums[0];
+}

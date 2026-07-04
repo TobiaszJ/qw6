@@ -415,6 +415,10 @@ void qw6_dump_logits(const float *logits, int n, int top_k);
 
 /* Version */
 #define QW6_VERSION "0.0.1-prealpha"
-#define QW6_BUILD_PHASE 1  /* 0=research, 1=cpu-ref, 2=vulkan */
+#ifdef QW6_VULKAN
+#define QW6_BUILD_PHASE 2  /* 0=research, 1=cpu-ref, 2=vulkan */
+#else
+#define QW6_BUILD_PHASE 1
+#endif
 
 #endif /* QW6_H */
