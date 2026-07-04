@@ -29,6 +29,9 @@ ds4flash.gguf
 .DS_Store
 Thumbs.db
 
+# Test builds
+.build/
+
 # Vulkan shader cache
 shader_cache/
 vulkan/*.spv
