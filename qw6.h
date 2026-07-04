@@ -103,7 +103,7 @@ typedef struct {
     size_t data_size;   /* bytes */
     uint64_t file_offset;
 #ifdef QW6_VULKAN
-    size_t vk_offset;   /* byte offset in GPU weight buffer (0 = not uploaded) */
+    size_t vk_offset;   /* byte offset in GPU weight buffer ((size_t)-1 = not uploaded) */
 #endif
 } qw6_tensor_t;
 
