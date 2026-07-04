@@ -2002,7 +2002,7 @@ struct qw6_vk_pipe_s {
 
 /* Cached dispatch: same as qw6_vk_dispatch but reuses pipelines and layouts.
  * Must be defined here (after struct) so it can access the cache. */
-static int qw6_vk_pipe_dispatch(struct qw6_vk_pipe_s *p, const char *shader_path,
+__attribute__((unused)) static int qw6_vk_pipe_dispatch(struct qw6_vk_pipe_s *p, const char *shader_path,
                                  qw6_vk_buffer_t **buffers, const size_t *offsets,
                                  uint32_t n_buffers,
                                  const void *push, uint32_t push_size,
@@ -2164,21 +2164,21 @@ static int qw6_vk_pipe_matvec(struct qw6_vk_pipe_s *p,
 
     switch (t->quant) {
     case QW6_Q_FP32:
-        return qw6_vk_pipe_dispatch(p, "vulkan/matvec_f32.spv",
+        return qw6_vk_dispatch(&p->vk, "vulkan/matvec_f32.spv",
                                bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
     case QW6_Q_Q5_K:
-        return qw6_vk_pipe_dispatch(p, "vulkan/matmul_q5k.spv",
+        return qw6_vk_dispatch(&p->vk, "vulkan/matmul_q5k.spv",
                                bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
     case QW6_Q_Q6_K:
-        return qw6_vk_pipe_dispatch(p, "vulkan/matmul_q6k.spv",
+        return qw6_vk_dispatch(&p->vk, "vulkan/matmul_q6k.spv",
                                bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
     case QW6_Q_Q4_K_M:
     case QW6_Q_Q4_K_S:
-        return qw6_vk_pipe_dispatch(p, "vulkan/matmul_q4k.spv",
+        return qw6_vk_dispatch(&p->vk, "vulkan/matmul_q4k.spv",
                                bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
     case QW6_Q_IQ2_XXS:
     case QW6_Q_IQ2_M:
-        return qw6_vk_pipe_dispatch(p, "vulkan/matmul_iq2xxs.spv",
+        return qw6_vk_dispatch(&p->vk, "vulkan/matmul_iq2xxs.spv",
                                bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
     default:
         /* Unsupported on GPU — caller must fall back to CPU */
@@ -2194,7 +2194,7 @@ static int qw6_vk_pipe_rmsnorm(struct qw6_vk_pipe_s *p,
     const size_t zero[3] = {0, 0, 0};
     qw6_vk_buffer_t *bufs[3] = {x, w, y};
     qw6_vk_rmsnorm_push_t push = {.n = n, .eps = eps};
-    return qw6_vk_pipe_dispatch(p, "vulkan/rmsnorm_full.spv",
+    return qw6_vk_dispatch(&p->vk, "vulkan/rmsnorm_full.spv",
                            bufs, zero, 3, &push, sizeof(push), 1, 1, 1);
 }
 
@@ -2203,7 +2203,7 @@ static int qw6_vk_pipe_add(struct qw6_vk_pipe_s *p,
                             qw6_vk_buffer_t *c, uint32_t n) {
     const size_t zero[3] = {0, 0, 0};
     qw6_vk_buffer_t *bufs[3] = {a, b, c};
-    return qw6_vk_pipe_dispatch(p, "vulkan/add.spv",
+    return qw6_vk_dispatch(&p->vk, "vulkan/add.spv",
                            bufs, zero, 3, &n, sizeof(n),
                            (n + 255) / 256, 1, 1);
 }
@@ -2214,7 +2214,7 @@ static int qw6_vk_pipe_silu_mul(struct qw6_vk_pipe_s *p,
     const size_t zero[3] = {0, 0, 0};
     qw6_vk_buffer_t *bufs[3] = {gate, up, out};
     qw6_vk_n_push_t push = {.n = n};
-    return qw6_vk_pipe_dispatch(p, "vulkan/silu_mul.spv",
+    return qw6_vk_dispatch(&p->vk, "vulkan/silu_mul.spv",
                            bufs, zero, 3, &push, sizeof(push),
                            (n + 255) / 256, 1, 1);
 }
@@ -2235,7 +2235,7 @@ __attribute__((unused)) static int qw6_vk_pipe_mrope(struct qw6_vk_pipe_s *p,
         .theta_base = QW6_ROPE_THETA,
     };
     uint32_t total_pairs = (q_dim + kv_dim) / 2;
-    return qw6_vk_pipe_dispatch(p, "vulkan/rope_mrope.spv",
+    return qw6_vk_dispatch(&p->vk, "vulkan/rope_mrope.spv",
                            bufs, zero, 2, &push, sizeof(push),
                            (total_pairs + 255) / 256, 1, 1);
 }
@@ -2257,7 +2257,7 @@ __attribute__((unused)) static int qw6_vk_pipe_attention_gqa(struct qw6_vk_pipe_
         .n_kv_heads = n_kv_heads,
         .head_dim = head_dim,
     };
-    return qw6_vk_pipe_dispatch(p, "vulkan/attention_gqa.spv",
+    return qw6_vk_dispatch(&p->vk, "vulkan/attention_gqa.spv",
                            bufs, zero, 4, &push, sizeof(push),
                            n_q_heads, 1, 1);
 }
@@ -2269,7 +2269,7 @@ __attribute__((unused)) static int qw6_vk_pipe_conv1d(struct qw6_vk_pipe_s *p,
     const size_t zero[3] = {0, 0, 0};
     qw6_vk_buffer_t *bufs[3] = {xbuf, wbuf, outbuf};
     qw6_vk_conv1d_push_t push = {.dim = dim, .kernel_size = kernel_size};
-    return qw6_vk_pipe_dispatch(p, "vulkan/deltanet_conv1d.spv",
+    return qw6_vk_dispatch(&p->vk, "vulkan/deltanet_conv1d.spv",
                            bufs, zero, 3, &push, sizeof(push),
                            (dim + 255) / 256, 1, 1);
 }
@@ -2290,7 +2290,7 @@ __attribute__((unused)) static int qw6_vk_pipe_deltanet_retrieve(struct qw6_vk_p
         .has_beta = 0,
     };
     uint32_t out_n = val_heads * val_dim;
-    return qw6_vk_pipe_dispatch(p, "vulkan/deltanet_retrieve.spv",
+    return qw6_vk_dispatch(&p->vk, "vulkan/deltanet_retrieve.spv",
                            bufs, zero, 3, &push, sizeof(push),
                            (out_n + 255) / 256, 1, 1);
 }
@@ -2313,7 +2313,7 @@ __attribute__((unused)) static int qw6_vk_pipe_deltanet_update(struct qw6_vk_pip
         .has_beta = 1,
     };
     uint32_t state_n = val_heads * val_dim * val_dim;
-    return qw6_vk_pipe_dispatch(p, "vulkan/deltanet_update.spv",
+    return qw6_vk_dispatch(&p->vk, "vulkan/deltanet_update.spv",
                            bufs, zero, 5, &push, sizeof(push),
                            (state_n + 255) / 256, 1, 1);
 }
@@ -2326,7 +2326,7 @@ __attribute__((unused)) static int qw6_vk_pipe_moe_route(struct qw6_vk_pipe_s *p
     const size_t zero[3] = {0, 0, 0};
     qw6_vk_buffer_t *bufs[3] = {logits, indices, weights};
     qw6_vk_moe_route_push_t push = {.n_experts = n_experts, .top_k = top_k};
-    return qw6_vk_pipe_dispatch(p, "vulkan/moe_route.spv",
+    return qw6_vk_dispatch(&p->vk, "vulkan/moe_route.spv",
                            bufs, zero, 3, &push, sizeof(push), 1, 1, 1);
 }
 
@@ -2344,7 +2344,7 @@ __attribute__((unused)) static int qw6_vk_pipe_moe_gather(struct qw6_vk_pipe_s *
         .has_shared = shared_out ? 1u : 0u,
         .shared_weight = shared_weight,
     };
-    return qw6_vk_pipe_dispatch(p, "vulkan/moe_gather.spv",
+    return qw6_vk_dispatch(&p->vk, "vulkan/moe_gather.spv",
                            bufs, zero, 4, &push, sizeof(push),
                            (dim + 255) / 256, 1, 1);
 }
@@ -2693,12 +2693,12 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                 attn_cpu[i] *= qw6_sigmoid(gate_cpu[i]);
             memcpy(att->mapped, attn_cpu, QW6_NUM_Q_HEADS * QW6_HEAD_DIM * sizeof(float));
 
-            /* Output projection: use CPU (GPU weight upload has systematic bug) */
+            /* Output projection on CPU (attn_o GPU needs fix) */
             {
-                float attn_in[QW6_NUM_Q_HEADS * QW6_HEAD_DIM];
-                memcpy(attn_in, att->mapped, sizeof(attn_in));
-                qw6_tensor_matvec((float *)att->mapped, &m->layers[l].attn_o,
-                                  attn_in, QW6_HIDDEN_SIZE);
+                float tmp[QW6_HIDDEN_SIZE];
+                qw6_tensor_matvec(tmp, &m->layers[l].attn_o,
+                                  (float *)att->mapped, QW6_HIDDEN_SIZE);
+                memcpy(att->mapped, tmp, sizeof(tmp));
             }
         }
 

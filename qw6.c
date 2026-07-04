@@ -2842,7 +2842,7 @@ int main(int argc, char **argv) {
     float temp = 0.0f;
     bool nothink = false, dump_tokens = false, bench = false, self_test = false;
     bool use_vulkan = false, vulkan_self_test = false;
-    bool load_only = false;
+    bool load_only = false, raw_prompt = false;
 #ifdef QW6_VULKAN
     void *pipe = NULL;
     int vk_pipe_ok = 0;
@@ -2862,6 +2862,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--self-test") == 0) self_test = true;
         else if (strcmp(argv[i], "--bench") == 0) bench = true;
         else if (strcmp(argv[i], "--cpu") == 0) { use_vulkan = false; }
+        else if (strcmp(argv[i], "--raw") == 0) { raw_prompt = true; }
         else if (strcmp(argv[i], "--vulkan") == 0) { use_vulkan = true; }
         else if (strcmp(argv[i], "--vulkan-self-test") == 0) { vulkan_self_test = true; }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -3049,10 +3050,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "qw6: thinking mode: %s\n", nothink ? "disabled" : "enabled");
         fprintf(stderr, "qw6: ctx=%d max_tokens=%d temp=%.1f\n\n", ctx, n_tokens, temp);
 
-        /* Wrap prompt in Qwen chat template */
-        const char *sys_msg = "You are a helpful assistant";
+        /* Chat template (CHATML for Qwen, skip with --raw) */
+        const char *enc_prompt = prompt;
         char *templated = NULL;
-        {
+        if (!raw_prompt) {
+            const char *sys_msg = "You are a helpful assistant";
             const char *t_prefix = "<|im_start|>system\n";
             const char *t_mid    = "<|im_end|>\n<|im_start|>user\n";
             const char *t_suffix = "<|im_end|>\n<|im_start|>assistant\n";
@@ -3063,10 +3065,9 @@ int main(int argc, char **argv) {
                 snprintf(templated, slen, "%s%s%s%s%s",
                          t_prefix, sys_msg, t_mid, prompt, t_suffix);
                 fprintf(stderr, "qw6: chat templated prompt (%zu chars)\n", slen - 1);
+                enc_prompt = templated;
             }
         }
-
-        const char *enc_prompt = templated ? templated : prompt;
 
         uint32_t *tokens = NULL;
         uint32_t n = 0;
