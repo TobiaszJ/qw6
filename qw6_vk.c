@@ -198,6 +198,209 @@ static void qw6_vk_free(qw6_vk_t *vk) {
     memset(vk, 0, sizeof(*vk));
 }
 
+static int qw6_vk_dispatch(qw6_vk_t *vk, const char *shader_path,
+                           qw6_vk_buffer_t **buffers, uint32_t n_buffers,
+                           const void *push, uint32_t push_size,
+                           uint32_t gx, uint32_t gy, uint32_t gz) {
+    VkDescriptorSetLayoutBinding *bindings = calloc(n_buffers, sizeof(*bindings));
+    if (!bindings) return -1;
+    for (uint32_t i = 0; i < n_buffers; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dlci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = n_buffers,
+        .pBindings = bindings,
+    };
+    VkDescriptorSetLayout dsl;
+    QW6_VK_CHECK(vkCreateDescriptorSetLayout(vk->device, &dlci, NULL, &dsl));
+    free(bindings);
+
+    VkPushConstantRange pcr = {
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset = 0,
+        .size = push_size,
+    };
+    VkPipelineLayoutCreateInfo plci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts = &dsl,
+        .pushConstantRangeCount = push_size ? 1u : 0u,
+        .pPushConstantRanges = push_size ? &pcr : NULL,
+    };
+    VkPipelineLayout pl;
+    QW6_VK_CHECK(vkCreatePipelineLayout(vk->device, &plci, NULL, &pl));
+
+    uint32_t *spv = NULL;
+    size_t spv_bytes = 0;
+    if (qw6_vk_read_file(shader_path, &spv, &spv_bytes) != 0) return -1;
+    VkShaderModuleCreateInfo smci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = spv_bytes,
+        .pCode = spv,
+    };
+    VkShaderModule sm;
+    QW6_VK_CHECK(vkCreateShaderModule(vk->device, &smci, NULL, &sm));
+    free(spv);
+
+    VkComputePipelineCreateInfo pci = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = sm,
+            .pName = "main",
+        },
+        .layout = pl,
+    };
+    VkPipeline pipe;
+    QW6_VK_CHECK(vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pci, NULL, &pipe));
+
+    VkDescriptorPoolSize pool_size = {
+        .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = n_buffers,
+    };
+    VkDescriptorPoolCreateInfo dpci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1,
+        .poolSizeCount = 1,
+        .pPoolSizes = &pool_size,
+    };
+    VkDescriptorPool pool;
+    QW6_VK_CHECK(vkCreateDescriptorPool(vk->device, &dpci, NULL, &pool));
+    VkDescriptorSetAllocateInfo dsai = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &dsl,
+    };
+    VkDescriptorSet ds;
+    QW6_VK_CHECK(vkAllocateDescriptorSets(vk->device, &dsai, &ds));
+
+    VkDescriptorBufferInfo *infos = calloc(n_buffers, sizeof(*infos));
+    VkWriteDescriptorSet *writes = calloc(n_buffers, sizeof(*writes));
+    if (!infos || !writes) return -1;
+    for (uint32_t i = 0; i < n_buffers; i++) {
+        infos[i].buffer = buffers[i]->buffer;
+        infos[i].offset = 0;
+        infos[i].range = buffers[i]->size;
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = ds;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &infos[i];
+    }
+    vkUpdateDescriptorSets(vk->device, n_buffers, writes, 0, NULL);
+    free(infos);
+    free(writes);
+
+    VkCommandBufferAllocateInfo cbai = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = vk->command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    VkCommandBuffer cb;
+    QW6_VK_CHECK(vkAllocateCommandBuffers(vk->device, &cbai, &cb));
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    QW6_VK_CHECK(vkBeginCommandBuffer(cb, &begin));
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &ds, 0, NULL);
+    if (push_size) vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
+    vkCmdDispatch(cb, gx, gy, gz);
+    QW6_VK_CHECK(vkEndCommandBuffer(cb));
+
+    VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence;
+    QW6_VK_CHECK(vkCreateFence(vk->device, &fci, NULL, &fence));
+    VkSubmitInfo submit = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cb,
+    };
+    QW6_VK_CHECK(vkQueueSubmit(vk->queue, 1, &submit, fence));
+    QW6_VK_CHECK(vkWaitForFences(vk->device, 1, &fence, VK_TRUE, UINT64_MAX));
+
+    vkDestroyFence(vk->device, fence, NULL);
+    vkFreeCommandBuffers(vk->device, vk->command_pool, 1, &cb);
+    vkDestroyDescriptorPool(vk->device, pool, NULL);
+    vkDestroyPipeline(vk->device, pipe, NULL);
+    vkDestroyShaderModule(vk->device, sm, NULL);
+    vkDestroyPipelineLayout(vk->device, pl, NULL);
+    vkDestroyDescriptorSetLayout(vk->device, dsl, NULL);
+    return 0;
+}
+
+typedef struct {
+    uint32_t n;
+    float eps;
+} qw6_vk_rmsnorm_push_t;
+
+static int qw6_vk_rmsnorm(qw6_vk_t *vk, const float *x, const float *w,
+                          float *y, uint32_t n, float eps) {
+    qw6_vk_buffer_t bx, bw, by;
+    if (qw6_vk_buffer_create(vk, &bx, n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bw, n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &by, n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    memcpy(bx.mapped, x, n * sizeof(float));
+    memcpy(bw.mapped, w, n * sizeof(float));
+    qw6_vk_buffer_t *bufs[3] = {&bx, &bw, &by};
+    qw6_vk_rmsnorm_push_t push = {.n = n, .eps = eps};
+    int rc = qw6_vk_dispatch(vk, "vulkan/rmsnorm_full.spv", bufs, 3,
+                             &push, sizeof(push), 1, 1, 1);
+    if (rc == 0) memcpy(y, by.mapped, n * sizeof(float));
+    qw6_vk_buffer_destroy(vk, &by);
+    qw6_vk_buffer_destroy(vk, &bw);
+    qw6_vk_buffer_destroy(vk, &bx);
+    return rc;
+}
+
+typedef struct {
+    uint32_t rows;
+    uint32_t cols;
+} qw6_vk_matvec_push_t;
+
+static int qw6_vk_matvec_f32(qw6_vk_t *vk, const float *w, const float *x,
+                             float *y, uint32_t rows, uint32_t cols) {
+    qw6_vk_buffer_t bw, bx, by;
+    if (qw6_vk_buffer_create(vk, &bw, (VkDeviceSize)rows * cols * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bx, cols * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &by, rows * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    memcpy(bw.mapped, w, (size_t)rows * cols * sizeof(float));
+    memcpy(bx.mapped, x, cols * sizeof(float));
+    qw6_vk_buffer_t *bufs[3] = {&bw, &bx, &by};
+    qw6_vk_matvec_push_t push = {.rows = rows, .cols = cols};
+    int rc = qw6_vk_dispatch(vk, "vulkan/matvec_f32.spv", bufs, 3,
+                             &push, sizeof(push), rows, 1, 1);
+    if (rc == 0) memcpy(y, by.mapped, rows * sizeof(float));
+    qw6_vk_buffer_destroy(vk, &by);
+    qw6_vk_buffer_destroy(vk, &bx);
+    qw6_vk_buffer_destroy(vk, &bw);
+    return rc;
+}
+
+int qw6_vk_matvec_f32_host(const float *w, const float *x, float *y,
+                           uint32_t rows, uint32_t cols) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_matvec_f32(&vk, w, x, y, rows, cols);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
+int qw6_vk_rmsnorm_host(const float *x, const float *w, float *y,
+                        uint32_t n, float eps) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_rmsnorm(&vk, x, w, y, n, eps);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
 static int qw6_vk_vec_add(qw6_vk_t *vk, const float *a, const float *b,
                           float *c, uint32_t n) {
     qw6_vk_buffer_t ba, bb, bc;
@@ -365,9 +568,64 @@ int qw6_vk_selftest(void) {
             fail = 1;
         }
     }
+
+    const uint32_t rn = 2048;
+    float *rx = calloc(rn, sizeof(float));
+    float *rw = calloc(rn, sizeof(float));
+    float *ry = calloc(rn, sizeof(float));
+    if (!rx || !rw || !ry) fail = 1;
+    if (!fail) {
+        double ss = 0.0;
+        for (uint32_t i = 0; i < rn; i++) {
+            rx[i] = sinf((float)i * 0.013f);
+            rw[i] = 0.75f + 0.0001f * (float)(i % 17);
+            ss += (double)rx[i] * rx[i];
+        }
+        fail = qw6_vk_rmsnorm(&vk, rx, rw, ry, rn, 1e-6f) != 0;
+        float scale = 1.0f / sqrtf((float)(ss / rn) + 1e-6f);
+        for (uint32_t i = 0; i < rn && !fail; i++) {
+            float expected = rx[i] * scale * rw[i];
+            if (fabsf(ry[i] - expected) > 2e-5f) {
+                fprintf(stderr, "qw6_vk: rmsnorm mismatch at %u got %.6f expected %.6f\n",
+                        i, ry[i], expected);
+                fail = 1;
+            }
+        }
+    }
+
+    const uint32_t rows = 7, cols = 19;
+    float *mw = calloc(rows * cols, sizeof(float));
+    float *mx = calloc(cols, sizeof(float));
+    float *my = calloc(rows, sizeof(float));
+    if (!mw || !mx || !my) fail = 1;
+    if (!fail) {
+        for (uint32_t r = 0; r < rows; r++)
+            for (uint32_t col = 0; col < cols; col++)
+                mw[r * cols + col] = 0.01f * (float)((int)r - (int)col);
+        for (uint32_t col = 0; col < cols; col++)
+            mx[col] = cosf((float)col * 0.2f);
+        fail = qw6_vk_matvec_f32(&vk, mw, mx, my, rows, cols) != 0;
+        for (uint32_t r = 0; r < rows && !fail; r++) {
+            float expected = 0.0f;
+            for (uint32_t col = 0; col < cols; col++)
+                expected += mw[r * cols + col] * mx[col];
+            if (fabsf(my[r] - expected) > 2e-5f) {
+                fprintf(stderr, "qw6_vk: matvec_f32 mismatch row %u got %.6f expected %.6f\n",
+                        r, my[r], expected);
+                fail = 1;
+            }
+        }
+    }
+
     free(a);
     free(b);
     free(c);
+    free(rx);
+    free(rw);
+    free(ry);
+    free(mw);
+    free(mx);
+    free(my);
     qw6_vk_free(&vk);
     if (fail) {
         fprintf(stderr, "qw6_vk: self-test failed\n");

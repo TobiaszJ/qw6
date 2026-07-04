@@ -50,7 +50,8 @@ project builds on top of that.
 - native dequantization for F32, F16, BF16, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_S, and IQ3_S
 - layer-0 Gated DeltaNet single-token forward probe through SSM conv, GDN update, gated norm, and `ssm_out`
 - 40-layer CPU greedy generation smoke path
-- Phase 2 Vulkan runtime smoke path with SPIR-V shader build and compute dispatch self-test
+- Phase 2 Vulkan runtime smoke path with SPIR-V shader build, GPU `rmsnorm_full`,
+  GPU `matvec_f32`, and a layer-0 router probe against real Qwen weights
 
 The repository currently contains CPU engine code, tokenizer implementation,
 native GGUF loader/indexing, kernel scaffolding, and design documentation:
@@ -76,6 +77,7 @@ be run with:
 ./qw6 --load-only -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf
 ./qw6 -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf -p "Hello" -n 2 --nothink
 make vulkan && ./qw6 --vulkan-self-test
+./qw6 --load-only --vulkan -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf
 ```
 
 Expected current behavior: model metadata validation passes and native probes
@@ -83,8 +85,10 @@ print tensor checksums, router top-k experts, routed/shared-FFN summaries, and a
 layer-0 DeltaNet forward checksum. The generation command runs a native
 40-layer CPU smoke path and prints greedy token IDs plus decoded text; reference
 logit parity and performance work are still pending. The Vulkan self-test
-selects the BC-250 RADV device and validates a real compute dispatch; full
-model inference still uses CPU fallback kernels when `--vulkan` is requested.
+selects the BC-250 RADV device and validates real compute dispatches; the
+`--load-only --vulkan` path also compares GPU layer-0 router MatVec against CPU.
+Full model inference still uses CPU fallback kernels when `--vulkan` is
+requested.
 
 ## Acknowledgements
 

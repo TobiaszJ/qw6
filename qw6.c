@@ -1514,6 +1514,49 @@ static int qw6_probe_layer0_router(qw6_model_t *m) {
     return rc;
 }
 
+#ifdef QW6_VULKAN
+static int qw6_probe_layer0_router_vulkan(qw6_model_t *m) {
+    QW6_ASSERT_PTR(m);
+    qw6_tensor_t *norm_t = &m->layers[0].norm;
+    qw6_tensor_t *router_t = &m->layers[0].moe_router;
+    if (!norm_t->data || !router_t->data || router_t->quant != QW6_Q_FP32) return -1;
+
+    float *hidden = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *norm_w = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *normed = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *cpu = calloc(QW6_NUM_EXPERTS, sizeof(float));
+    float *gpu = calloc(QW6_NUM_EXPERTS, sizeof(float));
+    QW6_ASSERT_PTR(hidden); QW6_ASSERT_PTR(norm_w); QW6_ASSERT_PTR(normed);
+    QW6_ASSERT_PTR(cpu); QW6_ASSERT_PTR(gpu);
+
+    int rc = qw6_tensor_dequantize_row(&m->tok_embeddings, 0, hidden);
+    if (rc == 0) rc = qw6_tensor_dequantize_row(norm_t, 0, norm_w);
+    if (rc == 0) {
+        qw6_cpu_rmsnorm(normed, hidden, norm_w, QW6_HIDDEN_SIZE);
+        rc = qw6_tensor_matvec(cpu, router_t, normed, QW6_NUM_EXPERTS);
+    }
+    if (rc == 0) {
+        rc = qw6_vk_matvec_f32_host((const float *)router_t->data, normed, gpu,
+                                    QW6_NUM_EXPERTS, QW6_HIDDEN_SIZE);
+    }
+    if (rc == 0) {
+        double max_diff = 0.0, sum_diff = 0.0;
+        for (int i = 0; i < QW6_NUM_EXPERTS; i++) {
+            double d = fabs((double)cpu[i] - gpu[i]);
+            if (d > max_diff) max_diff = d;
+            sum_diff += d;
+        }
+        fprintf(stderr,
+                "qw6_vk: probe layer0 router matvec max_diff=%.8f mean_diff=%.8f first=%.5f\n",
+                max_diff, sum_diff / QW6_NUM_EXPERTS, gpu[0]);
+        if (max_diff > 1e-4) rc = -1;
+    }
+
+    free(hidden); free(norm_w); free(normed); free(cpu); free(gpu);
+    return rc;
+}
+#endif
+
 static int qw6_probe_layer0_shared_ffn(qw6_model_t *m) {
     QW6_ASSERT_PTR(m);
     qw6_tensor_t *gate_t = &m->layers[0].shared_gate;
@@ -2826,6 +2869,13 @@ int main(int argc, char **argv) {
             qw6_model_free(&model);
             return 1;
         }
+#ifdef QW6_VULKAN
+        if (use_vulkan && qw6_probe_layer0_router_vulkan(&model) != 0) {
+            fprintf(stderr, "qw6: Vulkan layer0 router probe failed\n");
+            qw6_model_free(&model);
+            return 1;
+        }
+#endif
         if (qw6_probe_layer0_shared_ffn(&model) != 0) {
             fprintf(stderr, "qw6: native layer0 shared FFN probe failed\n");
             qw6_model_free(&model);

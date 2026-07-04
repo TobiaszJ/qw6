@@ -13,7 +13,7 @@ VULKAN_LIBS ?= $(shell pkg-config --libs vulkan 2>/dev/null || echo "-lvulkan")
 SRCS = qw6.c qw6_tok.c
 VULKAN_SRCS = qw6.c qw6_tok.c qw6_vk.c
 SERVER_SRCS = qw6.c qw6_tok.c qw6-server.c
-VULKAN_SHADERS = vulkan/rmsnorm.comp vulkan/vec_add.comp vulkan/silu_mul.comp vulkan/argmax.comp
+VULKAN_SHADERS = vulkan/rmsnorm.comp vulkan/rmsnorm_full.comp vulkan/matvec_f32.comp vulkan/vec_add.comp vulkan/silu_mul.comp vulkan/argmax.comp
 VULKAN_SPV = $(VULKAN_SHADERS:.comp=.spv)
 
 # Output binaries

@@ -76,9 +76,11 @@ exceed llama.cpp Vulkan performance as baseline.
 - [x] Vulkan device initialization
 - [x] host-visible buffer allocation and compute dispatch self-test
 - [x] SPIR-V shader build via `glslc`
+- [x] `matvec_f32.comp` + layer-0 router probe against real Qwen weights
 - [ ] `matmul_iq2.comp` for IQ2 routed experts
 - [ ] `matmul_q4k.comp`, `matmul_q5k.comp`, `matmul_q6k.comp`
-- [ ] `rmsnorm.comp` (partial: reduction shader scaffold)
+- [x] `rmsnorm_full.comp` single-vector RMSNorm
+- [ ] `rmsnorm.comp` multi-workgroup/chunked RMSNorm
 - [ ] `rope_mrope.comp`
 - [ ] `attention_gqa.comp`
 - [ ] `deltanet_conv1d.comp`
@@ -93,10 +95,12 @@ exceed llama.cpp Vulkan performance as baseline.
 - [ ] performance benchmark vs llama.cpp Vulkan baseline
 
 **Current Vulkan smoke path:** `make vulkan && ./qw6 --vulkan-self-test`
-compiles SPIR-V shaders, selects the BC-250 RADV device, dispatches a compute
-shader, and validates results on the host. `./qw6 ... --vulkan` currently
-initializes the Phase 2 binary path but still falls back to CPU kernels for
-full model inference.
+compiles SPIR-V shaders, selects the BC-250 RADV device, dispatches GPU
+`vec_add`, `rmsnorm_full`, and `matvec_f32`, and validates results on the host.
+`./qw6 --load-only --vulkan -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf` additionally
+runs layer-0 router MatVec on the GPU against real Qwen weights and compares it
+to CPU (`max_diff ~= 7.6e-6`). Full model inference still falls back to CPU
+kernels.
 
 **Deliverable:** `./qw6 -p "Hello" --vulkan` with all 40 layers on GPU at or
 above the current BC-250 llama.cpp baseline.

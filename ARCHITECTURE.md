@@ -25,6 +25,9 @@ path before the Vulkan backend:
 - Phase 2 has a Vulkan runtime smoke layer: device selection, host-visible
   buffers, descriptor/pipeline creation, SPIR-V shader build, and a verified
   compute dispatch on BC-250 RADV.
+- GPU `rmsnorm_full` and `matvec_f32` kernels are validated numerically; the
+  Vulkan `matvec_f32` path is also probed against the real layer-0 MoE router
+  weights from Qwen3.6.
 
 Not yet implemented:
 
@@ -32,6 +35,7 @@ Not yet implemented:
 - optimized/chunked prefill
 - text-quality validation beyond smoke generation
 - GPU dispatch orchestration for full 40-layer model inference
+- quantized GPU MatVec kernels for Q/K/IQ expert formats
 
 The old experimental external `llama.cpp` generation bridge is not part of the
 native engine path.
