@@ -2721,12 +2721,13 @@ int qw6_prefill(qw6_session_t *s, const uint32_t *tokens, uint32_t n) {
     return 0;
 }
 
-int qw6_generate(qw6_session_t *s, uint32_t n_tokens, float temp, float top_p) {
+int qw6_generate(qw6_session_t *s, uint32_t n_tokens, float temp, float top_p,
+                 int top_k) {
     QW6_ASSERT_PTR(s); QW6_ASSERT(n_tokens > 0, "n_tokens > 0");
     int generated = 0;
     for (uint32_t i = 0; i < n_tokens; i++) {
         if (s->n_tokens >= s->capacity) break;
-        uint32_t tok = qw6_sample(s, temp, top_p);
+        uint32_t tok = qw6_sample(s, temp, top_p, top_k);
         fprintf(stdout, "%u%s", tok, i + 1 == n_tokens ? "\n" : " ");
         fflush(stdout);
         s->tokens[s->n_tokens++] = tok;
@@ -2740,11 +2741,84 @@ int qw6_generate(qw6_session_t *s, uint32_t n_tokens, float temp, float top_p) {
     return generated;
 }
 
-uint32_t qw6_sample(qw6_session_t *s, float temp, float top_p) {
+typedef struct {
+    int idx;
+    float score;
+} qw6_sample_item_t;
+
+static int qw6_sample_item_cmp_desc(const void *a, const void *b) {
+    const qw6_sample_item_t *ia = (const qw6_sample_item_t *)a;
+    const qw6_sample_item_t *ib = (const qw6_sample_item_t *)b;
+    if (ia->score < ib->score) return 1;
+    if (ia->score > ib->score) return -1;
+    return ia->idx - ib->idx;
+}
+
+static float qw6_rand_unit(void) {
+    return (float)rand() / ((float)RAND_MAX + 1.0f);
+}
+
+uint32_t qw6_sample(qw6_session_t *s, float temp, float top_p, int top_k) {
     QW6_ASSERT_PTR(s);
-    (void)top_p;
     if (temp <= 0.0f) return qw6_cpu_argmax(s->logits, QW6_VOCAB_SIZE);
-    return qw6_cpu_argmax(s->logits, QW6_VOCAB_SIZE);
+
+    if (top_k < 0) top_k = 0;
+    if (top_p <= 0.0f || top_p > 1.0f) top_p = 1.0f;
+
+    qw6_sample_item_t *items = malloc((size_t)QW6_VOCAB_SIZE * sizeof(*items));
+    QW6_ASSERT_PTR(items);
+    float max_score = -INFINITY;
+    for (int i = 0; i < QW6_VOCAB_SIZE; i++) {
+        float score = s->logits[i] / temp;
+        items[i].idx = i;
+        items[i].score = score;
+        if (score > max_score) max_score = score;
+    }
+
+    qsort(items, QW6_VOCAB_SIZE, sizeof(*items), qw6_sample_item_cmp_desc);
+
+    int limit = QW6_VOCAB_SIZE;
+    if (top_k > 0 && top_k < limit) limit = top_k;
+
+    double sum = 0.0;
+    for (int i = 0; i < limit; i++) {
+        sum += exp((double)items[i].score - (double)max_score);
+    }
+    if (sum <= 0.0) {
+        uint32_t tok = (uint32_t)items[0].idx;
+        free(items);
+        return tok;
+    }
+
+    int nucleus = limit;
+    if (top_p < 1.0f) {
+        double cum = 0.0;
+        nucleus = 0;
+        for (int i = 0; i < limit; i++) {
+            double p = exp((double)items[i].score - (double)max_score) / sum;
+            cum += p;
+            nucleus = i + 1;
+            if (cum >= (double)top_p) break;
+        }
+        if (nucleus < 1) nucleus = 1;
+    }
+
+    double keep_sum = 0.0;
+    for (int i = 0; i < nucleus; i++) {
+        keep_sum += exp((double)items[i].score - (double)max_score);
+    }
+    double target = qw6_rand_unit() * keep_sum;
+    double acc = 0.0;
+    uint32_t tok = (uint32_t)items[nucleus - 1].idx;
+    for (int i = 0; i < nucleus; i++) {
+        acc += exp((double)items[i].score - (double)max_score);
+        if (target <= acc) {
+            tok = (uint32_t)items[i].idx;
+            break;
+        }
+    }
+    free(items);
+    return tok;
 }
 
 /* ---- Tokenizer convenience API ---- */
@@ -3132,6 +3206,25 @@ static int selftest_softmax_argmax(void) {
     return fail;
 }
 
+static int selftest_sampling(void) {
+    qw6_session_t s;
+    memset(&s, 0, sizeof(s));
+    float logits[QW6_VOCAB_SIZE];
+    memset(logits, 0, sizeof(logits));
+    s.logits = logits;
+
+    int fail = 0;
+    logits[0] = 1.0f; logits[1] = 2.0f; logits[2] = 3.0f;
+    fail += (qw6_sample(&s, 0.0f, 1.0f, 0) == 2) ? 0 : 1;
+    fail += (qw6_sample(&s, 1.0f, 1.0f, 1) == 2) ? 0 : 1;
+    for (int i = 0; i < 3; i++) logits[i] = 0.0f;
+    for (int i = 3; i < QW6_VOCAB_SIZE; i++) logits[i] = -100.0f;
+    logits[0] = 10.0f; logits[1] = 0.0f; logits[2] = 0.0f;
+    fail += (qw6_sample(&s, 1.0f, 0.5f, 0) == 0) ? 0 : 1;
+    if (fail) fprintf(stderr, "self-test: sampling failed\n");
+    return fail;
+}
+
 static int selftest_moe_route(void) {
     const float logits[4] = {0.0f, 2.0f, 1.0f, -1.0f};
     int idx[2] = {-1, -1};
@@ -3156,6 +3249,7 @@ static int qw6_selftest(void) {
     fail += selftest_attention_gqa();
     fail += selftest_mtp_draft();
     fail += selftest_softmax_argmax();
+    fail += selftest_sampling();
     fail += selftest_moe_route();
     if (fail) {
         fprintf(stderr, "qw6: self-test failed (%d checks)\n", fail);
@@ -3177,6 +3271,8 @@ static void usage(void) {
         "  -n <N>          Max tokens to generate (default: 256)\n"
         "  --ctx <N>       Context window (default: %d)\n"
         "  --temp <F>      Temperature (default: 0.0 = greedy)\n"
+        "  --top-p <F>     Nucleus sampling probability (default: 1.0)\n"
+        "  --top-k <N>     Top-k sampling cutoff (default: 0 = disabled)\n"
         "  --nothink       Disable thinking mode\n"
         "  --cpu           CPU backend (default)\n"
         "  --vulkan        Vulkan backend (Phase 2)\n"
@@ -3207,6 +3303,8 @@ int main(int argc, char **argv) {
     int n_tokens = 256;
     int ctx = QW6_DEFAULT_CTX;
     float temp = 0.0f;
+    float top_p = 1.0f;
+    int top_k = 0;
     unsigned int seed = 0;
     bool nothink = false, dump_tokens = false, dump_logits = false, dump_logprobs = false;
     bool bench = false, self_test = false;
@@ -3227,6 +3325,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-n") == 0 && i+1 < argc) n_tokens = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ctx") == 0 && i+1 < argc) ctx = atoi(argv[++i]);
         else if (strcmp(argv[i], "--temp") == 0 && i+1 < argc) temp = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--top-p") == 0 && i+1 < argc) top_p = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--top-k") == 0 && i+1 < argc) top_k = atoi(argv[++i]);
         else if (strcmp(argv[i], "--seed") == 0 && i+1 < argc) seed = (unsigned int)atol(argv[++i]);
         else if (strcmp(argv[i], "--nothink") == 0) nothink = true;
         else if (strcmp(argv[i], "--dump-tokens") == 0) dump_tokens = true;
@@ -3506,7 +3606,7 @@ int main(int argc, char **argv) {
 
         fprintf(stderr, "qw6: generating %d tokens...\n", n_tokens);
         clock_t start = clock();
-        int gen = qw6_generate(&session, (uint32_t)n_tokens, temp, 0.9f);
+        int gen = qw6_generate(&session, (uint32_t)n_tokens, temp, top_p, top_k);
         double elapsed = (double)(clock() - start) / CLOCKS_PER_SEC;
         if (gen > 0) {
             char *decoded = NULL;
@@ -3559,7 +3659,7 @@ int main(int argc, char **argv) {
         if (qw6_tok_encode(&tokenizer, prompt, &btok, &bn) == 0) {
             qw6_prefill(&session, btok, bn);
             clock_t bstart = clock();
-            int bgen = qw6_generate(&session, 128, 0.0f, 0.9f);
+            int bgen = qw6_generate(&session, 128, 0.0f, 1.0f, 0);
             double belapsed = (double)(clock() - bstart) / CLOCKS_PER_SEC;
             if (bgen > 0) {
                 fprintf(stderr, "\nqw6: benchmark: %d tokens in %.2fs (%.2f tok/s)\n",

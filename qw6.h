@@ -222,8 +222,9 @@ void qw6_session_free(qw6_session_t *s);
 
 /* Inference */
 int qw6_prefill(qw6_session_t *s, const uint32_t *tokens, uint32_t n);
-int qw6_generate(qw6_session_t *s, uint32_t n_tokens, float temp, float top_p);
-uint32_t qw6_sample(qw6_session_t *s, float temp, float top_p);
+int qw6_generate(qw6_session_t *s, uint32_t n_tokens, float temp, float top_p,
+                 int top_k);
+uint32_t qw6_sample(qw6_session_t *s, float temp, float top_p, int top_k);
 
 /* Tokenizer */
 int qw6_token_encode(const char *text, uint32_t **out_tokens, uint32_t *out_n);
