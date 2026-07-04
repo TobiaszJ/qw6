@@ -217,7 +217,8 @@ int qw6_model_load(qw6_model_t *m, const char *gguf_path);
 void qw6_model_free(qw6_model_t *m);
 
 /* Session */
-int qw6_session_init(qw6_session_t *s, qw6_model_t *m, uint32_t max_tokens);
+int qw6_session_init(qw6_session_t *s, qw6_model_t *m, uint32_t max_tokens,
+                     bool use_vulkan);
 void qw6_session_free(qw6_session_t *s);
 
 /* Inference */

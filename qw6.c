@@ -1204,7 +1204,8 @@ void qw6_model_free(qw6_model_t *m) {
 
 /* ---- Session ---- */
 
-int qw6_session_init(qw6_session_t *s, qw6_model_t *m, uint32_t max_tokens) {
+int qw6_session_init(qw6_session_t *s, qw6_model_t *m, uint32_t max_tokens,
+                     bool use_vulkan) {
     QW6_ASSERT_PTR(s);
     QW6_ASSERT_PTR(m);
 
@@ -1216,22 +1217,24 @@ int qw6_session_init(qw6_session_t *s, qw6_model_t *m, uint32_t max_tokens) {
     s->logits = calloc(QW6_VOCAB_SIZE, sizeof(float));
     QW6_ASSERT_PTR(s->logits);
 
-    for (int i = 0; i < QW6_NUM_LAYERS; i++) {
-        if (qw6_layer_type(i) == QW6_LAYER_LINEAR_ATTN) {
-            m->deltanet_state[i] = calloc((size_t)QW6_NUM_VALUE_HEADS *
-                                          QW6_VALUE_HEAD_DIM * QW6_VALUE_HEAD_DIM,
-                                          sizeof(float));
-            s->conv_state[i] = calloc((size_t)QW6_CONV1D_KERNEL *
-                                      QW6_LINEAR_QKV_DIM, sizeof(float));
-            QW6_ASSERT_PTR(m->deltanet_state[i]);
-            QW6_ASSERT_PTR(s->conv_state[i]);
-        } else {
-            m->k_cache[i] = calloc((size_t)max_tokens * QW6_NUM_KV_HEADS *
-                                   QW6_HEAD_DIM, sizeof(float));
-            m->v_cache[i] = calloc((size_t)max_tokens * QW6_NUM_KV_HEADS *
-                                   QW6_HEAD_DIM, sizeof(float));
-            QW6_ASSERT_PTR(m->k_cache[i]);
-            QW6_ASSERT_PTR(m->v_cache[i]);
+    if (!use_vulkan) {
+        for (int i = 0; i < QW6_NUM_LAYERS; i++) {
+            if (qw6_layer_type(i) == QW6_LAYER_LINEAR_ATTN) {
+                m->deltanet_state[i] = calloc((size_t)QW6_NUM_VALUE_HEADS *
+                                              QW6_VALUE_HEAD_DIM * QW6_VALUE_HEAD_DIM,
+                                              sizeof(float));
+                s->conv_state[i] = calloc((size_t)QW6_CONV1D_KERNEL *
+                                          QW6_LINEAR_QKV_DIM, sizeof(float));
+                QW6_ASSERT_PTR(m->deltanet_state[i]);
+                QW6_ASSERT_PTR(s->conv_state[i]);
+            } else {
+                m->k_cache[i] = calloc((size_t)max_tokens * QW6_NUM_KV_HEADS *
+                                       QW6_HEAD_DIM, sizeof(float));
+                m->v_cache[i] = calloc((size_t)max_tokens * QW6_NUM_KV_HEADS *
+                                       QW6_HEAD_DIM, sizeof(float));
+                QW6_ASSERT_PTR(m->k_cache[i]);
+                QW6_ASSERT_PTR(m->v_cache[i]);
+            }
         }
     }
     return 0;
@@ -3540,7 +3543,7 @@ int main(int argc, char **argv) {
 #endif
 
     qw6_session_t session;
-    if (qw6_session_init(&session, &model, (uint32_t)ctx) != 0) {
+    if (qw6_session_init(&session, &model, (uint32_t)ctx, use_vulkan) != 0) {
 #ifdef QW6_VULKAN
         if (vk_pipe_ok) qw6_vk_pipe_free((qw6_vk_pipe_t *)pipe);
 #endif

@@ -120,7 +120,7 @@ Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders.
 - [ ] DeltaNet has older update/retrieve helpers plus the actual `qw6_gated_delta_net_single` recurrence. Tests must validate the recurrence used by the model path, not only the older helper kernels.
 - [ ] The Conv1D probe is not enough to validate the stateful model path. It must cover multi-token state shift, weight layout, SiLU, and in-place buffer reuse.
 - [x] CPU fallback inside the Vulkan pipeline uses mapped buffers only in non-strict/debug mode; performance mode now rejects fallback through `--vulkan-strict`.
-- [ ] Session initialization allocates CPU KV/state buffers even when the Vulkan pipeline is used. That wastes memory and muddies profiling on the BC-250.
+- [x] Session initialization allocates CPU KV/state buffers even when the Vulkan pipeline is used. That wastes memory and muddies profiling on the BC-250.
 - [x] `qw6_forward_token` allocates CPU temporary buffers before it redirects to Vulkan. This creates avoidable allocation overhead in the GPU path.
 
 ### Vulkan device and memory architecture problems
