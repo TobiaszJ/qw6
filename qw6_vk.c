@@ -40,6 +40,13 @@ typedef struct {
     } \
 } while (0)
 
+#define QW6_VK_USAGE_STORAGE         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+#define QW6_VK_USAGE_STORAGE_XFER    (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | \
+                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT | \
+                                     VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+#define QW6_VK_USAGE_STORAGE_DST     (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | \
+                                     VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+
 /* Forward declarations for pipeline types (defined later) */
 #define QW6_VK_CACHE_MAX 32
 typedef struct {
@@ -2847,17 +2854,17 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m, bool strict) {
     /* ---- Allocate the big weight buffer ---- */
     size_t total_w = m->total_weight_bytes + 512 * 1024 * 1024; /* +512 MB for dequant temps */
     if (qw6_vk_buffer_create(&ctx->vk, &ctx->weights, total_w,
-                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+                             QW6_VK_USAGE_STORAGE_DST) != 0) {
         qw6_vk_free(&ctx->vk); free(ctx); return -1;
     }
     if (qw6_vk_buffer_create(&ctx->vk, &ctx->iq2s_grid, sizeof(iq2s_grid),
-                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+                             QW6_VK_USAGE_STORAGE_DST) != 0) {
         qw6_vk_pipe_free(ctx); return -1;
     }
     memcpy(ctx->iq2s_grid.mapped, iq2s_grid, sizeof(iq2s_grid));
 
     if (qw6_vk_buffer_create(&ctx->vk, &ctx->iq3s_grid, sizeof(iq3s_grid),
-                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+                             QW6_VK_USAGE_STORAGE_DST) != 0) {
         qw6_vk_pipe_free(ctx); return -1;
     }
     memcpy(ctx->iq3s_grid.mapped, iq3s_grid, sizeof(iq3s_grid));
@@ -2866,7 +2873,7 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m, bool strict) {
     /* Hidden-size buffers */
 #define VK_BUF_SZ(nm, sz) do { \
     if (qw6_vk_buffer_create(&ctx->vk, &ctx->nm, (sz) * sizeof(float), \
-                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) \
+                             QW6_VK_USAGE_STORAGE_XFER) != 0) \
         { qw6_vk_pipe_free(ctx); return -1; } \
 } while(0)
     VK_BUF_SZ(scr_hidden, QW6_HIDDEN_SIZE);
@@ -2880,15 +2887,15 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m, bool strict) {
     VK_BUF_SZ(scr_logits, QW6_VOCAB_SIZE);
     /* Small uint32 sample output buffer */
     if (qw6_vk_buffer_create(&ctx->vk, &ctx->scr_sample, sizeof(uint32_t),
-                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0)
+                             QW6_VK_USAGE_STORAGE_XFER) != 0)
         { qw6_vk_pipe_free(ctx); return -1; }
     if (qw6_vk_buffer_create(&ctx->vk, &ctx->scr_moe_idx,
                              QW6_EXPERTS_PER_TOK * sizeof(uint32_t),
-                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0)
+                             QW6_VK_USAGE_STORAGE_XFER) != 0)
         { qw6_vk_pipe_free(ctx); return -1; }
     if (qw6_vk_buffer_create(&ctx->vk, &ctx->scr_moe_w,
                              QW6_EXPERTS_PER_TOK * sizeof(float),
-                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0)
+                             QW6_VK_USAGE_STORAGE_XFER) != 0)
         { qw6_vk_pipe_free(ctx); return -1; }
 #undef VK_BUF_SZ
 
@@ -2938,11 +2945,11 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m, bool strict) {
     for (int l = 0; l < QW6_NUM_LAYERS; l++) {
         if (qw6_layer_type(l) != QW6_LAYER_FULL_ATTN) continue;
         if (qw6_vk_buffer_create(&ctx->vk, &ctx->k_cache[l], kv_layer_bytes,
-                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+                                 QW6_VK_USAGE_STORAGE_XFER) != 0) {
             qw6_vk_pipe_free(ctx); return -1;
         }
         if (qw6_vk_buffer_create(&ctx->vk, &ctx->v_cache[l], kv_layer_bytes,
-                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+                                 QW6_VK_USAGE_STORAGE_XFER) != 0) {
             qw6_vk_pipe_free(ctx); return -1;
         }
     }
@@ -2953,12 +2960,12 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m, bool strict) {
     for (int l = 0; l < QW6_NUM_LAYERS; l++) {
         if (qw6_layer_type(l) != QW6_LAYER_LINEAR_ATTN) continue;
         if (qw6_vk_buffer_create(&ctx->vk, &ctx->dn_state[l], dn_bytes,
-                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+                                 QW6_VK_USAGE_STORAGE_XFER) != 0) {
             qw6_vk_pipe_free(ctx); return -1;
         }
         memset(ctx->dn_state[l].mapped, 0, dn_bytes);
         if (qw6_vk_buffer_create(&ctx->vk, &ctx->conv_state[l], conv_bytes,
-                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+                                 QW6_VK_USAGE_STORAGE_XFER) != 0) {
             qw6_vk_pipe_free(ctx); return -1;
         }
         memset(ctx->conv_state[l].mapped, 0, conv_bytes);
