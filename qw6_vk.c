@@ -2547,12 +2547,12 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                 attn_cpu[i] *= qw6_sigmoid(gate_cpu[i]);
             memcpy(att->mapped, attn_cpu, QW6_NUM_Q_HEADS * QW6_HEAD_DIM * sizeof(float));
 
-            /* Output projection on CPU (GPU weight upload bug for attn_o) */
+            /* Output projection: use CPU (GPU weight upload has systematic bug) */
             {
-                float tmp[QW6_HIDDEN_SIZE];
-                qw6_tensor_matvec(tmp, &m->layers[l].attn_o,
-                                  (float *)att->mapped, QW6_HIDDEN_SIZE);
-                memcpy(att->mapped, tmp, QW6_HIDDEN_SIZE * sizeof(float));
+                float attn_in[QW6_NUM_Q_HEADS * QW6_HEAD_DIM];
+                memcpy(attn_in, att->mapped, sizeof(attn_in));
+                qw6_tensor_matvec((float *)att->mapped, &m->layers[l].attn_o,
+                                  attn_in, QW6_HIDDEN_SIZE);
             }
         }
 
