@@ -97,7 +97,7 @@ Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders.
 
 - [ ] Required tensor validation is incomplete. Some binding helpers can silently skip malformed tensors; the loader can still appear to succeed if raw layer tensor counts look plausible.
 - [x] `bind_expert_pack` now reports shape, stride, quant, and byte-span errors with descriptive messages. Returns -1 on failure, checked by all callers.
-- [ ] Unknown GGUF tensor types must be fatal. The current type conversion has paths where an unsupported type can collapse toward FP32 semantics if earlier checks miss it.
+- [x] Unknown GGUF tensor types are fatal. The loader now rejects unsupported tensor types instead of collapsing them toward FP32 semantics.
 - [x] Tensor byte sizes validated via `gguf_validate_tensor_ranges()` using `ggml_type_block_elems/bytes`.
 - [x] Large-file handling: ftell/fseek → ftello/fseeko with off_t for 64-bit file sizes.
 - [x] `type_counts[30]` → `type_counts[36]` (enum goes to GGML_TYPE_TQ2_0 = 35).

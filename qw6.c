@@ -338,7 +338,7 @@ static bool qw6_gguf_type_supported(ggml_type_t t) {
     }
 }
 
-static qw6_quant_t qw6_gguf_to_quant(ggml_type_t t);
+static bool qw6_gguf_to_quant(ggml_type_t t, qw6_quant_t *out);
 
 static uint64_t qw6_file_size(FILE *f) {
     QW6_ASSERT_PTR(f);
@@ -480,11 +480,16 @@ static int tensor_layer_index(const char *name) {
     return (int)idx;
 }
 
-static void qw6_tensor_bind(qw6_tensor_t *dst, const gguf_tensor_info_t *ti,
-                            uint8_t *base, uint64_t abs_offset,
-                            uint64_t span) {
+static int qw6_tensor_bind(qw6_tensor_t *dst, const gguf_tensor_info_t *ti,
+                           uint8_t *base, uint64_t abs_offset,
+                           uint64_t span) {
     QW6_ASSERT_PTR(dst);
     QW6_ASSERT_PTR(ti);
+    if (!qw6_gguf_type_supported(ti->type)) {
+        fprintf(stderr, "qw6: tensor '%s' uses unsupported type %s\n",
+                ti->name, ggml_type_name(ti->type));
+        return -1;
+    }
     snprintf(dst->name, sizeof(dst->name), "%s", ti->name);
     dst->n_dims = ti->n_dims;
     for (uint32_t i = 0; i < GGUF_MAX_DIMS; i++)
@@ -494,7 +499,12 @@ static void qw6_tensor_bind(qw6_tensor_t *dst, const gguf_tensor_info_t *ti,
     dst->file_offset = abs_offset;
     dst->data_size = (size_t)span;
     dst->data = base ? (void *)(base + abs_offset) : NULL;
-    dst->quant = qw6_gguf_to_quant(ti->type);
+    if (!qw6_gguf_to_quant(ti->type, &dst->quant)) {
+        fprintf(stderr, "qw6: tensor '%s' uses unsupported type %s\n",
+                ti->name, ggml_type_name(ti->type));
+        return -1;
+    }
+    return 0;
 }
 
 static bool name_has_suffix(const char *name, const char *suffix) {
@@ -542,7 +552,12 @@ static int bind_expert_pack(qw6_tensor_t *dst, const gguf_tensor_info_t *ti,
         return -1;
     }
 
-    qw6_quant_t q = qw6_gguf_to_quant(ti->type);
+    qw6_quant_t q;
+    if (!qw6_gguf_to_quant(ti->type, &q)) {
+        fprintf(stderr, "qw6: tensor '%s' uses unsupported type %s\n",
+                ti->name, ggml_type_name(ti->type));
+        return -1;
+    }
     uint32_t cols = (uint32_t)ti->dims[0];
     uint32_t rows = (uint32_t)ti->dims[1];
     size_t row_size = qw6_tensor_row_size_for(q, cols);
@@ -637,7 +652,8 @@ static int bind_layer_tensor(qw6_model_t *m, int layer,
     }
 
     if (!dst) return 0;
-    qw6_tensor_bind(dst, ti, base, abs_offset, span);
+    if (qw6_tensor_bind(dst, ti, base, abs_offset, span) != 0)
+        return -1;
     return 1;
 }
 
@@ -920,19 +936,20 @@ int qw6_gguf_parse(const char *path, gguf_ctx_t *ctx) {
 
 /* Map GGML tensor type → qw6 quant enum (used by tensor data loader — Phase 1) */
 __attribute__((unused))
-static qw6_quant_t qw6_gguf_to_quant(ggml_type_t t) {
+static bool qw6_gguf_to_quant(ggml_type_t t, qw6_quant_t *out) {
+    QW6_ASSERT_PTR(out);
     switch (t) {
-        case GGML_TYPE_F32:     return QW6_Q_FP32;
-        case GGML_TYPE_F16:    return QW6_Q_FP16;
-        case GGML_TYPE_BF16:   return QW6_Q_BF16;
-        case GGML_TYPE_Q8_0:   return QW6_Q_Q8_0;
-        case GGML_TYPE_Q5_K:   return QW6_Q_Q5_K;
-        case GGML_TYPE_Q6_K:   return QW6_Q_Q6_K;
-        case GGML_TYPE_Q4_K:   return QW6_Q_Q4_K_M;
-        case GGML_TYPE_IQ2_S:  return QW6_Q_IQ2_S;
-        case GGML_TYPE_IQ2_XXS: return QW6_Q_IQ2_XXS;
-        case GGML_TYPE_IQ3_S:  return QW6_Q_IQ3_S;
-        default:                return QW6_Q_FP32;   /* safe fallback */
+        case GGML_TYPE_F32:     *out = QW6_Q_FP32; return true;
+        case GGML_TYPE_F16:    *out = QW6_Q_FP16; return true;
+        case GGML_TYPE_BF16:   *out = QW6_Q_BF16; return true;
+        case GGML_TYPE_Q8_0:   *out = QW6_Q_Q8_0; return true;
+        case GGML_TYPE_Q5_K:   *out = QW6_Q_Q5_K; return true;
+        case GGML_TYPE_Q6_K:   *out = QW6_Q_Q6_K; return true;
+        case GGML_TYPE_Q4_K:   *out = QW6_Q_Q4_K_M; return true;
+        case GGML_TYPE_IQ2_S:  *out = QW6_Q_IQ2_S; return true;
+        case GGML_TYPE_IQ2_XXS: *out = QW6_Q_IQ2_XXS; return true;
+        case GGML_TYPE_IQ3_S:  *out = QW6_Q_IQ3_S; return true;
+        default:                return false;
     }
 }
 
@@ -980,16 +997,6 @@ int qw6_gguf_read_file(const char *path, qw6_model_t *m) {
                     ggml_type_name((ggml_type_t)t), type_counts[t]);
     }
 #undef QW6_MAX_GGML_TYPE
-
-    /* Check all tensor types are supported */
-    int unsupported = 0;
-    for (uint32_t i = 0; i < ctx.tensors_parsed; i++) {
-        if (!qw6_gguf_type_supported(ctx.tensors[i].type)) {
-            fprintf(stderr, "qw6: WARNING: tensor '%s' uses unsupported type %s\n",
-                    ctx.tensors[i].name, ggml_type_name(ctx.tensors[i].type));
-            unsupported++;
-        }
-    }
 
     /* Build a lightweight tensor index. Actual tensor bytes are loaded lazily
      * by the future forward path; this keeps Phase 1 metadata checks cheap. */
@@ -1039,21 +1046,26 @@ int qw6_gguf_read_file(const char *path, qw6_model_t *m) {
         if (layer >= 0) layer_seen[layer]++;
 
         uint64_t abs_offset = ctx.data_offset + ctx.tensors[i].offset;
+        int bind_rc = 0;
         if (strcmp(name, "token_embd.weight") == 0)
-            qw6_tensor_bind(&m->tok_embeddings, &ctx.tensors[i],
-                            weight_base, abs_offset, span);
+            bind_rc = qw6_tensor_bind(&m->tok_embeddings, &ctx.tensors[i],
+                                      weight_base, abs_offset, span);
         else if (strcmp(name, "output.weight") == 0)
-            qw6_tensor_bind(&m->output, &ctx.tensors[i],
-                            weight_base, abs_offset, span);
+            bind_rc = qw6_tensor_bind(&m->output, &ctx.tensors[i],
+                                      weight_base, abs_offset, span);
         else if (strcmp(name, "output_norm.weight") == 0)
-            qw6_tensor_bind(&m->output_norm, &ctx.tensors[i],
-                            weight_base, abs_offset, span);
+            bind_rc = qw6_tensor_bind(&m->output_norm, &ctx.tensors[i],
+                                      weight_base, abs_offset, span);
         else if (layer >= 0) {
             if (bind_layer_tensor(m, layer, &ctx.tensors[i],
                                   weight_base, abs_offset, span) < 0) {
                 qw6_gguf_free(&ctx);
                 return -1;
             }
+        }
+        if (bind_rc < 0) {
+            qw6_gguf_free(&ctx);
+            return -1;
         }
     }
 
@@ -1067,7 +1079,7 @@ int qw6_gguf_read_file(const char *path, qw6_model_t *m) {
             token_embd, output, output_norm, layers_with_tensors,
             QW6_NUM_LAYERS, attn_tensors, ssm_tensors, moe_tensors);
 
-    if (unsupported > 0 || token_embd != 1 || output != 1 ||
+    if (token_embd != 1 || output != 1 ||
         layers_with_tensors != QW6_NUM_LAYERS || ssm_tensors == 0 ||
         attn_tensors == 0 || moe_tensors == 0) {
         fprintf(stderr, "qw6: GGUF does not match required Qwen3.6 tensor layout\n");
@@ -3225,6 +3237,18 @@ static int selftest_sampling(void) {
     return fail;
 }
 
+static int selftest_gguf_type_gate(void) {
+    int fail = 0;
+    fail += qw6_gguf_type_supported(GGML_TYPE_F32) ? 0 : 1;
+    fail += qw6_gguf_type_supported(GGML_TYPE_Q5_K) ? 0 : 1;
+    fail += qw6_gguf_type_supported((ggml_type_t)9999) ? 1 : 0;
+    qw6_quant_t q = QW6_Q_FP32;
+    fail += qw6_gguf_to_quant((ggml_type_t)9999, &q) ? 1 : 0;
+    fail += (q == QW6_Q_FP32) ? 0 : 1;
+    if (fail) fprintf(stderr, "self-test: gguf type gate failed\n");
+    return fail;
+}
+
 static int selftest_moe_route(void) {
     const float logits[4] = {0.0f, 2.0f, 1.0f, -1.0f};
     int idx[2] = {-1, -1};
@@ -3250,6 +3274,7 @@ static int qw6_selftest(void) {
     fail += selftest_mtp_draft();
     fail += selftest_softmax_argmax();
     fail += selftest_sampling();
+    fail += selftest_gguf_type_gate();
     fail += selftest_moe_route();
     if (fail) {
         fprintf(stderr, "qw6: self-test failed (%d checks)\n", fail);
