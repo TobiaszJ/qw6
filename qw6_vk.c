@@ -54,7 +54,8 @@ typedef struct {
     double cpu_setup_ms;
     double gpu_ms;
     double total_ms;
-    uint64_t bound_bytes;
+    uint64_t read_bytes;
+    uint64_t write_bytes;
     int valid;
 } vk_pipe_cache_t;
 struct qw6_vk_pipe_s;
@@ -2083,7 +2084,8 @@ struct qw6_vk_pipe_s {
     uint32_t timestamp_query_next;
     uint64_t dispatch_count;
     uint64_t fallback_count;
-    uint64_t readback_bytes;
+    uint64_t read_bytes;
+    uint64_t write_bytes;
     vk_pipe_cache_t pipe_cache[QW6_VK_CACHE_MAX];
     int pipe_cache_count;
     VkDescriptorPool descriptor_pool;
@@ -2224,12 +2226,14 @@ static int qw6_vk_pipe_dispatch(struct qw6_vk_pipe_s *p, const char *shader_path
     VkWriteDescriptorSet writes[5];
     memset(infos, 0, sizeof(infos));
     memset(writes, 0, sizeof(writes));
-    uint64_t bound_bytes = 0;
+    uint64_t read_bytes = 0;
     for (uint32_t i = 0; i < n_buffers && i < 5; i++) {
         infos[i].buffer = buffers[i]->buffer;
         infos[i].offset = offsets ? offsets[i] : 0;
         infos[i].range = buffers[i]->size - infos[i].offset;
-        bound_bytes += infos[i].range;
+        if (i + 1 < n_buffers) {
+            read_bytes += infos[i].range;
+        }
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = ds;
         writes[i].dstBinding = i;
@@ -2272,7 +2276,10 @@ static int qw6_vk_pipe_dispatch(struct qw6_vk_pipe_s *p, const char *shader_path
     p->dispatch_count++;
     if (profile) {
         c->cpu_setup_ms += t0 - setup_t0;
-        c->bound_bytes += bound_bytes;
+        c->read_bytes += read_bytes;
+        c->write_bytes += (n_buffers > 0) ? infos[n_buffers - 1].range : 0;
+        p->read_bytes += read_bytes;
+        p->write_bytes += (n_buffers > 0) ? infos[n_buffers - 1].range : 0;
         if (ts1 != UINT32_MAX) {
             uint64_t stamps[2] = {0, 0};
             VkResult qrc = vkGetQueryPoolResults(vk->device, p->timestamp_queries,
@@ -2613,7 +2620,7 @@ static int qw6_vk_pipe_sample_greedy(struct qw6_vk_pipe_s *p,
                               1, 1, 1) != 0) return -1;
     uint32_t tok;
     memcpy(&tok, p->scr_sample.mapped, sizeof(tok));
-    p->readback_bytes += sizeof(tok);
+    p->read_bytes += sizeof(tok);
     *out_token = tok;
     return 0;
 }
@@ -3355,7 +3362,7 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
     /* Read back logits to CPU (NULL = skip, e.g. when only GPU sample is needed) */
     if (logits_out) {
         memcpy(logits_out, lg->mapped, QW6_VOCAB_SIZE * sizeof(float));
-        p->readback_bytes += (uint64_t)QW6_VOCAB_SIZE * sizeof(float);
+        p->read_bytes += (uint64_t)QW6_VOCAB_SIZE * sizeof(float);
     }
     free(hidden_cpu);
     return 0;
@@ -3382,22 +3389,24 @@ int qw6_vk_pipe_forward_greedy(qw6_vk_pipe_t *p, qw6_model_t *m,
 void qw6_vk_pipe_free(qw6_vk_pipe_t *p) {
     if (!p) return;
     if (p->profile) {
-        fprintf(stderr, "qw6_vk profile: dispatches=%llu fallbacks=%llu timestamps=%s readback=%llu bytes\n",
+        fprintf(stderr, "qw6_vk profile: dispatches=%llu fallbacks=%llu timestamps=%s read=%llu write=%llu bytes\n",
                 (unsigned long long)p->dispatch_count,
                 (unsigned long long)p->fallback_count,
                 p->vk.timestamp_supported ? "on" : "off",
-                (unsigned long long)p->readback_bytes);
+                (unsigned long long)p->read_bytes,
+                (unsigned long long)p->write_bytes);
         for (int i = 0; i < p->pipe_cache_count; i++) {
             vk_pipe_cache_t *c = &p->pipe_cache[i];
             if (!c->valid || c->calls == 0) continue;
-            fprintf(stderr, "  %-32s calls=%llu setup=%.3f ms gpu=%.3f ms wall=%.3f ms avg=%.3f ms bind=%llu\n",
+            fprintf(stderr, "  %-32s calls=%llu setup=%.3f ms gpu=%.3f ms wall=%.3f ms avg=%.3f ms read=%llu write=%llu\n",
                     c->shader_path,
                     (unsigned long long)c->calls,
                     c->cpu_setup_ms,
                     c->gpu_ms,
                     c->total_ms,
                     c->total_ms / (double)c->calls,
-                    (unsigned long long)c->bound_bytes);
+                    (unsigned long long)c->read_bytes,
+                    (unsigned long long)c->write_bytes);
         }
     }
     if (p->timestamp_queries) vkDestroyQueryPool(p->vk.device, p->timestamp_queries, NULL);
