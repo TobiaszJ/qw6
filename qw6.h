@@ -202,6 +202,9 @@ typedef struct {
     uint32_t capacity;
     float *conv_state[QW6_NUM_LAYERS];
     float *logits;             /* [vocab] — last token logits */
+    bool greedy;               /* if true, use GPU argmax when possible */
+    bool dump_logits;          /* if true, keep full logits for dump */
+    bool dump_logprobs;        /* if true, keep full logits for dump */
 #ifdef QW6_VULKAN
     void *vk_pipe;             /* qw6_vk_pipe_t*, NULL = CPU */
 #endif

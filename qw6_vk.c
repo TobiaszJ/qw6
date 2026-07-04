@@ -2012,6 +2012,7 @@ struct qw6_vk_pipe_s {
     qw6_vk_buffer_t scr_s0;        /* [HIDDEN_SIZE*2] float */
     qw6_vk_buffer_t scr_s1;        /* [HIDDEN_SIZE*2] float */
     qw6_vk_buffer_t scr_logits;    /* [VOCAB_SIZE] float */
+    qw6_vk_buffer_t scr_sample;    /* [1] uint32_t */
 
     /* KV cache for full-attn layers */
     qw6_vk_buffer_t k_cache[QW6_NUM_LAYERS];
@@ -2467,6 +2468,21 @@ static int qw6_vk_pipe_rmsnorm_heads(struct qw6_vk_pipe_s *p,
                                 heads, 1, 1);
 }
 
+static int qw6_vk_pipe_sample_greedy(struct qw6_vk_pipe_s *p,
+                                       qw6_vk_buffer_t *logits_buf,
+                                       uint32_t *out_token) {
+    const size_t zero[2] = {0, 0};
+    qw6_vk_buffer_t *bufs[2] = {logits_buf, &p->scr_sample};
+    qw6_vk_n_push_t push = {.n = QW6_VOCAB_SIZE};
+    if (qw6_vk_pipe_dispatch(p, "vulkan/sampling.spv",
+                              bufs, zero, 2, &push, sizeof(push),
+                              1, 1, 1) != 0) return -1;
+    uint32_t tok;
+    memcpy(&tok, p->scr_sample.mapped, sizeof(tok));
+    *out_token = tok;
+    return 0;
+}
+
 /* ---- Init ---- */
 
 int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m) {
@@ -2548,6 +2564,10 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m) {
     VK_BUF_SZ(scr_s0, QW6_LINEAR_QKV_DIM);
     VK_BUF_SZ(scr_s1, QW6_LINEAR_QKV_DIM);
     VK_BUF_SZ(scr_logits, QW6_VOCAB_SIZE);
+    /* Small uint32 sample output buffer */
+    if (qw6_vk_buffer_create(&ctx->vk, &ctx->scr_sample, sizeof(uint32_t),
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0)
+        { qw6_vk_pipe_free(ctx); return -1; }
 #undef VK_BUF_SZ
 
     /* ---- Upload embedding and output tensors ---- */
@@ -3016,10 +3036,28 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
         VK_MATMUL(&m->output, nrm, lg, QW6_VOCAB_SIZE, QW6_HIDDEN_SIZE);
     }
 
-    /* Read back logits to CPU */
-    memcpy(logits_out, lg->mapped, QW6_VOCAB_SIZE * sizeof(float));
+    /* Read back logits to CPU (NULL = skip, e.g. when only GPU sample is needed) */
+    if (logits_out) {
+        memcpy(logits_out, lg->mapped, QW6_VOCAB_SIZE * sizeof(float));
+    }
     free(hidden_cpu);
     return 0;
+}
+
+/* Greedy forward: does full forward pass but uses GPU argmax to avoid
+ * reading back all 248k logits. Returns the sampled token ID.
+ * If dump_logits_buf is non-NULL, also reads back the full logits for debugging. */
+int qw6_vk_pipe_forward_greedy(qw6_vk_pipe_t *p, qw6_model_t *m,
+                                uint32_t token, uint32_t pos,
+                                uint32_t *out_token, float *dump_logits_buf) {
+    /* Do the full forward pass */
+    int rc = qw6_vk_pipe_forward(p, m, token, pos,
+                                  dump_logits_buf ? dump_logits_buf : NULL);
+    if (rc == 0) {
+        /* GPU argmax on the scr_logits buffer */
+        rc = qw6_vk_pipe_sample_greedy(p, &p->scr_logits, out_token);
+    }
+    return rc;
 }
 
 /* ---- Free ---- */
@@ -3061,6 +3099,7 @@ void qw6_vk_pipe_free(qw6_vk_pipe_t *p) {
     if (p->scr_s0.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_s0);
     if (p->scr_s1.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_s1);
     if (p->scr_logits.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_logits);
+    if (p->scr_sample.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_sample);
     for (int i = 0; i < QW6_NUM_LAYERS; i++) {
         if (qw6_layer_type(i) == QW6_LAYER_FULL_ATTN) {
             if (p->k_cache[i].buffer) qw6_vk_buffer_destroy(&p->vk, &p->k_cache[i]);

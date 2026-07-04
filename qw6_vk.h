@@ -71,6 +71,13 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                         uint32_t token, uint32_t pos,
                         float *logits_out);
 
+/* Greedy forward: same as qw6_vk_pipe_forward but uses GPU argmax
+ * to read back only the sampled token ID, not all logits.
+ * If dump_logits_buf is non-NULL, also reads back full logits for debugging. */
+int qw6_vk_pipe_forward_greedy(qw6_vk_pipe_t *p, qw6_model_t *m,
+                                uint32_t token, uint32_t pos,
+                                uint32_t *out_token, float *dump_logits_buf);
+
 /* Free all GPU resources */
 void qw6_vk_pipe_free(qw6_vk_pipe_t *p);
 

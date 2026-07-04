@@ -2275,8 +2275,18 @@ static int qw6_forward_token(qw6_session_t *s, uint32_t token, uint32_t pos) {
 #ifdef QW6_VULKAN
     /* GPU pipeline path */
     if (s->vk_pipe) {
-        int rc = qw6_vk_pipe_forward((qw6_vk_pipe_t *)s->vk_pipe,
+        int rc;
+        if (s->greedy) {
+            uint32_t sampled;
+            /* Greedy: use GPU argmax, skip full logit readback unless dumping */
+            bool need_logits = s->dump_logits || s->dump_logprobs;
+            rc = qw6_vk_pipe_forward_greedy((qw6_vk_pipe_t *)s->vk_pipe,
+                                            m, token, pos, &sampled,
+                                            need_logits ? s->logits : NULL);
+        } else {
+            rc = qw6_vk_pipe_forward((qw6_vk_pipe_t *)s->vk_pipe,
                                       m, token, pos, s->logits);
+        }
         free(hidden); free(resid); free(norm_w); free(normed);
         free(attn); free(ffn);
         return rc;
@@ -3288,6 +3298,9 @@ int main(int argc, char **argv) {
                 vk_pipe_ok ? "Vulkan GPU pipeline" : "CPU fallback");
     }
 #endif
+    session.greedy = (temp <= 0.0f);
+    session.dump_logits = dump_logits;
+    session.dump_logprobs = dump_logprobs;
 
     if (prompt) {
         if (seed == 0) seed = (unsigned int)time(NULL);
