@@ -2505,6 +2505,35 @@ static int qw6_vk_pipe_buf_copy(struct qw6_vk_pipe_s *p,
                                 (count_floats + 255) / 256, 1, 1);
 }
 
+static int qw6_vk_pipe_alpha_beta(struct qw6_vk_pipe_s *p,
+                                    qw6_vk_buffer_t *alpha,
+                                    qw6_vk_buffer_t *beta,
+                                    const qw6_tensor_t *dt,
+                                    const qw6_tensor_t *a,
+                                    uint32_t n_heads) {
+    if (!dt || dt->vk_offset == (size_t)-1) return -1;
+    if (!a || a->vk_offset == (size_t)-1) return -1;
+    const size_t offs[4] = {0, 0, dt->vk_offset, a->vk_offset};
+    qw6_vk_buffer_t *bufs[4] = {alpha, beta, &p->weights, &p->weights};
+    qw6_vk_n_push_t push = {.n = n_heads};
+    return qw6_vk_pipe_dispatch(p, "vulkan/deltanet_alpha_beta.spv",
+                                bufs, offs, 4, &push, sizeof(push),
+                                1, 1, 1);
+}
+
+static int qw6_vk_pipe_sigmoid_mul(struct qw6_vk_pipe_s *p,
+                                     qw6_vk_buffer_t *gate, size_t gate_off,
+                                     qw6_vk_buffer_t *x,
+                                     qw6_vk_buffer_t *out,
+                                     uint32_t n) {
+    const size_t offs[3] = {gate_off, 0, 0};
+    qw6_vk_buffer_t *bufs[3] = {gate, x, out};
+    qw6_vk_n_push_t push = {.n = n};
+    return qw6_vk_pipe_dispatch(p, "vulkan/sigmoid_mul.spv",
+                                bufs, offs, 3, &push, sizeof(push),
+                                (n + 255) / 256, 1, 1);
+}
+
 /* ---- Init ---- */
 
 int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m) {
@@ -2841,12 +2870,17 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                                           QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM) != 0)
                 qw6_l2_norm_heads(k, QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM);
 
-            /* Apply sigmoid/softplus to beta/alpha */
-            float *dt_cpu = (float *)m->layers[l].dn_dt.data;
-            float *a_cpu  = (float *)m->layers[l].dn_a.data;
-            for (int h = 0; h < QW6_NUM_VALUE_HEADS; h++) {
-                beta_cpu[h] = qw6_sigmoid(beta_cpu[h]);
-                alpha_cpu[h] = qw6_softplus(alpha_cpu[h] + dt_cpu[h]) * a_cpu[h];
+            /* Apply sigmoid/softplus to beta/alpha (GPU with CPU fallback) */
+            if (qw6_vk_pipe_alpha_beta(p, ffn, att,
+                                       &m->layers[l].dn_dt,
+                                       &m->layers[l].dn_a,
+                                       QW6_NUM_VALUE_HEADS) != 0) {
+                float *dt_cpu = (float *)m->layers[l].dn_dt.data;
+                float *a_cpu  = (float *)m->layers[l].dn_a.data;
+                for (int h = 0; h < QW6_NUM_VALUE_HEADS; h++) {
+                    beta_cpu[h] = qw6_sigmoid(beta_cpu[h]);
+                    alpha_cpu[h] = qw6_softplus(alpha_cpu[h] + dt_cpu[h]) * a_cpu[h];
+                }
             }
 
             /* Fused Gated DeltaNet recurrent update + retrieve. */
@@ -2962,10 +2996,15 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                                       QW6_NUM_Q_HEADS, QW6_NUM_KV_HEADS, QW6_HEAD_DIM);
             }
 
-            /* Apply gate */
-            for (int i = 0; i < QW6_NUM_Q_HEADS * QW6_HEAD_DIM; i++)
-                attn_cpu[i] *= qw6_sigmoid(gate_cpu[i]);
-            memcpy(att->mapped, attn_cpu, QW6_NUM_Q_HEADS * QW6_HEAD_DIM * sizeof(float));
+            /* Apply gate: att *= sigmoid(gate) (GPU with CPU fallback) */
+            size_t gate_off = (size_t)QW6_NUM_Q_HEADS * QW6_HEAD_DIM * sizeof(float);
+            if (qw6_vk_pipe_sigmoid_mul(p, s0, gate_off, att, att,
+                                        QW6_NUM_Q_HEADS * QW6_HEAD_DIM) != 0) {
+                for (int i = 0; i < QW6_NUM_Q_HEADS * QW6_HEAD_DIM; i++)
+                    attn_cpu[i] *= qw6_sigmoid(gate_cpu[i]);
+                memcpy(att->mapped, attn_cpu,
+                       QW6_NUM_Q_HEADS * QW6_HEAD_DIM * sizeof(float));
+            }
 
             /* Output projection. attn_o is pre-dequantized to FP32 at init
              * because the Q5_K shader is still numerically wrong for it. */

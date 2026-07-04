@@ -1,0 +1,34 @@
+#version 450
+
+/* Element-wise alpha/beta transforms for Gated DeltaNet linear attention.
+ *   beta[h] = sigmoid(beta[h])
+ *   alpha[h] = softplus(alpha[h] + dt[h]) * a[h]
+ *
+ * One thread per value head (typically 32). */
+layout(local_size_x = 32) in;
+
+layout(set = 0, binding = 0) buffer Alpha { float alpha[]; };
+layout(set = 0, binding = 1) buffer Beta { float beta[]; };
+layout(set = 0, binding = 2) readonly buffer Dt { float dt[]; };
+layout(set = 0, binding = 3) readonly buffer A { float a[]; };
+
+layout(push_constant) uniform Push {
+    uint n_heads;
+} pc;
+
+float qw6_sigmoid(float x) {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+float qw6_softplus(float x) {
+    if (x > 20.0) return x;
+    if (x < -20.0) return exp(x);
+    return log(1.0 + exp(x));
+}
+
+void main() {
+    uint h = gl_GlobalInvocationID.x;
+    if (h >= pc.n_heads) return;
+    alpha[h] = qw6_softplus(alpha[h] + dt[h]) * a[h];
+    beta[h] = qw6_sigmoid(beta[h]);
+}

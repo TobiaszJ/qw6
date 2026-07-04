@@ -13,7 +13,7 @@ VULKAN_LIBS ?= $(shell pkg-config --libs vulkan 2>/dev/null || echo "-lvulkan")
 SRCS = qw6.c qw6_tok.c
 VULKAN_SRCS = qw6.c qw6_tok.c qw6_vk.c
 SERVER_SRCS = qw6.c qw6_tok.c qw6-server.c
-VULKAN_SHADERS = vulkan/rmsnorm.comp vulkan/rmsnorm_apply.comp vulkan/rmsnorm_full.comp vulkan/rmsnorm_heads.comp vulkan/matvec_f32.comp vulkan/matmul_q4k.comp vulkan/matmul_q5k.comp vulkan/matmul_q6k.comp vulkan/matmul_iq2xxs.comp vulkan/matmul_iq2s.comp vulkan/matmul_iq3s.comp vulkan/vec_add.comp vulkan/add.comp vulkan/silu_mul.comp vulkan/l2_norm_heads.comp vulkan/buf_copy.comp vulkan/argmax.comp vulkan/sampling.comp vulkan/rope_mrope.comp vulkan/attention_gqa.comp vulkan/moe_route.comp vulkan/moe_gather.comp vulkan/deltanet_conv1d.comp vulkan/deltanet_conv1d_f32.comp vulkan/deltanet_gated.comp vulkan/deltanet_update.comp vulkan/deltanet_retrieve.comp vulkan/mtp_draft.comp
+VULKAN_SHADERS = vulkan/rmsnorm.comp vulkan/rmsnorm_apply.comp vulkan/rmsnorm_full.comp vulkan/rmsnorm_heads.comp vulkan/matvec_f32.comp vulkan/matmul_q4k.comp vulkan/matmul_q5k.comp vulkan/matmul_q6k.comp vulkan/matmul_iq2xxs.comp vulkan/matmul_iq2s.comp vulkan/matmul_iq3s.comp vulkan/vec_add.comp vulkan/add.comp vulkan/silu_mul.comp vulkan/sigmoid_mul.comp vulkan/l2_norm_heads.comp vulkan/buf_copy.comp vulkan/argmax.comp vulkan/sampling.comp vulkan/rope_mrope.comp vulkan/attention_gqa.comp vulkan/moe_route.comp vulkan/moe_gather.comp vulkan/deltanet_conv1d.comp vulkan/deltanet_conv1d_f32.comp vulkan/deltanet_gated.comp vulkan/deltanet_alpha_beta.comp vulkan/deltanet_update.comp vulkan/deltanet_retrieve.comp vulkan/mtp_draft.comp
 VULKAN_SPV = $(VULKAN_SHADERS:.comp=.spv)
 
 # Output binaries
