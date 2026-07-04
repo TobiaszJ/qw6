@@ -2073,6 +2073,136 @@ static int qw6_vk_pipe_silu_mul(struct qw6_vk_pipe_s *p,
                            (n + 255) / 256, 1, 1);
 }
 
+static int qw6_vk_pipe_mrope(struct qw6_vk_pipe_s *p,
+                              qw6_vk_buffer_t *qbuf, qw6_vk_buffer_t *kbuf,
+                              uint32_t q_dim, uint32_t kv_dim,
+                              uint32_t n_heads, uint32_t n_kv_heads,
+                              uint32_t position, uint32_t rotary_dim) {
+    const size_t zero[2] = {0, 0};
+    qw6_vk_buffer_t *bufs[2] = {qbuf, kbuf};
+    qw6_vk_mrope_push_t push = {
+        .q_dim = q_dim, .kv_dim = kv_dim,
+        .n_heads = n_heads, .n_kv_heads = n_kv_heads,
+        .position = position,
+        .q_head_dim = q_dim / n_heads, .k_head_dim = kv_dim / n_kv_heads,
+        .q_rot = rotary_dim, .k_rot = rotary_dim,
+        .theta_base = QW6_ROPE_THETA,
+    };
+    uint32_t total_pairs = (q_dim + kv_dim) / 2;
+    return qw6_vk_dispatch(&p->vk, "vulkan/rope_mrope.spv",
+                           bufs, zero, 2, &push, sizeof(push),
+                           (total_pairs + 255) / 256, 1, 1);
+}
+
+static int qw6_vk_pipe_attention_gqa(struct qw6_vk_pipe_s *p,
+                                      qw6_vk_buffer_t *qbuf,
+                                      qw6_vk_buffer_t *k_cache,
+                                      qw6_vk_buffer_t *v_cache,
+                                      qw6_vk_buffer_t *outbuf,
+                                      uint32_t seq_len,
+                                      uint32_t n_q_heads,
+                                      uint32_t n_kv_heads,
+                                      uint32_t head_dim) {
+    const size_t zero[4] = {0, 0, 0, 0};
+    qw6_vk_buffer_t *bufs[4] = {qbuf, k_cache, v_cache, outbuf};
+    qw6_vk_attention_gqa_push_t push = {
+        .seq_len = seq_len,
+        .n_q_heads = n_q_heads,
+        .n_kv_heads = n_kv_heads,
+        .head_dim = head_dim,
+    };
+    return qw6_vk_dispatch(&p->vk, "vulkan/attention_gqa.spv",
+                           bufs, zero, 4, &push, sizeof(push),
+                           n_q_heads, 1, 1);
+}
+
+static int qw6_vk_pipe_conv1d(struct qw6_vk_pipe_s *p,
+                               qw6_vk_buffer_t *xbuf, qw6_vk_buffer_t *wbuf,
+                               qw6_vk_buffer_t *outbuf,
+                               uint32_t dim, uint32_t kernel_size) {
+    const size_t zero[3] = {0, 0, 0};
+    qw6_vk_buffer_t *bufs[3] = {xbuf, wbuf, outbuf};
+    qw6_vk_conv1d_push_t push = {.dim = dim, .kernel_size = kernel_size};
+    return qw6_vk_dispatch(&p->vk, "vulkan/deltanet_conv1d.spv",
+                           bufs, zero, 3, &push, sizeof(push),
+                           (dim + 255) / 256, 1, 1);
+}
+
+static int qw6_vk_pipe_deltanet_retrieve(struct qw6_vk_pipe_s *p,
+                                          qw6_vk_buffer_t *state,
+                                          qw6_vk_buffer_t *query,
+                                          qw6_vk_buffer_t *out,
+                                          uint32_t key_heads,
+                                          uint32_t key_dim,
+                                          uint32_t val_heads,
+                                          uint32_t val_dim) {
+    const size_t zero[3] = {0, 0, 0};
+    qw6_vk_buffer_t *bufs[3] = {state, query, out};
+    qw6_vk_deltanet_push_t push = {
+        .key_heads = key_heads, .key_dim = key_dim,
+        .val_heads = val_heads, .val_dim = val_dim,
+        .has_beta = 0,
+    };
+    uint32_t out_n = val_heads * val_dim;
+    return qw6_vk_dispatch(&p->vk, "vulkan/deltanet_retrieve.spv",
+                           bufs, zero, 3, &push, sizeof(push),
+                           (out_n + 255) / 256, 1, 1);
+}
+
+static int qw6_vk_pipe_deltanet_update(struct qw6_vk_pipe_s *p,
+                                        qw6_vk_buffer_t *state,
+                                        qw6_vk_buffer_t *key,
+                                        qw6_vk_buffer_t *value,
+                                        qw6_vk_buffer_t *query,
+                                        qw6_vk_buffer_t *beta,
+                                        uint32_t key_heads,
+                                        uint32_t key_dim,
+                                        uint32_t val_heads,
+                                        uint32_t val_dim) {
+    const size_t zero[5] = {0, 0, 0, 0, 0};
+    qw6_vk_buffer_t *bufs[5] = {state, key, value, query, beta};
+    qw6_vk_deltanet_push_t push = {
+        .key_heads = key_heads, .key_dim = key_dim,
+        .val_heads = val_heads, .val_dim = val_dim,
+        .has_beta = 1,
+    };
+    uint32_t state_n = val_heads * val_dim * val_dim;
+    return qw6_vk_dispatch(&p->vk, "vulkan/deltanet_update.spv",
+                           bufs, zero, 5, &push, sizeof(push),
+                           (state_n + 255) / 256, 1, 1);
+}
+
+static int qw6_vk_pipe_moe_route(struct qw6_vk_pipe_s *p,
+                                  qw6_vk_buffer_t *logits,
+                                  qw6_vk_buffer_t *indices,
+                                  qw6_vk_buffer_t *weights,
+                                  uint32_t n_experts, uint32_t top_k) {
+    const size_t zero[3] = {0, 0, 0};
+    qw6_vk_buffer_t *bufs[3] = {logits, indices, weights};
+    qw6_vk_moe_route_push_t push = {.n_experts = n_experts, .top_k = top_k};
+    return qw6_vk_dispatch(&p->vk, "vulkan/moe_route.spv",
+                           bufs, zero, 3, &push, sizeof(push), 1, 1, 1);
+}
+
+static int qw6_vk_pipe_moe_gather(struct qw6_vk_pipe_s *p,
+                                   qw6_vk_buffer_t *expert_out,
+                                   qw6_vk_buffer_t *expert_weights,
+                                   qw6_vk_buffer_t *shared_out,
+                                   float shared_weight,
+                                   qw6_vk_buffer_t *out,
+                                   uint32_t dim, uint32_t top_k) {
+    const size_t zero[4] = {0, 0, 0, 0};
+    qw6_vk_buffer_t *bufs[4] = {expert_out, expert_weights, shared_out, out};
+    qw6_vk_moe_gather_push_t push = {
+        .dim = dim, .top_k = top_k,
+        .has_shared = shared_out ? 1u : 0u,
+        .shared_weight = shared_weight,
+    };
+    return qw6_vk_dispatch(&p->vk, "vulkan/moe_gather.spv",
+                           bufs, zero, 4, &push, sizeof(push),
+                           (dim + 255) / 256, 1, 1);
+}
+
 /* ---- Init ---- */
 
 int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m) {
