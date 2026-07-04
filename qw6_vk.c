@@ -1990,6 +1990,7 @@ int qw6_vk_selftest(void) {
 
 struct qw6_vk_pipe_s {
     qw6_vk_t vk;
+    bool strict;
     vk_pipe_cache_t pipe_cache[QW6_VK_CACHE_MAX];
     int pipe_cache_count;
     VkDescriptorPool descriptor_pool;
@@ -2578,12 +2579,21 @@ static int qw6_vk_pipe_axpy(struct qw6_vk_pipe_s *p,
                                 (n + 255) / 256, 1, 1);
 }
 
+static int qw6_vk_strict_fallback(struct qw6_vk_pipe_s *p, const char *what) {
+    if (p->strict) {
+        fprintf(stderr, "qw6_vk: strict Vulkan mode forbids CPU fallback (%s)\n", what);
+        return -1;
+    }
+    return 0;
+}
+
 /* ---- Init ---- */
 
-int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m) {
+int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m, bool strict) {
     if (!p || !m) return -1;
     qw6_vk_pipe_t *ctx = calloc(1, sizeof(qw6_vk_pipe_t));
     if (!ctx) return -1;
+    ctx->strict = strict;
 
     if (qw6_vk_init(&ctx->vk) != 0) {
         free(ctx);
@@ -2829,6 +2839,9 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
         if ((t)->vk_offset != (size_t)-1 && \
             qw6_vk_pipe_matvec(p, t, x, y, rows, cols) == 0) { \
             /* GPU dispatch succeeded */ \
+        } else if (qw6_vk_strict_fallback(p, "matmul") != 0) { \
+            free(hidden_cpu); \
+            return -1; \
         } else { \
             /* Fall back to CPU */ \
             float *_x = (float *)(x)->mapped; \
@@ -2895,6 +2908,7 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                                              &m->layers[l].conv1d, s0,
                                              QW6_LINEAR_QKV_DIM,
                                              QW6_CONV1D_KERNEL) != 0) {
+                if (qw6_vk_strict_fallback(p, "conv1d") != 0) { free(hidden_cpu); return -1; }
                 memmove(cs, cs + QW6_LINEAR_QKV_DIM,
                         (size_t)(QW6_CONV1D_KERNEL - 1) * QW6_LINEAR_QKV_DIM * sizeof(float));
                 memcpy(cs + (size_t)(QW6_CONV1D_KERNEL - 1) * QW6_LINEAR_QKV_DIM,
@@ -2916,17 +2930,22 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
             float *v = conv_out + 2 * QW6_NUM_KEY_HEADS * QW6_KEY_HEAD_DIM;
             size_t k_off = (size_t)QW6_NUM_KEY_HEADS * QW6_KEY_HEAD_DIM * sizeof(float);
             if (qw6_vk_pipe_l2_norm_heads(p, s0, 0,
-                                          QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM) != 0)
+                                          QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM) != 0) {
+                if (qw6_vk_strict_fallback(p, "l2_norm_heads(q)") != 0) { free(hidden_cpu); return -1; }
                 qw6_l2_norm_heads(q, QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM);
+            }
             if (qw6_vk_pipe_l2_norm_heads(p, s0, k_off,
-                                          QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM) != 0)
+                                          QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM) != 0) {
+                if (qw6_vk_strict_fallback(p, "l2_norm_heads(k)") != 0) { free(hidden_cpu); return -1; }
                 qw6_l2_norm_heads(k, QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM);
+            }
 
             /* Apply sigmoid/softplus to beta/alpha (GPU with CPU fallback) */
             if (qw6_vk_pipe_alpha_beta(p, ffn, att,
                                        &m->layers[l].dn_dt,
                                        &m->layers[l].dn_a,
                                        QW6_NUM_VALUE_HEADS) != 0) {
+                if (qw6_vk_strict_fallback(p, "alpha_beta") != 0) { free(hidden_cpu); return -1; }
                 float *dt_cpu = (float *)m->layers[l].dn_dt.data;
                 float *a_cpu  = (float *)m->layers[l].dn_a.data;
                 for (int h = 0; h < QW6_NUM_VALUE_HEADS; h++) {
@@ -2941,6 +2960,7 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                                            QW6_NUM_KEY_HEADS,
                                            QW6_NUM_VALUE_HEADS,
                                            QW6_VALUE_HEAD_DIM) != 0) {
+                if (qw6_vk_strict_fallback(p, "deltanet_gated") != 0) { free(hidden_cpu); return -1; }
                 float *state = (float *)p->dn_state[l].mapped;
                 qw6_gated_delta_net_single(gdn, state, q, k, v, alpha_cpu, beta_cpu);
                 memcpy(p->dn_state[l].mapped, state,
@@ -2952,6 +2972,7 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                                                s0, s1,
                                                QW6_NUM_VALUE_HEADS,
                                                QW6_VALUE_HEAD_DIM) != 0) {
+                if (qw6_vk_strict_fallback(p, "deltanet_norm_gate") != 0) { free(hidden_cpu); return -1; }
                 float *dn_norm_w = (float *)m->layers[l].dn_norm.data;
                 float *gated = (float *)s1->mapped;
                 float *gdn_cpu = (float *)nrm->mapped;
@@ -2991,6 +3012,7 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
             /* Apply Q/K RMSNorm per head (GPU with CPU fallback) */
             if (qw6_vk_pipe_rmsnorm_heads(p, s0, &m->layers[l].attn_q_norm,
                                           QW6_NUM_Q_HEADS, QW6_HEAD_DIM) != 0) {
+                if (qw6_vk_strict_fallback(p, "attn_q_norm") != 0) { free(hidden_cpu); return -1; }
                 float *qnw = (float *)m->layers[l].attn_q_norm.data;
                 for (int h = 0; h < QW6_NUM_Q_HEADS; h++)
                     qw6_cpu_rmsnorm(q_cpu + h * QW6_HEAD_DIM,
@@ -2999,6 +3021,7 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
             }
             if (qw6_vk_pipe_rmsnorm_heads(p, s1, &m->layers[l].attn_k_norm,
                                           QW6_NUM_KV_HEADS, QW6_HEAD_DIM) != 0) {
+                if (qw6_vk_strict_fallback(p, "attn_k_norm") != 0) { free(hidden_cpu); return -1; }
                 float *knw = (float *)m->layers[l].attn_k_norm.data;
                 for (int h = 0; h < QW6_NUM_KV_HEADS; h++)
                     qw6_cpu_rmsnorm(k_cpu + h * QW6_HEAD_DIM,
@@ -3014,6 +3037,7 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                                        QW6_NUM_KV_HEADS * QW6_HEAD_DIM,
                                        QW6_NUM_Q_HEADS, QW6_NUM_KV_HEADS,
                                        pos, (uint32_t)rot_dim) != 0) {
+                    if (qw6_vk_strict_fallback(p, "mrope") != 0) { free(hidden_cpu); return -1; }
                     qw6_cpu_mrope(q_cpu, k_cpu,
                                   QW6_NUM_Q_HEADS * QW6_HEAD_DIM,
                                   QW6_NUM_KV_HEADS * QW6_HEAD_DIM,
@@ -3029,11 +3053,13 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
             size_t v_cache_off = kv_pos * sizeof(float);
             if (qw6_vk_pipe_buf_copy(p, s1, 0, &p->k_cache[l], k_cache_off,
                                       QW6_NUM_KV_HEADS * QW6_HEAD_DIM) != 0) {
+                if (qw6_vk_strict_fallback(p, "kv_copy_k") != 0) { free(hidden_cpu); return -1; }
                 float *k_slot = (float *)p->k_cache[l].mapped + kv_pos;
                 memcpy(k_slot, k_cpu, kv_bytes);
             }
             if (qw6_vk_pipe_buf_copy(p, ffn, 0, &p->v_cache[l], v_cache_off,
                                       QW6_NUM_KV_HEADS * QW6_HEAD_DIM) != 0) {
+                if (qw6_vk_strict_fallback(p, "kv_copy_v") != 0) { free(hidden_cpu); return -1; }
                 float *v_slot = (float *)p->v_cache[l].mapped + kv_pos;
                 memcpy(v_slot, (float *)ffn->mapped, kv_bytes);
             }
@@ -3048,6 +3074,7 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                                           QW6_HEAD_DIM) == 0) {
                 /* GPU path wrote attn_cpu through the mapped buffer. */
             } else {
+                if (pos >= 256 && qw6_vk_strict_fallback(p, "attention_gqa_context") != 0) { free(hidden_cpu); return -1; }
                 qw6_cpu_attention_gqa(attn_cpu, q_cpu,
                                       (float *)p->k_cache[l].mapped,
                                       (float *)p->v_cache[l].mapped,
@@ -3059,6 +3086,7 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
             size_t gate_off = (size_t)QW6_NUM_Q_HEADS * QW6_HEAD_DIM * sizeof(float);
             if (qw6_vk_pipe_sigmoid_mul(p, s0, gate_off, att, att,
                                         QW6_NUM_Q_HEADS * QW6_HEAD_DIM) != 0) {
+                if (qw6_vk_strict_fallback(p, "sigmoid_mul") != 0) { free(hidden_cpu); return -1; }
                 for (int i = 0; i < QW6_NUM_Q_HEADS * QW6_HEAD_DIM; i++)
                     attn_cpu[i] *= qw6_sigmoid(gate_cpu[i]);
                 memcpy(att->mapped, attn_cpu,
@@ -3092,6 +3120,7 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
         float w[QW6_EXPERTS_PER_TOK] = {0};
         if (qw6_vk_pipe_moe_route(p, s0, &p->scr_moe_idx, &p->scr_moe_w,
                                   QW6_NUM_EXPERTS, QW6_EXPERTS_PER_TOK) != 0) {
+            if (qw6_vk_strict_fallback(p, "moe_route") != 0) { free(hidden_cpu); return -1; }
             float *router_logits = (float *)s0->mapped;
             qw6_cpu_moe_route(idx, w, router_logits,
                               QW6_NUM_EXPERTS, QW6_EXPERTS_PER_TOK);
@@ -3126,6 +3155,7 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
             /* Accumulate: ffn += w[e] * nrm (GPU axpy with CPU fallback) */
             if (qw6_vk_pipe_axpy(p, ffn, nrm, w[e],
                                  QW6_HIDDEN_SIZE) != 0) {
+                if (qw6_vk_strict_fallback(p, "axpy") != 0) { free(hidden_cpu); return -1; }
                 float *ffn_p = (float *)ffn->mapped;
                 float *tmp_p = (float *)nrm->mapped;
                 for (int i = 0; i < QW6_HIDDEN_SIZE; i++)
@@ -3158,6 +3188,7 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
             /* Accumulate: ffn += shared_weight * nrm (GPU axpy with CPU fallback) */
             if (qw6_vk_pipe_axpy(p, ffn, nrm, shared_weight,
                                  QW6_HIDDEN_SIZE) != 0) {
+                if (qw6_vk_strict_fallback(p, "shared_axpy") != 0) { free(hidden_cpu); return -1; }
                 float *ffn_p = (float *)ffn->mapped;
                 float *tmp_p = (float *)nrm->mapped;
                 for (int i = 0; i < QW6_HIDDEN_SIZE; i++)

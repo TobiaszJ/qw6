@@ -89,7 +89,7 @@ Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders.
 - [x] Add structured trace JSON output (`--trace-json`) for prompt tokens, generated tokens, and top logits after prefill/final token.
 - [ ] Establish CPU vs Vulkan parity for one token and for a multi-token prompt. The Vulkan path currently has separate math from the CPU path in Conv1D, Gated DeltaNet, attention, routing, and quant matmuls.
 - [ ] Validate the final generated text, not only that the process runs. Current output has not been proven semantically or numerically correct.
-- [ ] Make correctness tests fail hard on any CPU fallback in Vulkan performance mode. Today unsupported GPU quant or long-context attention can silently fall back to CPU.
+- [x] Make correctness tests fail hard on any CPU fallback in Vulkan performance mode via `--vulkan-strict`. Unsupported GPU quant or long-context attention now abort instead of silently falling back to CPU.
 - [x] Add --bench mode: runs 128-token timed generation with tok/s report.
 - [x] Add --seed flag for reproducible generation.
 
@@ -119,7 +119,7 @@ Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders.
 - [ ] CPU probes cover only small slices or layer 0. They do not prove full-model correctness.
 - [ ] DeltaNet has older update/retrieve helpers plus the actual `qw6_gated_delta_net_single` recurrence. Tests must validate the recurrence used by the model path, not only the older helper kernels.
 - [ ] The Conv1D probe is not enough to validate the stateful model path. It must cover multi-token state shift, weight layout, SiLU, and in-place buffer reuse.
-- [ ] CPU fallback inside the Vulkan pipeline uses mapped buffers and can hide missing GPU kernels. Debug fallback should be explicit; performance mode should reject it.
+- [x] CPU fallback inside the Vulkan pipeline uses mapped buffers only in non-strict/debug mode; performance mode now rejects fallback through `--vulkan-strict`.
 - [ ] Session initialization allocates CPU KV/state buffers even when the Vulkan pipeline is used. That wastes memory and muddies profiling on the BC-250.
 - [ ] `qw6_forward_token` allocates CPU temporary buffers before it redirects to Vulkan. This creates avoidable allocation overhead in the GPU path.
 

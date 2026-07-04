@@ -3167,6 +3167,7 @@ static void usage(void) {
         "  --nothink       Disable thinking mode\n"
         "  --cpu           CPU backend (default)\n"
         "  --vulkan        Vulkan backend (Phase 2)\n"
+        "  --vulkan-strict Fail if any GPU fallback would occur\n"
         "  --vulkan-self-test Run Vulkan compute backend self-test\n"
         "  --dump-tokens   Tokenise prompt and exit\n"
         "  --dump-logits   Dump top-10 logits after prefill and each generated token\n"
@@ -3200,6 +3201,7 @@ int main(int argc, char **argv) {
 #ifdef QW6_VULKAN
     void *pipe = NULL;
     int vk_pipe_ok = 0;
+    bool vk_strict = false;
 #endif
 
     for (int i = 1; i < argc; i++) {
@@ -3222,6 +3224,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--cpu") == 0) { use_vulkan = false; }
         else if (strcmp(argv[i], "--raw") == 0) { raw_prompt = true; }
         else if (strcmp(argv[i], "--vulkan") == 0) { use_vulkan = true; }
+#ifdef QW6_VULKAN
+        else if (strcmp(argv[i], "--vulkan-strict") == 0) { use_vulkan = true; vk_strict = true; }
+#endif
         else if (strcmp(argv[i], "--vulkan-self-test") == 0) { vulkan_self_test = true; }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(); return 0;
@@ -3376,11 +3381,17 @@ int main(int argc, char **argv) {
 
 #ifdef QW6_VULKAN
     if (use_vulkan) {
-        if (qw6_vk_pipe_init((qw6_vk_pipe_t **)&pipe, &model) == 0) {
+        if (qw6_vk_pipe_init((qw6_vk_pipe_t **)&pipe, &model, vk_strict) == 0) {
             fprintf(stderr, "qw6: Vulkan pipeline initialized\n");
             vk_pipe_ok = 1;
         } else {
-            fprintf(stderr, "qw6: Vulkan pipeline init failed, falling back to CPU\n");
+            fprintf(stderr, "qw6: Vulkan pipeline init failed%s\n",
+                    vk_strict ? "" : ", falling back to CPU");
+            if (vk_strict) {
+                qw6_model_free(&model);
+                qw6_tok_free(&tokenizer);
+                return 1;
+            }
         }
     }
 #endif

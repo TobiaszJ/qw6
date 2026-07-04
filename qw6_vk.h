@@ -4,6 +4,7 @@
 #ifdef QW6_VULKAN
 
 #include <stdint.h>
+#include <stdbool.h>
 
 int qw6_vk_selftest(void);
 int qw6_vk_matvec_f32_host(const float *w, const float *x, float *y,
@@ -60,7 +61,7 @@ int qw6_vk_mtp_draft_host(const float *w, const float *hidden, float *logits,
 typedef struct qw6_vk_pipe_s qw6_vk_pipe_t;
 
 /* Initialize GPU pipeline: detect device, allocate buffers, upload weights */
-int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m);
+int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m, bool strict);
 
 /* Run one token forward pass entirely on GPU.
  * token: input token ID
