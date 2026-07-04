@@ -3049,16 +3049,38 @@ int main(int argc, char **argv) {
         fprintf(stderr, "qw6: thinking mode: %s\n", nothink ? "disabled" : "enabled");
         fprintf(stderr, "qw6: ctx=%d max_tokens=%d temp=%.1f\n\n", ctx, n_tokens, temp);
 
+        /* Wrap prompt in Qwen chat template */
+        const char *sys_msg = "You are a helpful assistant";
+        char *templated = NULL;
+        {
+            const char *t_prefix = "<|im_start|>system\n";
+            const char *t_mid    = "<|im_end|>\n<|im_start|>user\n";
+            const char *t_suffix = "<|im_end|>\n<|im_start|>assistant\n";
+            size_t slen = strlen(t_prefix) + strlen(sys_msg) + strlen(t_mid)
+                        + strlen(prompt) + strlen(t_suffix) + 1;
+            templated = malloc(slen);
+            if (templated) {
+                snprintf(templated, slen, "%s%s%s%s%s",
+                         t_prefix, sys_msg, t_mid, prompt, t_suffix);
+                fprintf(stderr, "qw6: chat templated prompt (%zu chars)\n", slen - 1);
+            }
+        }
+
+        const char *enc_prompt = templated ? templated : prompt;
+
         uint32_t *tokens = NULL;
         uint32_t n = 0;
-        if (qw6_tok_encode(&tokenizer, prompt, &tokens, &n) != 0) {
+        if (qw6_tok_encode(&tokenizer, enc_prompt, &tokens, &n) != 0) {
             fprintf(stderr, "qw6: tokeniser encoding failed\n");
+            free(templated);
             qw6_session_free(&session);
             qw6_model_free(&model);
             qw6_tok_free(&tokenizer);
             return 1;
         }
         fprintf(stderr, "qw6: tokenised to %u tokens\n", n);
+        free(templated);
+        templated = NULL;
 
         if (qw6_prefill(&session, tokens, n) != 0) {
             fprintf(stderr, "qw6: native prefill failed\n");
