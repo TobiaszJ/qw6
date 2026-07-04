@@ -20,12 +20,14 @@ path before the Vulkan backend:
 - Native probes run output projection MatVec, layer-0 RMSNorm, router top-k,
   routed/shared-expert FFN, and a single-token layer-0 Gated DeltaNet forward
   probe against real Qwen3.6 weights.
+- Native greedy generation has a CPU smoke path through all 40 layers with
+  KV cache, DeltaNet state, Conv1D state, final norm, and output logits.
 
 Not yet implemented:
 
-- full 40-layer native forward pass
-- full GQA layer forward integrated with KV cache
-- end-to-end native token generation
+- reference-logit parity for the 40-layer native forward pass
+- optimized/chunked prefill
+- text-quality validation beyond smoke generation
 
 The old experimental external `llama.cpp` generation bridge is not part of the
 native engine path.

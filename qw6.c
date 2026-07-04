@@ -469,6 +469,8 @@ static int bind_layer_tensor(qw6_model_t *m, int layer,
     else if (strcmp(local, "attn_q.weight") == 0) dst = &m->layers[layer].attn_q;
     else if (strcmp(local, "attn_k.weight") == 0) dst = &m->layers[layer].attn_k;
     else if (strcmp(local, "attn_v.weight") == 0) dst = &m->layers[layer].attn_v;
+    else if (strcmp(local, "attn_q_norm.weight") == 0) dst = &m->layers[layer].attn_q_norm;
+    else if (strcmp(local, "attn_k_norm.weight") == 0) dst = &m->layers[layer].attn_k_norm;
     else if (strcmp(local, "attn_output.weight") == 0) dst = &m->layers[layer].attn_o;
     else if (strcmp(local, "attn_gate.weight") == 0) dst = &m->layers[layer].attn_gate;
     else if (strcmp(local, "ssm_conv1d.weight") == 0) dst = &m->layers[layer].conv1d;
@@ -868,6 +870,9 @@ int qw6_gguf_read_file(const char *path, qw6_model_t *m) {
         else if (strcmp(name, "output.weight") == 0)
             qw6_tensor_bind(&m->output, &ctx.tensors[i],
                             weight_base, abs_offset, span);
+        else if (strcmp(name, "output_norm.weight") == 0)
+            qw6_tensor_bind(&m->output_norm, &ctx.tensors[i],
+                            weight_base, abs_offset, span);
         else if (layer >= 0)
             (void)bind_layer_tensor(m, layer, &ctx.tensors[i],
                                     weight_base, abs_offset, span);
@@ -1020,13 +1025,31 @@ int qw6_session_init(qw6_session_t *s, qw6_model_t *m, uint32_t max_tokens) {
     s->logits = calloc(QW6_VOCAB_SIZE, sizeof(float));
     QW6_ASSERT_PTR(s->logits);
 
-    /* Runtime caches are intentionally lazy in Phase 1. The forward path is
-     * still stubbed, so eager DeltaNet/KV allocation would only waste memory. */
+    for (int i = 0; i < QW6_NUM_LAYERS; i++) {
+        if (qw6_layer_type(i) == QW6_LAYER_LINEAR_ATTN) {
+            m->deltanet_state[i] = calloc((size_t)QW6_NUM_VALUE_HEADS *
+                                          QW6_VALUE_HEAD_DIM * QW6_VALUE_HEAD_DIM,
+                                          sizeof(float));
+            s->conv_state[i] = calloc((size_t)QW6_CONV1D_KERNEL *
+                                      QW6_LINEAR_QKV_DIM, sizeof(float));
+            QW6_ASSERT_PTR(m->deltanet_state[i]);
+            QW6_ASSERT_PTR(s->conv_state[i]);
+        } else {
+            m->k_cache[i] = calloc((size_t)max_tokens * QW6_NUM_KV_HEADS *
+                                   QW6_HEAD_DIM, sizeof(float));
+            m->v_cache[i] = calloc((size_t)max_tokens * QW6_NUM_KV_HEADS *
+                                   QW6_HEAD_DIM, sizeof(float));
+            QW6_ASSERT_PTR(m->k_cache[i]);
+            QW6_ASSERT_PTR(m->v_cache[i]);
+        }
+    }
     return 0;
 }
 
 void qw6_session_free(qw6_session_t *s) {
     QW6_ASSERT_PTR(s);
+    for (int i = 0; i < QW6_NUM_LAYERS; i++)
+        if (s->conv_state[i]) free(s->conv_state[i]);
     if (s->tokens) free(s->tokens);
     if (s->logits) free(s->logits);
     memset(s, 0, sizeof(*s));
@@ -1768,6 +1791,256 @@ static int qw6_probe_layer0_attn_qkv(qw6_model_t *m) {
     return rc;
 }
 
+static void qw6_add_inplace(float *dst, const float *src, int n) {
+    for (int i = 0; i < n; i++) dst[i] += src[i];
+}
+
+static int qw6_apply_layer_moe(float *out, qw6_model_t *m, int layer,
+                               const float *x) {
+    QW6_ASSERT_PTR(out); QW6_ASSERT_PTR(m); QW6_ASSERT_PTR(x);
+    const qw6_tensor_t *router_t = &m->layers[layer].moe_router;
+    if (!router_t->data) return -1;
+
+    float *router_logits = calloc(QW6_NUM_EXPERTS, sizeof(float));
+    float *gate = calloc(QW6_MOE_INTER, sizeof(float));
+    float *up = calloc(QW6_MOE_INTER, sizeof(float));
+    float *mid = calloc(QW6_MOE_INTER, sizeof(float));
+    float *tmp = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *sgate = calloc(QW6_SHARED_INTER, sizeof(float));
+    float *sup = calloc(QW6_SHARED_INTER, sizeof(float));
+    float *smid = calloc(QW6_SHARED_INTER, sizeof(float));
+    int idx[QW6_EXPERTS_PER_TOK] = {0};
+    float w[QW6_EXPERTS_PER_TOK] = {0};
+    QW6_ASSERT_PTR(router_logits); QW6_ASSERT_PTR(gate); QW6_ASSERT_PTR(up);
+    QW6_ASSERT_PTR(mid); QW6_ASSERT_PTR(tmp); QW6_ASSERT_PTR(sgate);
+    QW6_ASSERT_PTR(sup); QW6_ASSERT_PTR(smid);
+
+    memset(out, 0, QW6_HIDDEN_SIZE * sizeof(float));
+    int rc = qw6_tensor_matvec(router_logits, router_t, x, QW6_NUM_EXPERTS);
+    if (rc == 0) {
+        qw6_cpu_moe_route(idx, w, router_logits,
+                          QW6_NUM_EXPERTS, QW6_EXPERTS_PER_TOK);
+        for (int e = 0; e < QW6_EXPERTS_PER_TOK && rc == 0; e++) {
+            const int expert = idx[e];
+            rc = qw6_tensor_matvec(gate, &m->layers[layer].expert_gate[expert],
+                                   x, QW6_MOE_INTER);
+            if (rc == 0) rc = qw6_tensor_matvec(up, &m->layers[layer].expert_up[expert],
+                                                x, QW6_MOE_INTER);
+            if (rc == 0) {
+                for (int i = 0; i < QW6_MOE_INTER; i++) mid[i] = qw6_silu(gate[i]) * up[i];
+                rc = qw6_tensor_matvec(tmp, &m->layers[layer].expert_down[expert],
+                                       mid, QW6_HIDDEN_SIZE);
+            }
+            if (rc == 0)
+                for (int i = 0; i < QW6_HIDDEN_SIZE; i++) out[i] += w[e] * tmp[i];
+        }
+    }
+
+    if (rc == 0 && m->layers[layer].shared_gate.data &&
+        m->layers[layer].shared_up.data && m->layers[layer].shared_down.data) {
+        float shared_weight = 1.0f;
+        if (m->layers[layer].shared_router.data) {
+            rc = qw6_tensor_matvec(&shared_weight, &m->layers[layer].shared_router, x, 1);
+            shared_weight = qw6_sigmoid(shared_weight);
+        }
+        if (rc == 0) rc = qw6_tensor_matvec(sgate, &m->layers[layer].shared_gate,
+                                            x, QW6_SHARED_INTER);
+        if (rc == 0) rc = qw6_tensor_matvec(sup, &m->layers[layer].shared_up,
+                                            x, QW6_SHARED_INTER);
+        if (rc == 0) {
+            for (int i = 0; i < QW6_SHARED_INTER; i++) smid[i] = qw6_silu(sgate[i]) * sup[i];
+            rc = qw6_tensor_matvec(tmp, &m->layers[layer].shared_down,
+                                   smid, QW6_HIDDEN_SIZE);
+        }
+        if (rc == 0)
+            for (int i = 0; i < QW6_HIDDEN_SIZE; i++) out[i] += shared_weight * tmp[i];
+    }
+
+    free(router_logits); free(gate); free(up); free(mid); free(tmp);
+    free(sgate); free(sup); free(smid);
+    return rc;
+}
+
+static int qw6_apply_linear_attn(float *out, qw6_session_t *s, int layer,
+                                 const float *x) {
+    qw6_model_t *m = s->model;
+    float *qkv = calloc(QW6_LINEAR_QKV_DIM, sizeof(float));
+    float *conv = calloc(QW6_LINEAR_QKV_DIM, sizeof(float));
+    float *z = calloc(QW6_LINEAR_VALUE_DIM, sizeof(float));
+    float *beta = calloc(QW6_NUM_VALUE_HEADS, sizeof(float));
+    float *alpha = calloc(QW6_NUM_VALUE_HEADS, sizeof(float));
+    float *dt = calloc(QW6_NUM_VALUE_HEADS, sizeof(float));
+    float *a = calloc(QW6_NUM_VALUE_HEADS, sizeof(float));
+    float *dn_norm = calloc(QW6_VALUE_HEAD_DIM, sizeof(float));
+    float *gdn = calloc(QW6_LINEAR_VALUE_DIM, sizeof(float));
+    float *gated = calloc(QW6_LINEAR_VALUE_DIM, sizeof(float));
+    QW6_ASSERT_PTR(qkv); QW6_ASSERT_PTR(conv); QW6_ASSERT_PTR(z);
+    QW6_ASSERT_PTR(beta); QW6_ASSERT_PTR(alpha); QW6_ASSERT_PTR(dt);
+    QW6_ASSERT_PTR(a); QW6_ASSERT_PTR(dn_norm); QW6_ASSERT_PTR(gdn);
+    QW6_ASSERT_PTR(gated);
+
+    int rc = qw6_tensor_matvec(qkv, &m->layers[layer].attn_q, x, QW6_LINEAR_QKV_DIM);
+    if (rc == 0) rc = qw6_tensor_matvec(z, &m->layers[layer].attn_gate,
+                                        x, QW6_LINEAR_VALUE_DIM);
+    if (rc == 0) rc = qw6_tensor_matvec(beta, &m->layers[layer].dn_beta,
+                                        x, QW6_NUM_VALUE_HEADS);
+    if (rc == 0) rc = qw6_tensor_matvec(alpha, &m->layers[layer].dn_alpha,
+                                        x, QW6_NUM_VALUE_HEADS);
+    if (rc == 0) rc = qw6_tensor_dequantize_row(&m->layers[layer].dn_dt, 0, dt);
+    if (rc == 0) rc = qw6_tensor_dequantize_row(&m->layers[layer].dn_a, 0, a);
+    if (rc == 0) rc = qw6_tensor_dequantize_row(&m->layers[layer].dn_norm, 0, dn_norm);
+    if (rc == 0) {
+        float *cs = s->conv_state[layer];
+        memmove(cs, cs + QW6_LINEAR_QKV_DIM,
+                (size_t)(QW6_CONV1D_KERNEL - 1) * QW6_LINEAR_QKV_DIM * sizeof(float));
+        memcpy(cs + (size_t)(QW6_CONV1D_KERNEL - 1) * QW6_LINEAR_QKV_DIM,
+               qkv, QW6_LINEAR_QKV_DIM * sizeof(float));
+
+        const float *cw = (const float *)m->layers[layer].conv1d.data;
+        for (int c = 0; c < QW6_LINEAR_QKV_DIM; c++) {
+            float sum = 0.0f;
+            for (int k = 0; k < QW6_CONV1D_KERNEL; k++)
+                sum += cs[(size_t)k * QW6_LINEAR_QKV_DIM + c] *
+                       cw[(size_t)c * QW6_CONV1D_KERNEL + k];
+            conv[c] = qw6_silu(sum);
+        }
+
+        float *q = conv;
+        float *k = conv + QW6_NUM_KEY_HEADS * QW6_KEY_HEAD_DIM;
+        float *v = conv + 2 * QW6_NUM_KEY_HEADS * QW6_KEY_HEAD_DIM;
+        qw6_l2_norm_heads(q, QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM);
+        qw6_l2_norm_heads(k, QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM);
+        for (int h = 0; h < QW6_NUM_VALUE_HEADS; h++) {
+            beta[h] = qw6_sigmoid(beta[h]);
+            alpha[h] = qw6_softplus(alpha[h] + dt[h]) * a[h];
+        }
+        qw6_gated_delta_net_single(gdn, m->deltanet_state[layer],
+                                   q, k, v, alpha, beta);
+        for (int h = 0; h < QW6_NUM_VALUE_HEADS; h++) {
+            float *dst = gated + h * QW6_VALUE_HEAD_DIM;
+            qw6_cpu_rmsnorm(dst, gdn + h * QW6_VALUE_HEAD_DIM,
+                            dn_norm, QW6_VALUE_HEAD_DIM);
+            for (int i = 0; i < QW6_VALUE_HEAD_DIM; i++)
+                dst[i] *= qw6_silu(z[h * QW6_VALUE_HEAD_DIM + i]);
+        }
+        rc = qw6_tensor_matvec(out, &m->layers[layer].dn_out, gated, QW6_HIDDEN_SIZE);
+    }
+
+    free(qkv); free(conv); free(z); free(beta); free(alpha); free(dt);
+    free(a); free(dn_norm); free(gdn); free(gated);
+    return rc;
+}
+
+static void qw6_rmsnorm_heads_weighted(float *x, const float *w,
+                                       int heads, int dim) {
+    for (int h = 0; h < heads; h++)
+        qw6_cpu_rmsnorm(x + h * dim, x + h * dim, w, dim);
+}
+
+static int qw6_apply_full_attn(float *out, qw6_session_t *s, int layer,
+                               const float *x, uint32_t pos) {
+    qw6_model_t *m = s->model;
+    float *qfull = calloc(QW6_NUM_Q_HEADS * QW6_HEAD_DIM * 2, sizeof(float));
+    float *q = calloc(QW6_NUM_Q_HEADS * QW6_HEAD_DIM, sizeof(float));
+    float *gate = calloc(QW6_NUM_Q_HEADS * QW6_HEAD_DIM, sizeof(float));
+    float *k = calloc(QW6_NUM_KV_HEADS * QW6_HEAD_DIM, sizeof(float));
+    float *v = calloc(QW6_NUM_KV_HEADS * QW6_HEAD_DIM, sizeof(float));
+    float *qw = calloc(QW6_HEAD_DIM, sizeof(float));
+    float *kw = calloc(QW6_HEAD_DIM, sizeof(float));
+    float *attn = calloc(QW6_NUM_Q_HEADS * QW6_HEAD_DIM, sizeof(float));
+    QW6_ASSERT_PTR(qfull); QW6_ASSERT_PTR(q); QW6_ASSERT_PTR(gate);
+    QW6_ASSERT_PTR(k); QW6_ASSERT_PTR(v); QW6_ASSERT_PTR(qw);
+    QW6_ASSERT_PTR(kw); QW6_ASSERT_PTR(attn);
+
+    int rc = qw6_tensor_matvec(qfull, &m->layers[layer].attn_q, x,
+                               QW6_NUM_Q_HEADS * QW6_HEAD_DIM * 2);
+    if (rc == 0) rc = qw6_tensor_matvec(k, &m->layers[layer].attn_k, x,
+                                        QW6_NUM_KV_HEADS * QW6_HEAD_DIM);
+    if (rc == 0) rc = qw6_tensor_matvec(v, &m->layers[layer].attn_v, x,
+                                        QW6_NUM_KV_HEADS * QW6_HEAD_DIM);
+    if (rc == 0) rc = qw6_tensor_dequantize_row(&m->layers[layer].attn_q_norm, 0, qw);
+    if (rc == 0) rc = qw6_tensor_dequantize_row(&m->layers[layer].attn_k_norm, 0, kw);
+    if (rc == 0) {
+        for (int h = 0; h < QW6_NUM_Q_HEADS; h++) {
+            memcpy(q + h * QW6_HEAD_DIM,
+                   qfull + h * QW6_HEAD_DIM * 2,
+                   QW6_HEAD_DIM * sizeof(float));
+            memcpy(gate + h * QW6_HEAD_DIM,
+                   qfull + h * QW6_HEAD_DIM * 2 + QW6_HEAD_DIM,
+                   QW6_HEAD_DIM * sizeof(float));
+        }
+        qw6_rmsnorm_heads_weighted(q, qw, QW6_NUM_Q_HEADS, QW6_HEAD_DIM);
+        qw6_rmsnorm_heads_weighted(k, kw, QW6_NUM_KV_HEADS, QW6_HEAD_DIM);
+        qw6_cpu_mrope(q, k, QW6_NUM_Q_HEADS * QW6_HEAD_DIM,
+                      QW6_NUM_KV_HEADS * QW6_HEAD_DIM,
+                      QW6_NUM_Q_HEADS, QW6_NUM_KV_HEADS,
+                      pos, (int)(QW6_HEAD_DIM * QW6_PARTIAL_ROTARY));
+
+        float *k_slot = m->k_cache[layer] +
+            (size_t)pos * QW6_NUM_KV_HEADS * QW6_HEAD_DIM;
+        float *v_slot = m->v_cache[layer] +
+            (size_t)pos * QW6_NUM_KV_HEADS * QW6_HEAD_DIM;
+        memcpy(k_slot, k, QW6_NUM_KV_HEADS * QW6_HEAD_DIM * sizeof(float));
+        memcpy(v_slot, v, QW6_NUM_KV_HEADS * QW6_HEAD_DIM * sizeof(float));
+
+        qw6_cpu_attention_gqa(attn, q, m->k_cache[layer], m->v_cache[layer],
+                              (int)pos + 1, QW6_NUM_Q_HEADS, QW6_NUM_KV_HEADS,
+                              QW6_HEAD_DIM);
+        for (int i = 0; i < QW6_NUM_Q_HEADS * QW6_HEAD_DIM; i++)
+            attn[i] *= qw6_sigmoid(gate[i]);
+        rc = qw6_tensor_matvec(out, &m->layers[layer].attn_o, attn, QW6_HIDDEN_SIZE);
+    }
+
+    free(qfull); free(q); free(gate); free(k); free(v); free(qw); free(kw); free(attn);
+    return rc;
+}
+
+static int qw6_forward_token(qw6_session_t *s, uint32_t token, uint32_t pos) {
+    qw6_model_t *m = s->model;
+    float *hidden = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *resid = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *norm_w = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *normed = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *attn = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *ffn = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    QW6_ASSERT_PTR(hidden); QW6_ASSERT_PTR(resid); QW6_ASSERT_PTR(norm_w);
+    QW6_ASSERT_PTR(normed); QW6_ASSERT_PTR(attn); QW6_ASSERT_PTR(ffn);
+
+    int rc = qw6_tensor_dequantize_row(&m->tok_embeddings, token, hidden);
+    for (int l = 0; l < QW6_NUM_LAYERS && rc == 0; l++) {
+        memcpy(resid, hidden, QW6_HIDDEN_SIZE * sizeof(float));
+        rc = qw6_tensor_dequantize_row(&m->layers[l].norm, 0, norm_w);
+        if (rc == 0) qw6_cpu_rmsnorm(normed, hidden, norm_w, QW6_HIDDEN_SIZE);
+        if (rc == 0 && qw6_layer_type(l) == QW6_LAYER_LINEAR_ATTN)
+            rc = qw6_apply_linear_attn(attn, s, l, normed);
+        else if (rc == 0)
+            rc = qw6_apply_full_attn(attn, s, l, normed, pos);
+        if (rc == 0) {
+            memcpy(hidden, resid, QW6_HIDDEN_SIZE * sizeof(float));
+            qw6_add_inplace(hidden, attn, QW6_HIDDEN_SIZE);
+        }
+
+        memcpy(resid, hidden, QW6_HIDDEN_SIZE * sizeof(float));
+        if (rc == 0) rc = qw6_tensor_dequantize_row(&m->layers[l].post_norm, 0, norm_w);
+        if (rc == 0) {
+            qw6_cpu_rmsnorm(normed, hidden, norm_w, QW6_HIDDEN_SIZE);
+            rc = qw6_apply_layer_moe(ffn, m, l, normed);
+        }
+        if (rc == 0) {
+            memcpy(hidden, resid, QW6_HIDDEN_SIZE * sizeof(float));
+            qw6_add_inplace(hidden, ffn, QW6_HIDDEN_SIZE);
+        }
+    }
+    if (rc == 0) rc = qw6_tensor_dequantize_row(&m->output_norm, 0, norm_w);
+    if (rc == 0) {
+        qw6_cpu_rmsnorm(normed, hidden, norm_w, QW6_HIDDEN_SIZE);
+        rc = qw6_tensor_matvec(s->logits, &m->output, normed, QW6_VOCAB_SIZE);
+    }
+
+    free(hidden); free(resid); free(norm_w); free(normed); free(attn); free(ffn);
+    return rc;
+}
+
 /* ---- CPU Kernels (Phase 1: correctness, not speed) ---- */
 
 void qw6_cpu_rmsnorm(float *out, const float *x, const float *weight, int dim) {
@@ -2136,16 +2409,38 @@ int qw6_cpu_argmax(const float *x, int n) {
 
 int qw6_prefill(qw6_session_t *s, const uint32_t *tokens, uint32_t n) {
     QW6_ASSERT_PTR(s); QW6_ASSERT_PTR(tokens); QW6_ASSERT(n > 0, "n > 0");
-    (void)tokens; (void)n;
-    fprintf(stderr, "qw6: prefill not yet implemented (Phase 1)\n");
-    return -1;
+    if (s->n_tokens + n > s->capacity) {
+        fprintf(stderr, "qw6: prompt exceeds context capacity\n");
+        return -1;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t pos = s->n_tokens;
+        s->tokens[s->n_tokens++] = tokens[i];
+        if (qw6_forward_token(s, tokens[i], pos) != 0) {
+            fprintf(stderr, "qw6: native forward failed at prompt token %u\n", i);
+            return -1;
+        }
+    }
+    return 0;
 }
 
 int qw6_generate(qw6_session_t *s, uint32_t n_tokens, float temp, float top_p) {
     QW6_ASSERT_PTR(s); QW6_ASSERT(n_tokens > 0, "n_tokens > 0");
-    (void)n_tokens; (void)temp; (void)top_p;
-    fprintf(stderr, "qw6: generate not yet implemented (Phase 1)\n");
-    return -1;
+    int generated = 0;
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        if (s->n_tokens >= s->capacity) break;
+        uint32_t tok = qw6_sample(s, temp, top_p);
+        fprintf(stdout, "%u%s", tok, i + 1 == n_tokens ? "\n" : " ");
+        fflush(stdout);
+        s->tokens[s->n_tokens++] = tok;
+        generated++;
+        if (tok == QW6_EOS_TOKEN_ID) break;
+        if (qw6_forward_token(s, tok, s->n_tokens - 1) != 0) {
+            fprintf(stderr, "qw6: native forward failed at generated token %u\n", i);
+            return generated > 0 ? generated : -1;
+        }
+    }
+    return generated;
 }
 
 uint32_t qw6_sample(qw6_session_t *s, float temp, float top_p) {
@@ -2577,7 +2872,7 @@ int main(int argc, char **argv) {
 
     qw6_model_t model;
     if (qw6_model_load(&model, model_path) != 0) {
-        fprintf(stderr, "qw6: model loading is Phase 1 TODO (GGUF parser)\n");
+        fprintf(stderr, "qw6: model loading failed\n");
         qw6_tok_free(&tokenizer);
         return 1;
     }
@@ -2607,7 +2902,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "qw6: tokenised to %u tokens\n", n);
 
         if (qw6_prefill(&session, tokens, n) != 0) {
-            fprintf(stderr, "qw6: prefill is Phase 1 TODO\n");
+            fprintf(stderr, "qw6: native prefill failed\n");
             free(tokens);
             qw6_session_free(&session);
             qw6_model_free(&model);
@@ -2619,6 +2914,13 @@ int main(int argc, char **argv) {
         clock_t start = clock();
         int gen = qw6_generate(&session, (uint32_t)n_tokens, temp, 0.9f);
         double elapsed = (double)(clock() - start) / CLOCKS_PER_SEC;
+        if (gen > 0) {
+            char *decoded = NULL;
+            if (qw6_tok_decode(&tokenizer, session.tokens + n, (uint32_t)gen, &decoded) == 0) {
+                fprintf(stderr, "qw6: generated text: \"%s\"\n", decoded);
+                free(decoded);
+            }
+        }
         fprintf(stderr, "qw6: %d tokens in %.2fs\n", gen, elapsed);
         free(tokens);
     }

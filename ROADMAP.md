@@ -44,10 +44,11 @@ forward pass can be checked against reference logits.
   - [x] attention QKV projection probe
   - [x] routed expert FFN gather
   - [x] full Gated DeltaNet layer-0 forward probe
-  - [ ] full 40-layer forward to logits
+  - [x] full 40-layer forward to logits (CPU smoke path)
   - [x] MTP draft layer reference kernel
 - [x] `qw6 --dump-tokens`
 - [x] `qw6 --load-only` native GGUF validation/dequant probe
+- [x] greedy native token generation smoke test (`./qw6 -m ... -p "Hello" -n 2`)
 - [ ] `qw6 --dump-logits` / `--dump-logprobs`
 - [ ] official Qwen3.6-35B-A3B reference vectors
 - [ ] token-by-token logit comparison regression
@@ -57,6 +58,10 @@ forward pass can be checked against reference logits.
 validates the GGUF, dequantizes real tensors, runs output/shared-expert MatVec,
 routes layer 0 top-8 experts, runs routed/shared FFN probes, and executes a
 single-token layer-0 Gated DeltaNet forward probe through `ssm_out`.
+
+**Current native generation smoke path:** `./qw6 -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf -p "Hello" -n 2 --nothink`
+runs the 40-layer CPU path with KV/DeltaNet/Conv state and greedy sampling.
+Reference-logit parity is still pending.
 
 **Deliverable:** `./qw6 -p "Hello" --cpu` produces correct output matching Qwen
 reference logits.

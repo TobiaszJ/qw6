@@ -115,6 +115,7 @@ typedef struct {
     /* Embeddings */
     qw6_tensor_t tok_embeddings;   /* [vocab, hidden] */
     qw6_tensor_t output;           /* [vocab, hidden] (untied) */
+    qw6_tensor_t output_norm;      /* [hidden] */
 
     /* Per-layer */
     struct {
@@ -129,6 +130,8 @@ typedef struct {
         qw6_tensor_t attn_k;           /* [kv*head_dim, hidden] */
         qw6_tensor_t attn_v;           /* [kv*head_dim, hidden] */
         qw6_tensor_t attn_o;           /* [num_q*head_dim, hidden] */
+        qw6_tensor_t attn_q_norm;
+        qw6_tensor_t attn_k_norm;
         qw6_tensor_t attn_gate;        /* [hidden] FP16 — output gate */
 
         /* Linear attention (type == LINEAR_ATTN only) */
@@ -192,6 +195,7 @@ typedef struct {
     uint32_t *tokens;          /* token IDs */
     uint32_t n_tokens;
     uint32_t capacity;
+    float *conv_state[QW6_NUM_LAYERS];
     float *logits;             /* [vocab] — last token logits */
 } qw6_session_t;
 

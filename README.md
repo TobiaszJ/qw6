@@ -73,12 +73,14 @@ be run with:
 
 ```bash
 ./qw6 --load-only -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf
+./qw6 -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf -p "Hello" -n 2 --nothink
 ```
 
 Expected current behavior: model metadata validation passes and native probes
 print tensor checksums, router top-k experts, routed/shared-FFN summaries, and a
-layer-0 DeltaNet forward checksum. Normal prompt generation is still a Phase 1
-TODO until the 40-layer forward-to-logits path is implemented.
+layer-0 DeltaNet forward checksum. The generation command runs a native
+40-layer CPU smoke path and prints greedy token IDs plus decoded text; reference
+logit parity and performance work are still pending.
 
 ## Acknowledgements
 
