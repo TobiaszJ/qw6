@@ -2443,6 +2443,12 @@ typedef struct {
     float eps;
 } qw6_vk_rmsnorm_heads_push_t;
 
+typedef struct {
+    uint32_t src_offset;  /* in float units */
+    uint32_t dst_offset;
+    uint32_t count;
+} qw6_vk_buf_copy_push_t;
+
 static int qw6_vk_pipe_l2_norm_heads(struct qw6_vk_pipe_s *p,
                                       qw6_vk_buffer_t *buf,
                                       size_t offset,
@@ -2481,6 +2487,22 @@ static int qw6_vk_pipe_sample_greedy(struct qw6_vk_pipe_s *p,
     memcpy(&tok, p->scr_sample.mapped, sizeof(tok));
     *out_token = tok;
     return 0;
+}
+
+static int qw6_vk_pipe_buf_copy(struct qw6_vk_pipe_s *p,
+                                 qw6_vk_buffer_t *src, size_t src_off,
+                                 qw6_vk_buffer_t *dst, size_t dst_off,
+                                 uint32_t count_floats) {
+    const size_t offs[2] = {src_off, dst_off};
+    qw6_vk_buffer_t *bufs[2] = {src, dst};
+    qw6_vk_buf_copy_push_t push = {
+        .src_offset = 0,  /* already accounted in buffer offset */
+        .dst_offset = 0,
+        .count = count_floats,
+    };
+    return qw6_vk_pipe_dispatch(p, "vulkan/buf_copy.spv",
+                                bufs, offs, 2, &push, sizeof(push),
+                                (count_floats + 255) / 256, 1, 1);
 }
 
 /* ---- Init ---- */
@@ -2907,13 +2929,21 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                 }
             }
 
-            /* Write K,V to KV cache */
-            float *k_slot = (float *)p->k_cache[l].mapped +
-                (size_t)pos * QW6_NUM_KV_HEADS * QW6_HEAD_DIM;
-            float *v_slot = (float *)p->v_cache[l].mapped +
-                (size_t)pos * QW6_NUM_KV_HEADS * QW6_HEAD_DIM;
-            memcpy(k_slot, k_cpu, QW6_NUM_KV_HEADS * QW6_HEAD_DIM * sizeof(float));
-            memcpy(v_slot, (float *)ffn->mapped, QW6_NUM_KV_HEADS * QW6_HEAD_DIM * sizeof(float));
+            /* Write K,V to KV cache (GPU copy with CPU fallback) */
+            size_t kv_pos = (size_t)pos * QW6_NUM_KV_HEADS * QW6_HEAD_DIM;
+            size_t kv_bytes = (size_t)QW6_NUM_KV_HEADS * QW6_HEAD_DIM * sizeof(float);
+            size_t k_cache_off = kv_pos * sizeof(float);
+            size_t v_cache_off = kv_pos * sizeof(float);
+            if (qw6_vk_pipe_buf_copy(p, s1, 0, &p->k_cache[l], k_cache_off,
+                                      QW6_NUM_KV_HEADS * QW6_HEAD_DIM) != 0) {
+                float *k_slot = (float *)p->k_cache[l].mapped + kv_pos;
+                memcpy(k_slot, k_cpu, kv_bytes);
+            }
+            if (qw6_vk_pipe_buf_copy(p, ffn, 0, &p->v_cache[l], v_cache_off,
+                                      QW6_NUM_KV_HEADS * QW6_HEAD_DIM) != 0) {
+                float *v_slot = (float *)p->v_cache[l].mapped + kv_pos;
+                memcpy(v_slot, (float *)ffn->mapped, kv_bytes);
+            }
 
             /* GQA attention. Current shader uses a 256-entry shared score
              * buffer, so keep CPU fallback for longer contexts. */

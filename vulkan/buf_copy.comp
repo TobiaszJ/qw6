@@ -1,0 +1,21 @@
+#version 450
+
+/* Simple GPU buffer copy: copy n floats from src[src_off] to dst[dst_off].
+ * One element per thread. Use for KV cache writes and other bulk copies. */
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Src { float src[]; };
+layout(set = 0, binding = 1) buffer Dst { float dst[]; };
+
+layout(push_constant) uniform Push {
+    uint src_offset;  /* in float units */
+    uint dst_offset;  /* in float units */
+    uint count;       /* number of floats to copy */
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.count) return;
+    dst[pc.dst_offset + gid] = src[pc.src_offset + gid];
+}
