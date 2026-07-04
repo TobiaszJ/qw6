@@ -899,8 +899,11 @@ void qw6_tok_free(qw6_tokenizer_t *t) {
 
 const char *qw6_tok_id_to_str(qw6_tokenizer_t *t, uint32_t id) {
     TOK_ASSERT_PTR(t);
-    if (id < t->vocab_count && t->vocab[id]) {
+    if (id < QW6_TOK_VOCAB_SIZE && t->vocab[id]) {
         return t->vocab[id];
+    }
+    for (uint32_t i = 0; i < t->added_count; i++) {
+        if (t->added[i].id == id) return t->added[i].content;
     }
     return "<unk>";
 }
@@ -1080,6 +1083,41 @@ static int32_t find_merge(qw6_tokenizer_t *t, uint32_t a, uint32_t b) {
     return -1;
 }
 
+static int32_t find_special_token(qw6_tokenizer_t *t, const char *text, size_t text_len,
+                                  size_t pos, size_t *match_len) {
+    int32_t best_id = -1;
+    size_t best_len = 0;
+
+    for (uint32_t i = 0; i < t->added_count; i++) {
+        if (!t->added[i].special) continue;
+        size_t len = strlen(t->added[i].content);
+        if (len == 0 || pos + len > text_len) continue;
+        if (len < best_len) continue;
+        if (memcmp(text + pos, t->added[i].content, len) == 0) {
+            best_id = (int32_t)t->added[i].id;
+            best_len = len;
+        }
+    }
+
+    if (best_id >= 0 && match_len) *match_len = best_len;
+    return best_id;
+}
+
+static int encode_pretoken(qw6_tokenizer_t *t, const char *str, size_t len,
+                           uint32_t *out, uint32_t *out_count);
+
+static int encode_span(qw6_tokenizer_t *t, const char *text, size_t len,
+                       uint32_t *out, uint32_t *out_count) {
+    pretok_state_t st = { .text = text, .len = len, .pos = 0 };
+    const char *pretok_start = NULL;
+    while (1) {
+        size_t plen = pretok_next(&st, &pretok_start);
+        if (plen == 0) break;
+        if (encode_pretoken(t, pretok_start, plen, out, out_count) != 0) return -1;
+    }
+    return 0;
+}
+
 /* Apply BPE merges to a list of token IDs */
 static void apply_bpe(qw6_tokenizer_t *t, uint32_t *tokens, uint32_t *count) {
     if (*count < 2) return;
@@ -1168,22 +1206,34 @@ int qw6_tok_encode(qw6_tokenizer_t *t, const char *text,
         return 0;
     }
 
-    /* Check for added tokens (special tokens) in text first */
-    /* For now, skip special token detection — just BPE encode */
-
     uint32_t *tokens = malloc(65536 * sizeof(uint32_t));
     TOK_ASSERT_PTR(tokens);
     uint32_t count = 0;
 
-    /* Pre-tokenize and encode each pre-token */
-    pretok_state_t st = { .text = text, .len = text_len, .pos = 0 };
-    const char *pretok_start = NULL;
-
-    while (1) {
-        size_t plen = pretok_next(&st, &pretok_start);
-        if (plen == 0) break;
-
-        encode_pretoken(t, pretok_start, plen, tokens, &count);
+    size_t span_start = 0;
+    size_t pos = 0;
+    while (pos < text_len) {
+        size_t match_len = 0;
+        int32_t special_id = find_special_token(t, text, text_len, pos, &match_len);
+        if (special_id >= 0) {
+            if (pos > span_start) {
+                if (encode_span(t, text + span_start, pos - span_start, tokens, &count) != 0) {
+                    free(tokens);
+                    return -1;
+                }
+            }
+            tokens[count++] = (uint32_t)special_id;
+            pos += match_len;
+            span_start = pos;
+            continue;
+        }
+        pos++;
+    }
+    if (span_start < text_len) {
+        if (encode_span(t, text + span_start, text_len - span_start, tokens, &count) != 0) {
+            free(tokens);
+            return -1;
+        }
     }
 
     *out_tokens = tokens;

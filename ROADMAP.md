@@ -33,7 +33,7 @@ Development phases for the Qwen 3.6-35B-A3B inference engine on AMD BC-250.
 - [x] `qw6 --load-only` native GGUF validation/dequant probe
 - [x] greedy native token generation smoke test
 - [x] `make cpu` build target
-- [ ] `qw6 --dump-logits` / `--dump-logprobs`
+- [x] `qw6 --dump-logits` / `--dump-logprobs`
 - [ ] correct logit parity vs reference (requires test vectors from RTX 3090 server)
 
 **Note:** Phase 1 was never validated against reference logits. Both CPU and GPU
@@ -107,7 +107,7 @@ Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders.
 ### Tokenizer and prompt-format problems
 
 - [ ] The tokenizer is a reference implementation, not a faithful production Qwen tokenizer. Pre-tokenization is simplified ASCII/basic-Unicode logic and does not implement the full HuggingFace regex behavior.
-- [ ] Special token detection is skipped during encode. Chat and control tokens can be re-tokenized as normal text unless manually inserted elsewhere.
+- [x] Special token detection is handled during encode for added special tokens, so chat and control markers survive as single IDs.
 - [ ] The chat template is hardcoded instead of read from tokenizer metadata. This can shift prompt tokens from llama.cpp and invalidate both correctness and performance comparisons.
 - [ ] Encoding uses a temporary static hash map and linear merge search. This is not a decode bottleneck, but it is too fragile for repeated prompt benchmarking and server use.
 - [ ] Tokenizer regression coverage is tiny. Add fixtures collected from HuggingFace or llama.cpp for chat prompts, special tokens, Unicode, whitespace, code, numbers, and multi-message conversations.

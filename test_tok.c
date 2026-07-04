@@ -9,6 +9,7 @@ static const uint32_t ids_hello[] = {9419, 1814};
 static const uint32_t ids_hello_comma[] = {9419, 11, 1814, 0};
 static const uint32_t ids_fox[] = {760, 3841, 13477, 37550};
 static const uint32_t ids_digits[] = {16, 17, 18, 19, 20};
+static const uint32_t ids_special[] = {248045, 248046};
 
 struct test_case {
     const char *text;
@@ -21,6 +22,7 @@ static const struct test_case tests[] = {
     {"Hello, world!",     ids_hello_comma, 4},
     {"The quick brown fox", ids_fox,       4},
     {"12345",             ids_digits,     5},
+    {"<|im_start|><|im_end|>", ids_special, 2},
 };
 
 #define NUM_TESTS (int)(sizeof(tests) / sizeof(tests[0]))
