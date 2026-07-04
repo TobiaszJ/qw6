@@ -3064,6 +3064,7 @@ static void usage(void) {
         "  --inspect-gguf  Inspect GGUF header and exit\n"
         "  --load-only     Load and validate model metadata, then exit\n"
         "  --self-test     Run CPU kernel self-tests and exit\n"
+        "  --seed <N>      Random seed for deterministic sampling (default: time-based)\n"
         "  --bench         Run benchmark\n"
         "  -h, --help      This help\n\n"
         "Status: pre-alpha. CPU reference path under development.\n",
@@ -3078,6 +3079,7 @@ int main(int argc, char **argv) {
     int n_tokens = 256;
     int ctx = QW6_DEFAULT_CTX;
     float temp = 0.0f;
+    unsigned int seed = 0;
     bool nothink = false, dump_tokens = false, dump_logits = false, dump_logprobs = false;
     bool bench = false, self_test = false;
     bool use_vulkan = false, vulkan_self_test = false;
@@ -3095,6 +3097,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-n") == 0 && i+1 < argc) n_tokens = atoi(argv[++i]);
         else if (strcmp(argv[i], "--ctx") == 0 && i+1 < argc) ctx = atoi(argv[++i]);
         else if (strcmp(argv[i], "--temp") == 0 && i+1 < argc) temp = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--seed") == 0 && i+1 < argc) seed = (unsigned int)atol(argv[++i]);
         else if (strcmp(argv[i], "--nothink") == 0) nothink = true;
         else if (strcmp(argv[i], "--dump-tokens") == 0) dump_tokens = true;
         else if (strcmp(argv[i], "--dump-logits") == 0) dump_logits = true;
@@ -3287,9 +3290,11 @@ int main(int argc, char **argv) {
 #endif
 
     if (prompt) {
+        if (seed == 0) seed = (unsigned int)time(NULL);
+        srand(seed);
         fprintf(stderr, "qw6: prompt: \"%s\"\n", prompt);
         fprintf(stderr, "qw6: thinking mode: %s\n", nothink ? "disabled" : "enabled");
-        fprintf(stderr, "qw6: ctx=%d max_tokens=%d temp=%.1f\n\n", ctx, n_tokens, temp);
+        fprintf(stderr, "qw6: ctx=%d max_tokens=%d temp=%.1f seed=%u\n\n", ctx, n_tokens, temp, seed);
 
         /* Chat template (CHATML for Qwen, skip with --raw) */
         const char *enc_prompt = prompt;
@@ -3369,7 +3374,24 @@ int main(int argc, char **argv) {
         free(tokens);
     }
 
-    if (bench) fprintf(stderr, "qw6: benchmarks not yet implemented\n");
+    if (bench) {
+        if (!prompt) prompt = "Hello";
+        fprintf(stderr, "qw6: benchmark mode\n");
+        /* Run a timed generation */
+        uint32_t *btok = NULL;
+        uint32_t bn = 0;
+        if (qw6_tok_encode(&tokenizer, prompt, &btok, &bn) == 0) {
+            qw6_prefill(&session, btok, bn);
+            clock_t bstart = clock();
+            int bgen = qw6_generate(&session, 128, 0.0f, 0.9f);
+            double belapsed = (double)(clock() - bstart) / CLOCKS_PER_SEC;
+            if (bgen > 0) {
+                fprintf(stderr, "\nqw6: benchmark: %d tokens in %.2fs (%.2f tok/s)\n",
+                        bgen, belapsed, (double)bgen / belapsed);
+            }
+            free(btok);
+        }
+    }
 
     qw6_session_free(&session);
 #ifdef QW6_VULKAN
