@@ -2275,15 +2275,6 @@ static int qw6_apply_full_attn(float *out, qw6_session_t *s, int layer,
 
 static int qw6_forward_token(qw6_session_t *s, uint32_t token, uint32_t pos) {
     qw6_model_t *m = s->model;
-    float *hidden = calloc(QW6_HIDDEN_SIZE, sizeof(float));
-    float *resid = calloc(QW6_HIDDEN_SIZE, sizeof(float));
-    float *norm_w = calloc(QW6_HIDDEN_SIZE, sizeof(float));
-    float *normed = calloc(QW6_HIDDEN_SIZE, sizeof(float));
-    float *attn = calloc(QW6_HIDDEN_SIZE, sizeof(float));
-    float *ffn = calloc(QW6_HIDDEN_SIZE, sizeof(float));
-    QW6_ASSERT_PTR(hidden); QW6_ASSERT_PTR(resid); QW6_ASSERT_PTR(norm_w);
-    QW6_ASSERT_PTR(normed); QW6_ASSERT_PTR(attn); QW6_ASSERT_PTR(ffn);
-
 #ifdef QW6_VULKAN
     /* GPU pipeline path */
     if (s->vk_pipe) {
@@ -2299,11 +2290,18 @@ static int qw6_forward_token(qw6_session_t *s, uint32_t token, uint32_t pos) {
             rc = qw6_vk_pipe_forward((qw6_vk_pipe_t *)s->vk_pipe,
                                       m, token, pos, s->logits);
         }
-        free(hidden); free(resid); free(norm_w); free(normed);
-        free(attn); free(ffn);
         return rc;
     }
 #endif
+
+    float *hidden = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *resid = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *norm_w = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *normed = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *attn = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *ffn = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    QW6_ASSERT_PTR(hidden); QW6_ASSERT_PTR(resid); QW6_ASSERT_PTR(norm_w);
+    QW6_ASSERT_PTR(normed); QW6_ASSERT_PTR(attn); QW6_ASSERT_PTR(ffn);
 
     int rc = qw6_tensor_dequantize_row(&m->tok_embeddings, token, hidden);
     if (rc == 0 && qw6_check_nan_inf(hidden, QW6_HIDDEN_SIZE, "embedding") > 0) rc = -1;
