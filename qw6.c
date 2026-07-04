@@ -3302,6 +3302,7 @@ static void usage(void) {
         "  --nothink       Disable thinking mode\n"
         "  --cpu           CPU backend (default)\n"
         "  --vulkan        Vulkan backend (Phase 2)\n"
+        "  --vulkan-debug  Vulkan backend with CPU fallback allowed\n"
         "  --vulkan-strict Fail if any GPU fallback would occur\n"
         "  --vulkan-self-test Run Vulkan compute backend self-test\n"
         "  --dump-tokens   Tokenise prompt and exit\n"
@@ -3341,6 +3342,7 @@ int main(int argc, char **argv) {
 #ifdef QW6_VULKAN
     void *pipe = NULL;
     int vk_pipe_ok = 0;
+    bool vk_debug = false;
     bool vk_strict = false;
 #endif
 
@@ -3371,6 +3373,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--raw") == 0) { raw_prompt = true; }
         else if (strcmp(argv[i], "--vulkan") == 0) { use_vulkan = true; }
 #ifdef QW6_VULKAN
+        else if (strcmp(argv[i], "--vulkan-debug") == 0) { use_vulkan = true; vk_debug = true; vk_strict = false; }
         else if (strcmp(argv[i], "--vulkan-strict") == 0) { use_vulkan = true; vk_strict = true; }
 #endif
         else if (strcmp(argv[i], "--vulkan-self-test") == 0) { vulkan_self_test = true; }
@@ -3407,7 +3410,13 @@ int main(int argc, char **argv) {
     }
 #else
     if (use_vulkan) {
-        fprintf(stderr, "qw6: Vulkan runtime is available — GPU dispatch pipeline active\n");
+        if (vk_strict || bench_vulkan) {
+            fprintf(stderr, "qw6: Vulkan performance mode active\n");
+        } else if (vk_debug) {
+            fprintf(stderr, "qw6: Vulkan debug mode active\n");
+        } else {
+            fprintf(stderr, "qw6: Vulkan mode active\n");
+        }
     }
 #endif
     fprintf(stderr, "Model: Qwen 3.6-35B-A3B (35B total, 3B active, 256 experts)\n");
@@ -3527,6 +3536,13 @@ int main(int argc, char **argv) {
 
 #ifdef QW6_VULKAN
     if (use_vulkan) {
+        if (vk_strict || bench_vulkan) {
+            fprintf(stderr, "qw6: Vulkan performance mode: strict/no-readback\n");
+        } else if (vk_debug) {
+            fprintf(stderr, "qw6: Vulkan debug mode: CPU fallback allowed\n");
+        } else {
+            fprintf(stderr, "qw6: Vulkan mode: CPU fallback allowed\n");
+        }
         if (qw6_vk_pipe_init((qw6_vk_pipe_t **)&pipe, &model, vk_strict) == 0) {
             fprintf(stderr, "qw6: Vulkan pipeline initialized\n");
             vk_pipe_ok = 1;

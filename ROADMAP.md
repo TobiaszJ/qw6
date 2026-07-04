@@ -276,7 +276,7 @@ Goal: first match llama.cpp numerically, then surpass its BC-250 throughput for 
 - [ ] Record batched command buffers for each decode token or layer group.
 - [ ] Use barriers between dependent kernels and fence only at the token boundary.
 - [ ] Add GPU timestamp queries and fallback counters.
-- [ ] Keep debug mode separate from performance mode.
+- [x] Keep debug mode separate from performance mode.
 
 ### Milestone 3: Move weights and state to the right memory
 
