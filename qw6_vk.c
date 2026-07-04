@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <sys/time.h>
 
 typedef struct {
@@ -97,6 +98,39 @@ static double qw6_vk_now_ms(void) {
     return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
 }
 
+static int qw6_vk_device_override_matches(uint32_t idx, const VkPhysicalDeviceProperties *props,
+                                          const char *override) {
+    if (!override || !*override) return 0;
+    char *end = NULL;
+    long want_idx = strtol(override, &end, 10);
+    if (end && *end == '\0') return (want_idx >= 0 && (uint32_t)want_idx == idx);
+    if (strstr(override, props->deviceName) != NULL) return 1;
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "%04x:%04x", props->vendorID, props->deviceID);
+    if (strstr(override, pattern) != NULL) return 1;
+    return 0;
+}
+
+static int qw6_vk_device_score(const VkPhysicalDeviceProperties *props,
+                               const VkPhysicalDeviceFeatures *features,
+                               const VkQueueFamilyProperties *qprops,
+                               uint32_t nq) {
+    int score = 0;
+    if (props->vendorID == 0x1002) score += 1000;
+    if (props->vendorID == 0x1002 && strstr(props->deviceName, "BC-250")) score += 2000;
+    if (props->vendorID == 0x1002 && strstr(props->deviceName, "GFX1013")) score += 1500;
+    if (props->deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) score += 400;
+    if (props->deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) score += 200;
+    if (features->shaderInt64) score += 1;
+    for (uint32_t i = 0; i < nq; i++) {
+        if ((qprops[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && qprops[i].timestampValidBits > 0) {
+            score += 100;
+            break;
+        }
+    }
+    return score;
+}
+
 static uint32_t qw6_vk_find_memory_type(qw6_vk_t *vk, uint32_t bits,
                                         VkMemoryPropertyFlags flags) {
     VkPhysicalDeviceMemoryProperties mp;
@@ -166,34 +200,75 @@ static int qw6_vk_init(qw6_vk_t *vk) {
     VkPhysicalDevice *devs = calloc(ndev, sizeof(*devs));
     if (!devs) return -1;
     QW6_VK_CHECK(vkEnumeratePhysicalDevices(vk->instance, &ndev, devs));
-    vk->physical = devs[0];
-    uint32_t queue_timestamp_bits = 0;
+    const char *device_override = getenv("QW6_VK_DEVICE");
+    VkPhysicalDevice chosen = VK_NULL_HANDLE;
+    VkPhysicalDeviceProperties chosen_props;
+    uint32_t chosen_queue_family = UINT32_MAX;
+    uint32_t chosen_timestamp_bits = 0;
+    int chosen_score = INT_MIN;
+    if (device_override && *device_override) {
+        fprintf(stderr, "qw6_vk: device override requested: %s\n", device_override);
+    }
     for (uint32_t i = 0; i < ndev; i++) {
         VkPhysicalDeviceProperties props;
+        VkPhysicalDeviceFeatures features;
         vkGetPhysicalDeviceProperties(devs[i], &props);
-        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
-            props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
-            vk->physical = devs[i];
+        vkGetPhysicalDeviceFeatures(devs[i], &features);
+        uint32_t nq = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &nq, NULL);
+        uint32_t queue_family = UINT32_MAX;
+        uint32_t timestamp_bits = 0;
+        VkQueueFamilyProperties *qprops = NULL;
+        if (nq > 0) {
+            qprops = calloc(nq, sizeof(*qprops));
+            if (!qprops) {
+                free(devs);
+                return -1;
+            }
+            vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &nq, qprops);
+            for (uint32_t q = 0; q < nq; q++) {
+                if (!(qprops[q].queueFlags & VK_QUEUE_COMPUTE_BIT)) continue;
+                if (queue_family == UINT32_MAX) {
+                    queue_family = q;
+                    timestamp_bits = qprops[q].timestampValidBits;
+                }
+                if (qprops[q].timestampValidBits > timestamp_bits) {
+                    queue_family = q;
+                    timestamp_bits = qprops[q].timestampValidBits;
+                }
+            }
+        }
+        int score = (queue_family == UINT32_MAX) ? INT_MIN / 2 :
+            qw6_vk_device_score(&props, &features, qprops, nq);
+        fprintf(stderr, "qw6_vk: device[%u]: %s vendor=%04x device=%04x type=%u compute=%s timestamp_bits=%u score=%d\n",
+                i, props.deviceName, props.vendorID, props.deviceID, props.deviceType,
+                (queue_family == UINT32_MAX) ? "no" : "yes", timestamp_bits, score);
+        if (queue_family != UINT32_MAX &&
+            qw6_vk_device_override_matches(i, &props, device_override)) {
+            chosen = devs[i];
+            chosen_props = props;
+            chosen_queue_family = queue_family;
+            chosen_timestamp_bits = timestamp_bits;
+            chosen_score = INT_MAX;
+            free(qprops);
             break;
         }
+        if (score > chosen_score) {
+            chosen = devs[i];
+            chosen_props = props;
+            chosen_queue_family = queue_family;
+            chosen_timestamp_bits = timestamp_bits;
+            chosen_score = score;
+        }
+        free(qprops);
     }
+    if (chosen == VK_NULL_HANDLE || chosen_queue_family == UINT32_MAX) {
+        free(devs);
+        return -1;
+    }
+    vk->physical = chosen;
+    vk->queue_family = chosen_queue_family;
     free(devs);
-
-    uint32_t nq = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(vk->physical, &nq, NULL);
-    VkQueueFamilyProperties *qprops = calloc(nq, sizeof(*qprops));
-    if (!qprops) return -1;
-    vkGetPhysicalDeviceQueueFamilyProperties(vk->physical, &nq, qprops);
-    vk->queue_family = UINT32_MAX;
-    for (uint32_t i = 0; i < nq; i++) {
-        if (qprops[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-            vk->queue_family = i;
-            queue_timestamp_bits = qprops[i].timestampValidBits;
-            break;
-        }
-    }
-    free(qprops);
-    if (vk->queue_family == UINT32_MAX) return -1;
 
     float priority = 1.0f;
     VkDeviceQueueCreateInfo qci = {
@@ -217,13 +292,13 @@ static int qw6_vk_init(qw6_vk_t *vk) {
     };
     QW6_VK_CHECK(vkCreateCommandPool(vk->device, &cp, NULL, &vk->command_pool));
 
-    VkPhysicalDeviceProperties props;
-    vkGetPhysicalDeviceProperties(vk->physical, &props);
-    vk->timestamp_period_ns = props.limits.timestampPeriod;
-    vk->timestamp_supported = props.limits.timestampComputeAndGraphics &&
-                              queue_timestamp_bits > 0 &&
+    vk->timestamp_period_ns = chosen_props.limits.timestampPeriod;
+    vk->timestamp_supported = chosen_props.limits.timestampComputeAndGraphics &&
+                              chosen_timestamp_bits > 0 &&
                               vk->timestamp_period_ns > 0.0;
-    fprintf(stderr, "qw6_vk: device: %s\n", props.deviceName);
+    fprintf(stderr, "qw6_vk: selected device: %s vendor=%04x device=%04x queue_family=%u timestamp=%s\n",
+            chosen_props.deviceName, chosen_props.vendorID, chosen_props.deviceID,
+            vk->queue_family, vk->timestamp_supported ? "on" : "off");
     return 0;
 }
 
