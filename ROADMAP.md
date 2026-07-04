@@ -143,7 +143,7 @@ Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders.
 - [ ] The pipeline cache is capped at 32 entries and falls back to the uncached legacy dispatcher if exceeded. This fallback creates pipelines, descriptor pools, command buffers, fences, and shader modules per call.
 - [ ] There is no command graph or static execution plan. The layer sequence should be planned once, then replayed with updated push constants and buffer offsets.
 - [ ] Replace per-op waits with batched command buffers per token, per layer group, or per decode step. Use pipeline barriers and a small number of queue submissions.
-- [ ] Use timestamp queries around GPU work. Current profile timing wraps queue submit plus fence wait and mixes CPU driver overhead with GPU execution.
+- [x] Use timestamp queries around GPU work. Current profile timing wraps queue submit plus fence wait and mixes CPU driver overhead with GPU execution.
 - [ ] Add a "no fallback, no readback" decode benchmark mode to prove the GPU is doing the work.
 - [ ] The current `QW6_PROFILE` path prints useful aggregate shader timing, but it is not a full profiler. Add dispatch counts, CPU-side setup time, GPU timestamps, bytes read, bytes written, and fallback counts.
 

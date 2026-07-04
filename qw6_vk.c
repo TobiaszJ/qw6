@@ -27,6 +27,8 @@ typedef struct {
     VkQueue queue;
     uint32_t queue_family;
     VkCommandPool command_pool;
+    double timestamp_period_ns;
+    bool timestamp_supported;
 } qw6_vk_t;
 
 #define QW6_VK_CHECK(expr) do { \
@@ -48,7 +50,10 @@ typedef struct {
     VkPipeline pipeline;
     VkShaderModule sm;
     uint64_t calls;
+    double cpu_setup_ms;
+    double gpu_ms;
     double total_ms;
+    uint64_t bound_bytes;
     int valid;
 } vk_pipe_cache_t;
 struct qw6_vk_pipe_s;
@@ -162,6 +167,7 @@ static int qw6_vk_init(qw6_vk_t *vk) {
     if (!devs) return -1;
     QW6_VK_CHECK(vkEnumeratePhysicalDevices(vk->instance, &ndev, devs));
     vk->physical = devs[0];
+    uint32_t queue_timestamp_bits = 0;
     for (uint32_t i = 0; i < ndev; i++) {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(devs[i], &props);
@@ -182,6 +188,7 @@ static int qw6_vk_init(qw6_vk_t *vk) {
     for (uint32_t i = 0; i < nq; i++) {
         if (qprops[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
             vk->queue_family = i;
+            queue_timestamp_bits = qprops[i].timestampValidBits;
             break;
         }
     }
@@ -212,6 +219,10 @@ static int qw6_vk_init(qw6_vk_t *vk) {
 
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(vk->physical, &props);
+    vk->timestamp_period_ns = props.limits.timestampPeriod;
+    vk->timestamp_supported = props.limits.timestampComputeAndGraphics &&
+                              queue_timestamp_bits > 0 &&
+                              vk->timestamp_period_ns > 0.0;
     fprintf(stderr, "qw6_vk: device: %s\n", props.deviceName);
     return 0;
 }
@@ -1991,6 +2002,12 @@ int qw6_vk_selftest(void) {
 struct qw6_vk_pipe_s {
     qw6_vk_t vk;
     bool strict;
+    bool profile;
+    VkQueryPool timestamp_queries;
+    uint32_t timestamp_query_count;
+    uint32_t timestamp_query_next;
+    uint64_t dispatch_count;
+    uint64_t fallback_count;
     vk_pipe_cache_t pipe_cache[QW6_VK_CACHE_MAX];
     int pipe_cache_count;
     VkDescriptorPool descriptor_pool;
@@ -2036,6 +2053,8 @@ static int qw6_vk_pipe_dispatch(struct qw6_vk_pipe_s *p, const char *shader_path
                                  const void *push, uint32_t push_size,
                                  uint32_t gx, uint32_t gy, uint32_t gz) {
     qw6_vk_t *vk = &p->vk;
+    bool profile = p->profile;
+    double setup_t0 = profile ? qw6_vk_now_ms() : 0.0;
 
     /* Find or create cached pipeline */
     int ci = -1;
@@ -2129,10 +2148,12 @@ static int qw6_vk_pipe_dispatch(struct qw6_vk_pipe_s *p, const char *shader_path
     VkWriteDescriptorSet writes[5];
     memset(infos, 0, sizeof(infos));
     memset(writes, 0, sizeof(writes));
+    uint64_t bound_bytes = 0;
     for (uint32_t i = 0; i < n_buffers && i < 5; i++) {
         infos[i].buffer = buffers[i]->buffer;
         infos[i].offset = offsets ? offsets[i] : 0;
         infos[i].range = buffers[i]->size - infos[i].offset;
+        bound_bytes += infos[i].range;
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = ds;
         writes[i].dstBinding = i;
@@ -2146,10 +2167,22 @@ static int qw6_vk_pipe_dispatch(struct qw6_vk_pipe_s *p, const char *shader_path
     vkResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo begin = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     if (vkBeginCommandBuffer(cb, &begin) != VK_SUCCESS) return -1;
+    uint32_t ts0 = UINT32_MAX, ts1 = UINT32_MAX;
+    if (profile && p->timestamp_queries &&
+        p->timestamp_query_next + 1 < p->timestamp_query_count) {
+        ts0 = p->timestamp_query_next++;
+        ts1 = p->timestamp_query_next++;
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            p->timestamp_queries, ts0);
+    }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, c->pipeline);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, c->layout, 0, 1, &ds, 0, NULL);
     if (push_size) vkCmdPushConstants(cb, c->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
     vkCmdDispatch(cb, gx, gy, gz);
+    if (ts1 != UINT32_MAX) {
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            p->timestamp_queries, ts1);
+    }
     if (vkEndCommandBuffer(cb) != VK_SUCCESS) return -1;
 
     vkResetFences(vk->device, 1, &p->dispatch_fence);
@@ -2157,8 +2190,24 @@ static int qw6_vk_pipe_dispatch(struct qw6_vk_pipe_s *p, const char *shader_path
     double t0 = qw6_vk_now_ms();
     if (vkQueueSubmit(vk->queue, 1, &submit, p->dispatch_fence) != VK_SUCCESS) return -1;
     if (vkWaitForFences(vk->device, 1, &p->dispatch_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return -1;
+    double wall_ms = qw6_vk_now_ms() - t0;
     c->calls++;
-    c->total_ms += qw6_vk_now_ms() - t0;
+    c->total_ms += wall_ms;
+    p->dispatch_count++;
+    if (profile) {
+        c->cpu_setup_ms += t0 - setup_t0;
+        c->bound_bytes += bound_bytes;
+        if (ts1 != UINT32_MAX) {
+            uint64_t stamps[2] = {0, 0};
+            VkResult qrc = vkGetQueryPoolResults(vk->device, p->timestamp_queries,
+                                                 ts0, 2, sizeof(stamps), stamps,
+                                                 sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+            if (qrc == VK_SUCCESS && stamps[1] >= stamps[0]) {
+                double gpu_ns = (double)(stamps[1] - stamps[0]) * vk->timestamp_period_ns;
+                c->gpu_ms += gpu_ns / 1000000.0;
+            }
+        }
+    }
 
     return 0;
 }
@@ -2580,6 +2629,7 @@ static int qw6_vk_pipe_axpy(struct qw6_vk_pipe_s *p,
 }
 
 static int qw6_vk_strict_fallback(struct qw6_vk_pipe_s *p, const char *what) {
+    p->fallback_count++;
     if (p->strict) {
         fprintf(stderr, "qw6_vk: strict Vulkan mode forbids CPU fallback (%s)\n", what);
         return -1;
@@ -2594,10 +2644,24 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m, bool strict) {
     qw6_vk_pipe_t *ctx = calloc(1, sizeof(qw6_vk_pipe_t));
     if (!ctx) return -1;
     ctx->strict = strict;
+    ctx->profile = getenv("QW6_PROFILE") != NULL;
 
     if (qw6_vk_init(&ctx->vk) != 0) {
         free(ctx);
         return -1;
+    }
+
+    if (ctx->profile && ctx->vk.timestamp_supported) {
+        VkQueryPoolCreateInfo qpci = {
+            .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType = VK_QUERY_TYPE_TIMESTAMP,
+            .queryCount = 8192,
+        };
+        if (vkCreateQueryPool(ctx->vk.device, &qpci, NULL, &ctx->timestamp_queries) == VK_SUCCESS) {
+            ctx->timestamp_query_count = qpci.queryCount;
+        } else {
+            ctx->vk.timestamp_supported = false;
+        }
     }
 
     VkDescriptorPoolSize pool_size = {
@@ -3239,18 +3303,25 @@ int qw6_vk_pipe_forward_greedy(qw6_vk_pipe_t *p, qw6_model_t *m,
 
 void qw6_vk_pipe_free(qw6_vk_pipe_t *p) {
     if (!p) return;
-    if (getenv("QW6_PROFILE")) {
-        fprintf(stderr, "qw6_vk profile:\n");
+    if (p->profile) {
+        fprintf(stderr, "qw6_vk profile: dispatches=%llu fallbacks=%llu timestamps=%s\n",
+                (unsigned long long)p->dispatch_count,
+                (unsigned long long)p->fallback_count,
+                p->vk.timestamp_supported ? "on" : "off");
         for (int i = 0; i < p->pipe_cache_count; i++) {
             vk_pipe_cache_t *c = &p->pipe_cache[i];
             if (!c->valid || c->calls == 0) continue;
-            fprintf(stderr, "  %-32s calls=%llu total=%.3f ms avg=%.3f ms\n",
+            fprintf(stderr, "  %-32s calls=%llu setup=%.3f ms gpu=%.3f ms wall=%.3f ms avg=%.3f ms bytes=%llu\n",
                     c->shader_path,
                     (unsigned long long)c->calls,
+                    c->cpu_setup_ms,
+                    c->gpu_ms,
                     c->total_ms,
-                    c->total_ms / (double)c->calls);
+                    c->total_ms / (double)c->calls,
+                    (unsigned long long)c->bound_bytes);
         }
     }
+    if (p->timestamp_queries) vkDestroyQueryPool(p->vk.device, p->timestamp_queries, NULL);
     for (int i = 0; i < p->pipe_cache_count; i++) {
         vk_pipe_cache_t *c = &p->pipe_cache[i];
         if (!c->valid) continue;
