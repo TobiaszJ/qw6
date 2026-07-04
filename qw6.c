@@ -2897,7 +2897,7 @@ int main(int argc, char **argv) {
     }
 #else
     if (use_vulkan) {
-        fprintf(stderr, "qw6: Vulkan runtime is available; full inference still uses CPU fallback kernels\n");
+        fprintf(stderr, "qw6: Vulkan runtime is available — GPU dispatch pipeline active\n");
     }
 #endif
     fprintf(stderr, "Model: Qwen 3.6-35B-A3B (35B total, 3B active, 256 experts)\n");

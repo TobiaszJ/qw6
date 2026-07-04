@@ -2073,7 +2073,7 @@ static int qw6_vk_pipe_silu_mul(struct qw6_vk_pipe_s *p,
                            (n + 255) / 256, 1, 1);
 }
 
-static int qw6_vk_pipe_mrope(struct qw6_vk_pipe_s *p,
+__attribute__((unused)) static int qw6_vk_pipe_mrope(struct qw6_vk_pipe_s *p,
                               qw6_vk_buffer_t *qbuf, qw6_vk_buffer_t *kbuf,
                               uint32_t q_dim, uint32_t kv_dim,
                               uint32_t n_heads, uint32_t n_kv_heads,
@@ -2094,7 +2094,7 @@ static int qw6_vk_pipe_mrope(struct qw6_vk_pipe_s *p,
                            (total_pairs + 255) / 256, 1, 1);
 }
 
-static int qw6_vk_pipe_attention_gqa(struct qw6_vk_pipe_s *p,
+__attribute__((unused)) static int qw6_vk_pipe_attention_gqa(struct qw6_vk_pipe_s *p,
                                       qw6_vk_buffer_t *qbuf,
                                       qw6_vk_buffer_t *k_cache,
                                       qw6_vk_buffer_t *v_cache,
@@ -2116,7 +2116,7 @@ static int qw6_vk_pipe_attention_gqa(struct qw6_vk_pipe_s *p,
                            n_q_heads, 1, 1);
 }
 
-static int qw6_vk_pipe_conv1d(struct qw6_vk_pipe_s *p,
+__attribute__((unused)) static int qw6_vk_pipe_conv1d(struct qw6_vk_pipe_s *p,
                                qw6_vk_buffer_t *xbuf, qw6_vk_buffer_t *wbuf,
                                qw6_vk_buffer_t *outbuf,
                                uint32_t dim, uint32_t kernel_size) {
@@ -2128,7 +2128,7 @@ static int qw6_vk_pipe_conv1d(struct qw6_vk_pipe_s *p,
                            (dim + 255) / 256, 1, 1);
 }
 
-static int qw6_vk_pipe_deltanet_retrieve(struct qw6_vk_pipe_s *p,
+__attribute__((unused)) static int qw6_vk_pipe_deltanet_retrieve(struct qw6_vk_pipe_s *p,
                                           qw6_vk_buffer_t *state,
                                           qw6_vk_buffer_t *query,
                                           qw6_vk_buffer_t *out,
@@ -2149,7 +2149,7 @@ static int qw6_vk_pipe_deltanet_retrieve(struct qw6_vk_pipe_s *p,
                            (out_n + 255) / 256, 1, 1);
 }
 
-static int qw6_vk_pipe_deltanet_update(struct qw6_vk_pipe_s *p,
+__attribute__((unused)) static int qw6_vk_pipe_deltanet_update(struct qw6_vk_pipe_s *p,
                                         qw6_vk_buffer_t *state,
                                         qw6_vk_buffer_t *key,
                                         qw6_vk_buffer_t *value,
@@ -2172,7 +2172,7 @@ static int qw6_vk_pipe_deltanet_update(struct qw6_vk_pipe_s *p,
                            (state_n + 255) / 256, 1, 1);
 }
 
-static int qw6_vk_pipe_moe_route(struct qw6_vk_pipe_s *p,
+__attribute__((unused)) static int qw6_vk_pipe_moe_route(struct qw6_vk_pipe_s *p,
                                   qw6_vk_buffer_t *logits,
                                   qw6_vk_buffer_t *indices,
                                   qw6_vk_buffer_t *weights,
@@ -2184,7 +2184,7 @@ static int qw6_vk_pipe_moe_route(struct qw6_vk_pipe_s *p,
                            bufs, zero, 3, &push, sizeof(push), 1, 1, 1);
 }
 
-static int qw6_vk_pipe_moe_gather(struct qw6_vk_pipe_s *p,
+__attribute__((unused)) static int qw6_vk_pipe_moe_gather(struct qw6_vk_pipe_s *p,
                                    qw6_vk_buffer_t *expert_out,
                                    qw6_vk_buffer_t *expert_weights,
                                    qw6_vk_buffer_t *shared_out,
@@ -2516,22 +2516,25 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                                 k_cpu + h * QW6_HEAD_DIM,
                                 k_norm_w, QW6_HEAD_DIM);
 
-            /* MRoPE */
-            int rot_dim = (int)(QW6_HEAD_DIM * QW6_PARTIAL_ROTARY);
-            qw6_cpu_mrope(q_cpu, k_cpu,
-                          QW6_NUM_Q_HEADS * QW6_HEAD_DIM,
-                          QW6_NUM_KV_HEADS * QW6_HEAD_DIM,
-                          QW6_NUM_Q_HEADS, QW6_NUM_KV_HEADS,
-                          pos, rot_dim);
+            /* MRoPE (CPU) */
+            {
+                int rot_dim = (int)(QW6_HEAD_DIM * QW6_PARTIAL_ROTARY);
+                qw6_cpu_mrope(q_cpu, k_cpu,
+                              QW6_NUM_Q_HEADS * QW6_HEAD_DIM,
+                              QW6_NUM_KV_HEADS * QW6_HEAD_DIM,
+                              QW6_NUM_Q_HEADS, QW6_NUM_KV_HEADS,
+                              pos, rot_dim);
+            }
 
-            /* Write K,V to KV cache (on GPU) */
+            /* Write K,V to KV cache */
             float *k_slot = (float *)p->k_cache[l].mapped +
                 (size_t)pos * QW6_NUM_KV_HEADS * QW6_HEAD_DIM;
             float *v_slot = (float *)p->v_cache[l].mapped +
                 (size_t)pos * QW6_NUM_KV_HEADS * QW6_HEAD_DIM;
             memcpy(k_slot, k_cpu, QW6_NUM_KV_HEADS * QW6_HEAD_DIM * sizeof(float));
             memcpy(v_slot, (float *)ffn->mapped, QW6_NUM_KV_HEADS * QW6_HEAD_DIM * sizeof(float));
-            /* GQA attention on CPU (for now) */
+
+            /* GQA attention (CPU) */
             float *attn_cpu = (float *)att->mapped;
             qw6_cpu_attention_gqa(attn_cpu, q_cpu,
                                   (float *)p->k_cache[l].mapped,
@@ -2544,13 +2547,18 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                 attn_cpu[i] *= qw6_sigmoid(gate_cpu[i]);
             memcpy(att->mapped, attn_cpu, QW6_NUM_Q_HEADS * QW6_HEAD_DIM * sizeof(float));
 
-            /* Output projection */
-            VK_MATMUL(&m->layers[l].attn_o, att, att,
-                      QW6_HIDDEN_SIZE, QW6_NUM_Q_HEADS * QW6_HEAD_DIM);
+            /* Output projection on CPU (GPU weight upload bug for attn_o) */
+            {
+                float tmp[QW6_HIDDEN_SIZE];
+                qw6_tensor_matvec(tmp, &m->layers[l].attn_o,
+                                  (float *)att->mapped, QW6_HIDDEN_SIZE);
+                memcpy(att->mapped, tmp, QW6_HIDDEN_SIZE * sizeof(float));
+            }
         }
 
         /* Residual: hidden = resid + attn */
         VK_ADD(hid, att, QW6_HIDDEN_SIZE);
+
 
         /* ---- MoE Block ---- */
         memcpy(res->mapped, hid->mapped, QW6_HIDDEN_SIZE * sizeof(float));
