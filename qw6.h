@@ -436,6 +436,7 @@ ggml_type_t qw6_gguf_type_to_qw6(ggml_type_t ggml_type, qw6_quant_t *out_quant);
 void qw6_dump_tokens(const uint32_t *tokens, uint32_t n);
 void qw6_dump_logits(const float *logits, int n, int top_k);
 void qw6_dump_logprobs(const float *logits, int n, int top_k);
+int qw6_check_nan_inf(const float *buf, uint32_t n, const char *label);
 
 /* Version */
 #define QW6_VERSION "0.0.1-prealpha"

@@ -2220,6 +2220,7 @@ static int qw6_forward_token(qw6_session_t *s, uint32_t token, uint32_t pos) {
 #endif
 
     int rc = qw6_tensor_dequantize_row(&m->tok_embeddings, token, hidden);
+    if (rc == 0 && qw6_check_nan_inf(hidden, QW6_HIDDEN_SIZE, "embedding") > 0) rc = -1;
     for (int l = 0; l < QW6_NUM_LAYERS && rc == 0; l++) {
         memcpy(resid, hidden, QW6_HIDDEN_SIZE * sizeof(float));
         rc = qw6_tensor_dequantize_row(&m->layers[l].norm, 0, norm_w);
@@ -2232,6 +2233,10 @@ static int qw6_forward_token(qw6_session_t *s, uint32_t token, uint32_t pos) {
             memcpy(hidden, resid, QW6_HIDDEN_SIZE * sizeof(float));
             qw6_add_inplace(hidden, attn, QW6_HIDDEN_SIZE);
         }
+        if (rc == 0) {
+            char lbl[64]; snprintf(lbl, sizeof(lbl), "layer%d.attn", l);
+            if (qw6_check_nan_inf(hidden, QW6_HIDDEN_SIZE, lbl) > 0) rc = -1;
+        }
 
         memcpy(resid, hidden, QW6_HIDDEN_SIZE * sizeof(float));
         if (rc == 0) rc = qw6_tensor_dequantize_row(&m->layers[l].post_norm, 0, norm_w);
@@ -2243,12 +2248,17 @@ static int qw6_forward_token(qw6_session_t *s, uint32_t token, uint32_t pos) {
             memcpy(hidden, resid, QW6_HIDDEN_SIZE * sizeof(float));
             qw6_add_inplace(hidden, ffn, QW6_HIDDEN_SIZE);
         }
+        if (rc == 0) {
+            char lbl[64]; snprintf(lbl, sizeof(lbl), "layer%d.ffn", l);
+            if (qw6_check_nan_inf(hidden, QW6_HIDDEN_SIZE, lbl) > 0) rc = -1;
+        }
     }
     if (rc == 0) rc = qw6_tensor_dequantize_row(&m->output_norm, 0, norm_w);
     if (rc == 0) {
         qw6_cpu_rmsnorm(normed, hidden, norm_w, QW6_HIDDEN_SIZE);
         rc = qw6_tensor_matvec(s->logits, &m->output, normed, QW6_VOCAB_SIZE);
     }
+    if (rc == 0 && qw6_check_nan_inf(s->logits, QW6_VOCAB_SIZE, "logits") > 0) rc = -1;
 
     free(hidden); free(resid); free(norm_w); free(normed); free(attn); free(ffn);
     return rc;
@@ -2748,6 +2758,24 @@ void qw6_dump_logprobs(const float *logits, int n, int top_k) {
     for (int k = 0; k < top_k; k++)
         printf("  token %d: %.6f (prob=%.4f)\n", idx[k], val[k], expf(val[k]));
     free(idx); free(val);
+}
+
+/* ---- NaN/Inf detection ---- */
+
+int qw6_check_nan_inf(const float *buf, uint32_t n, const char *label) {
+    QW6_ASSERT_PTR(buf);
+    int bad = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (isnan(buf[i])) {
+            if (bad < 5) fprintf(stderr, "qw6: NaN in %s at index %u\n", label, i);
+            bad++;
+        } else if (isinf(buf[i])) {
+            if (bad < 5) fprintf(stderr, "qw6: Inf in %s at index %u\n", label, i);
+            bad++;
+        }
+    }
+    if (bad > 0) fprintf(stderr, "qw6: %d NaN/Inf values in %s\n", bad, label);
+    return bad;
 }
 
 /* ---- Self-test (no model/tokenizer/BC-250 required) ---- */
