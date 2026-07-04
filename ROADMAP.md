@@ -256,10 +256,14 @@ Goal: first match llama.cpp numerically, then surpass its BC-250 throughput for 
 - [ ] GPU norm weight binding without per-layer CPU copies.
 - [x] GPU per-head Q/K RMSNorm (rmsnorm_heads.comp).
 - [x] GPU per-head Q/K L2 norm (l2_norm_heads.comp).
-- [ ] GPU alpha, beta, gate, sigmoid, softplus, and SiLU post-processing.
-- [ ] GPU KV cache writes and long-context attention.
-- [ ] GPU MoE routing, expert selection, expert accumulation, shared expert weighting.
-- [ ] GPU final argmax or sampling without full-logit readback.
+- [x] GPU alpha/beta sigmoid/softplus transforms (deltanet_alpha_beta.comp).
+- [x] GPU attention gate sigmoid multiplication (sigmoid_mul.comp).
+- [x] GPU fused DeltaNet output RMSNorm + SiLU(z) gating (deltanet_norm_gate.comp).
+- [x] GPU KV cache writes (buf_copy.comp).
+- [ ] Long-context attention: current shader limited to 256-token context.
+- [x] GPU MoE routing (moe_route.comp integrated, reads back 8 indices + 8 weights instead of 256 logits).
+- [x] GPU expert accumulation (vec_axpy.comp for ffn += w * nrm).
+- [x] GPU argmax/sampling without full-logit readback (sampling.comp + forward_greedy).
 
 ### Milestone 2: Replace per-dispatch synchronization with a backend graph
 
