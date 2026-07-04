@@ -42,66 +42,252 @@ llama.cpp outputs layer-by-layer.
 
 ---
 
-## Phase 2: Vulkan Compute Backend ✅
+## Phase 2: Vulkan Compute Backend (Partial)
 
 Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders.
 
-### GPU Shaders (18 + 1)
-- [x] `matvec_f32.comp` — FP32 matrix-vector multiply
-- [x] `matmul_q4k.comp` — Q4_K block dequant + matmul
-- [x] `matmul_q5k.comp` — Q5_K block dequant + matmul (known issue: produces wrong output, pre-dequantize to FP32 workaround)
-- [x] `matmul_q6k.comp` — Q6_K block dequant + matmul
-- [x] `matmul_iq2xxs.comp` — IQ2_XXS block dequant + matmul (verified 3.5e-6 vs CPU)
-- [x] `add.comp` — element-wise vector add
-- [x] `silu_mul.comp` — SiLU activation + multiply
-- [x] `rmsnorm.comp` / `rmsnorm_full.comp` / `rmsnorm_apply.comp` — RMSNorm
-- [x] `rope_mrope.comp` — MRoPE rotary position encoding
-- [x] `attention_gqa.comp` — GQA attention (short-context)
-- [x] `deltanet_conv1d.comp` / `deltanet_update.comp` / `deltanet_retrieve.comp` — Gated DeltaNet
-- [x] `moe_route.comp` — top-k MoE routing
-- [x] `moe_gather.comp` — expert output gather
-- [x] `mtp_draft.comp` — MTP speculative decoding draft
-- [x] `argmax.comp` / `sampling.comp` — token sampling
+### Current audited state
 
-### Pipeline Infrastructure
-- [x] Vulkan device init, buffer allocation, SPIR-V build via `glslc`
-- [x] Big weight buffer: 10.7 GB upload of all model weights at init
-- [x] Persistent scratch buffers for intermediate activations
-- [x] Per-layer KV cache (full-attn) and DeltaNet state (linear-attn) on GPU
-- [x] Full 40-layer dispatch orchestration in `qw6_vk_pipe_forward()`
-- [x] CPU ops in pipeline: RMSNorm per head, Q/K norms, attention gate, small matmuls
-- [x] Chat template: automatic CHATML wrapping for Qwen conversation format
-- [x] Pipeline caching infrastructure (VkPipeline reuse; disabled — GPU hang)
-- [x] attn_o workaround: pre-dequantize Q5_K→FP32 on CPU during init
+- [x] BC-250 Vulkan device enumeration works in the normal path and reports AMD BC-250 / RADV GFX1013.
+- [x] The complete GGUF now loads with `--load-only --vulkan`.
+- [x] The Vulkan smoke path can run a real prompt and produce tokens.
+- [x] SPIR-V build covers 24 shader sources, not the older "18 + 1" list.
+- [x] Pipeline objects are cached again, and there is a reusable descriptor pool, command buffer, and fence.
+- [x] IQ2_S has a first GPU shader path.
+- [x] Linear-attention Conv1D and Gated DeltaNet have first fused GPU shader paths.
+- [ ] Correctness is not proven. CPU, GPU, and llama.cpp logits have not been compared layer-by-layer or token-by-token.
+- [ ] Throughput is still far below the stated goal. Current smoke measurements are about 1.57 s/token for `Hi -n 1`, and about 4 tokens in 6.29 s for `Hi -n 4` on the Vulkan path.
+- [ ] The current pipeline is not yet a llama.cpp-style backend. It is a Vulkan-assisted forward pass with many host-visible buffers, immediate per-dispatch waits, and several CPU steps inside each layer.
 
-### Known Issues
-- [ ] `matmul_q5k.spv` produces 100-500x wrong output (byte-identical data)
-- [ ] IQ2_S / IQ3_S expert weights lack GPU shaders (CPU fallback)
-- [ ] Pipeline caching GPU hang (descriptor/push constant mismatch)
-- [ ] Multi-token prefill processes one token at a time (~28s/token)
-- [ ] Core inference math not validated against reference output
+### Audited source scope
 
-### Verification
-- `./qw6 --vulkan-self-test` — all individual shaders verified on BC-250
-- `./qw6 --load-only --vulkan -m model.gguf` — IQ2 probe matches CPU within 3.5e-6
-- `./qw6 -m model.gguf -p "Hi" -n 1 --nothink --raw --vulkan` — full pipeline test
+- [x] `qw6.c`: GGUF loading, tensor binding, native dequant, CPU forward, session, prefill, generation, CLI, CPU probes.
+- [x] `qw6_vk.c`: Vulkan device setup, buffer allocation, host wrappers, self-test, pipeline cache, weight upload, full Vulkan pipeline forward, cleanup.
+- [x] `qw6_tok.c`: tokenizer JSON parser, byte-level BPE, pre-tokenization, encode/decode.
+- [x] Headers: `qw6.h`, `qw6_vk.h`, `qw6_tok.h`, `qw6_vk_int.h`, `qw6_vk_pipe.h`, `qw6_iq_tables.h`.
+- [x] Focused shader audit: quant matmuls, attention, Conv1D, Gated DeltaNet, and shader inventory.
+
+### Current GPU shader inventory
+
+- [x] Elementwise and small ops: `add.comp`, `vec_add.comp`, `silu_mul.comp`, `argmax.comp`, `sampling.comp`.
+- [x] Norms: `rmsnorm.comp`, `rmsnorm_apply.comp`, `rmsnorm_full.comp`.
+- [x] Dense FP32: `matvec_f32.comp`, `mtp_draft.comp`.
+- [x] Quant matvec: `matmul_q4k.comp`, `matmul_q5k.comp`, `matmul_q6k.comp`, `matmul_iq2xxs.comp`, `matmul_iq2s.comp`.
+- [x] Attention: `rope_mrope.comp`, `attention_gqa.comp`.
+- [x] Linear attention: `deltanet_conv1d.comp`, `deltanet_conv1d_f32.comp`, `deltanet_update.comp`, `deltanet_retrieve.comp`, `deltanet_gated.comp`.
+- [x] MoE helpers: `moe_route.comp`, `moe_gather.comp`.
+- [ ] Missing for full model coverage: IQ3_S GPU matvec.
+- [ ] Missing for performance: fused model-specific kernels that combine the operations currently split across many small dispatches.
+
+### Immediate correctness blockers
+
+- [ ] Add a real reference-logit harness before any more performance claims. It must compare tokenizer IDs, prompt tokens, layer outputs, final logits, top-k logits, and generated token IDs against llama.cpp for the exact GGUF, prompt, context length, and sampling settings.
+- [ ] Implement `--dump-logits`, `--dump-logprobs`, and layer/tensor trace dumping for both CPU and Vulkan paths. Without dumps, there is no way to isolate whether bad output comes from tokenizer, quant dequant, attention, DeltaNet, MoE, or sampling.
+- [ ] Establish CPU vs Vulkan parity for one token and for a multi-token prompt. The Vulkan path currently has separate math from the CPU path in Conv1D, Gated DeltaNet, attention, routing, and quant matmuls.
+- [ ] Validate the final generated text, not only that the process runs. Current output has not been proven semantically or numerically correct.
+- [ ] Make correctness tests fail hard on any CPU fallback in Vulkan performance mode. Today unsupported GPU quant or long-context attention can silently fall back to CPU.
+- [ ] Add a deterministic benchmark mode that fixes prompt, seed, max tokens, context length, chat template, thread count, and sampling. Current timing is a smoke test, not a valid baseline.
+
+### Loader and model binding problems
+
+- [ ] Required tensor validation is incomplete. Some binding helpers can silently skip malformed tensors; the loader can still appear to succeed if raw layer tensor counts look plausible.
+- [ ] `bind_expert_pack` must report shape, stride, quant, and byte-span errors instead of returning silently. Expert pack binding is central to this model and cannot be best-effort.
+- [ ] Unknown GGUF tensor types must be fatal. The current type conversion has paths where an unsupported type can collapse toward FP32 semantics if earlier checks miss it.
+- [ ] Tensor byte sizes must be computed from quant layout and dimensions, not inferred from the next tensor offset. The current span logic can include padding or gaps and can inflate `total_weight_bytes`.
+- [ ] Large-file handling should not depend on `long` from `ftell`. Use a consistent 64-bit file-size path for GGUF and tokenizer loads.
+- [ ] `type_counts[30]` is stale relative to the GGML enum values in `qw6.h`; types at and above BF16 are not counted correctly in diagnostics.
+- [ ] Model metadata must be checked against the hard-coded model constants. Because this engine is model-specific, mismatch should produce a clear fatal error instead of undefined behavior.
+- [ ] The Vulkan init path mutates `attn_o` tensors to FP32 after pre-dequantization. This workaround should be replaced with a separate GPU-side replacement tensor or fixed Q5_K shader so the model structure remains immutable after load.
+- [ ] `vk_offset` uses `(size_t)-1` as the missing sentinel while comments still imply zero can mean not uploaded. Clean this up so upload state is unambiguous.
+
+### Tokenizer and prompt-format problems
+
+- [ ] The tokenizer is a reference implementation, not a faithful production Qwen tokenizer. Pre-tokenization is simplified ASCII/basic-Unicode logic and does not implement the full HuggingFace regex behavior.
+- [ ] Special token detection is skipped during encode. Chat and control tokens can be re-tokenized as normal text unless manually inserted elsewhere.
+- [ ] The chat template is hardcoded instead of read from tokenizer metadata. This can shift prompt tokens from llama.cpp and invalidate both correctness and performance comparisons.
+- [ ] Encoding uses a temporary static hash map and linear merge search. This is not a decode bottleneck, but it is too fragile for repeated prompt benchmarking and server use.
+- [ ] Tokenizer regression coverage is tiny. Add fixtures collected from HuggingFace or llama.cpp for chat prompts, special tokens, Unicode, whitespace, code, numbers, and multi-message conversations.
+
+### CPU path problems that affect validation
+
+- [ ] CPU self-tests for toy Q4_K and IQ2 layouts do not validate real GGUF quant layouts. They are useful unit fixtures but not proof that model weights are dequantized correctly.
+- [ ] CPU probes cover only small slices or layer 0. They do not prove full-model correctness.
+- [ ] DeltaNet has older update/retrieve helpers plus the actual `qw6_gated_delta_net_single` recurrence. Tests must validate the recurrence used by the model path, not only the older helper kernels.
+- [ ] The Conv1D probe is not enough to validate the stateful model path. It must cover multi-token state shift, weight layout, SiLU, and in-place buffer reuse.
+- [ ] CPU fallback inside the Vulkan pipeline uses mapped buffers and can hide missing GPU kernels. Debug fallback should be explicit; performance mode should reject it.
+- [ ] Session initialization allocates CPU KV/state buffers even when the Vulkan pipeline is used. That wastes memory and muddies profiling on the BC-250.
+- [ ] `qw6_forward_token` allocates CPU temporary buffers before it redirects to Vulkan. This creates avoidable allocation overhead in the GPU path.
+
+### Vulkan device and memory architecture problems
+
+- [ ] All buffers are currently allocated as host-visible, host-coherent memory. The 10.7 GB weights should live in device-local memory with staging uploads; host-visible weights are not a high-throughput llama.cpp-style backend.
+- [ ] Add a proper allocator for device-local weights, persistent device scratch, upload staging, and small uniform/control buffers. The current one-buffer helper is too limited.
+- [ ] Add memory-type diagnostics and fail clearly if device-local capacity is insufficient. BC-250 behavior depends on the RADV memory heaps actually selected.
+- [ ] Device selection picks the first integrated/discrete GPU. Add device listing, BC-250 preference, vendor/device ID checks, queue capability checks, and an environment or CLI override.
+- [ ] Use dedicated transfer and compute usage flags where appropriate. The current buffer usage is too generic for staging and device-local layout.
+- [ ] Stop mapping every performance-critical buffer. Persistent host mapping is acceptable for staging and small readback, not for all weights and activations.
+- [ ] Rework the +512 MB dequant temporary space in the weight buffer. It is a workaround for `attn_o`, not a real memory plan.
+- [ ] Avoid copying norm weights into a scratch buffer every layer. Bind norm tensors directly from the weight buffer or store persistent small buffers.
+- [ ] KV cache and DeltaNet state are FP32 host-visible buffers. Revisit layout, precision, and device-local placement once correctness is proven.
+
+### Vulkan dispatch architecture problems
+
+- [ ] `qw6_vk_pipe_dispatch` still records one command buffer, submits it, and waits on a fence for every shader call. This destroys throughput.
+- [ ] Descriptor sets are still allocated, updated, and the descriptor pool is reset per dispatch. Pipeline caching alone does not remove CPU driver overhead.
+- [ ] The cached descriptor layout uses fixed arrays for up to five buffers. That is fragile and blocks richer fused kernels unless expanded or redesigned.
+- [ ] The pipeline cache is capped at 32 entries and falls back to the uncached legacy dispatcher if exceeded. This fallback creates pipelines, descriptor pools, command buffers, fences, and shader modules per call.
+- [ ] There is no command graph or static execution plan. The layer sequence should be planned once, then replayed with updated push constants and buffer offsets.
+- [ ] Replace per-op waits with batched command buffers per token, per layer group, or per decode step. Use pipeline barriers and a small number of queue submissions.
+- [ ] Use timestamp queries around GPU work. Current profile timing wraps queue submit plus fence wait and mixes CPU driver overhead with GPU execution.
+- [ ] Add a "no fallback, no readback" decode benchmark mode to prove the GPU is doing the work.
+- [ ] The current `QW6_PROFILE` path prints useful aggregate shader timing, but it is not a full profiler. Add dispatch counts, CPU-side setup time, GPU timestamps, bytes read, bytes written, and fallback counts.
+
+### Quant matmul problems and todos
+
+- [ ] Fix Q5_K before removing the `attn_o` workaround. The current Q5_K shader is marked wrong and `attn_o` is pre-dequantized to FP32 during init.
+- [ ] Validate Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_S, and IQ3_S against llama.cpp dequant for real rows from the loaded GGUF, not only toy self-test blocks.
+- [ ] Add IQ3_S GPU matvec. The tables exist in `qw6_iq_tables.h`, but the Vulkan pipeline has no IQ3_S shader path.
+- [ ] Decide whether IQ2_M is truly equivalent to the current IQ2_XXS shader path. If not, split it into a separate kernel and validation case.
+- [ ] The current quant matmul shaders use one workgroup per output row and do a scalar reduction over columns. That is simple but not enough for BC-250 throughput.
+- [ ] Add wave64/subgroup reductions tuned for GFX1013 instead of shared-memory reductions everywhere.
+- [ ] Process multiple rows per workgroup or multiple rows per wave where dimensions allow. MoE expert matrices are small enough that launch overhead and row granularity dominate.
+- [ ] Cache or broadcast the input activation vector efficiently. Current kernels reread `x` for every output row, which is expensive for large row counts.
+- [ ] Add vectorized loads for packed quant data and activation values. The shaders currently reconstruct bytes with scalar helper calls.
+- [ ] Specialize kernels for the exact model dimensions: hidden 2048, MoE inter 512, shared inter 512, output vocab 248320, QKV dimensions, and expert top-k 8.
+- [ ] Optimize the final output projection separately. It is a huge vocab matvec and should feed GPU argmax/top-k directly instead of copying all logits to CPU every token.
+
+### Linear-attention and DeltaNet problems and todos
+
+- [ ] Validate the fused `deltanet_gated.comp` math against `qw6_gated_delta_net_single` for real model tensors and multi-token state. Naming in the C path passes alpha-like values through a parameter called gate, so tests must verify exact semantics.
+- [ ] Move Q/K L2 normalization to GPU. The linear-attention path still normalizes heads on CPU after Conv1D.
+- [ ] Move beta sigmoid and alpha softplus/scale to GPU. The current path reads/writes those small vectors through host-mapped memory every linear-attention layer.
+- [ ] Move Gated DeltaNet output RMSNorm per value head to GPU.
+- [ ] Fuse SiLU(z) with the Gated DeltaNet output norm or the following output projection input preparation.
+- [ ] Validate Conv1D state update with in-place input/output buffer reuse. The shader currently reads and writes through different bindings that can point at the same scratch buffer.
+- [ ] Fuse the linear-attention sequence where practical: QKV projection, Conv1D, SiLU, Q/K L2 norm, alpha/beta transforms, recurrent update/retrieve, output norm, z gate, and output projection staging.
+- [ ] Revisit DeltaNet state layout for coalesced access. The current shader loops over `dim` per output element and may produce poor memory locality.
+- [ ] Add long-run state tests. A one-token or tiny random self-test will not catch accumulation drift in recurrent state.
+
+### Full-attention problems and todos
+
+- [ ] Move Q/K per-head RMSNorm to GPU. It is currently CPU work in every full-attention layer.
+- [ ] Move attention gate sigmoid/multiply to GPU. It is currently a CPU loop over the attention output.
+- [ ] Write K/V cache from GPU, not via host-mapped CPU copies.
+- [ ] Remove the `pos < 256` attention limitation. `attention_gqa.comp` has a 256-entry shared score buffer and falls back to CPU for longer contexts.
+- [ ] Add an attention kernel that handles the target context lengths with tiling, streaming softmax, and GQA layout tuned to 16 query heads, 2 KV heads, and head dimension 256.
+- [ ] Fuse MRoPE, KV append, attention, gate, and output projection preparation where it reduces dispatch and memory traffic.
+- [ ] Revisit KV precision and layout. FP32 KV is simple but may waste bandwidth and memory for long contexts.
+
+### MoE problems and todos
+
+- [ ] Keep routing on GPU. The current pipeline computes router logits on GPU, then routes on CPU.
+- [ ] Keep selected expert indices and weights on GPU. CPU routing forces host synchronization before every MoE block.
+- [ ] Replace the per-expert sequence of gate matmul, up matmul, SiLU multiply, down matmul, and CPU accumulation. With top-k 8 and 40 layers, this creates hundreds of tiny synchronized dispatches per token.
+- [ ] Implement a fused or batched selected-expert executor for exactly top-k 8, 256 experts, hidden 2048, and expert inter 512.
+- [ ] Accumulate expert outputs on GPU. The current accumulation is a CPU loop over hidden size for each selected expert.
+- [ ] Move shared expert routing and accumulation to GPU. The shared-router sigmoid and final shared accumulation are CPU work today.
+- [ ] Precompute per-layer expert tensor offsets and quant metadata in a GPU-readable table so kernels do not need CPU-side branching per expert.
+- [ ] Add MoE-specific validation against llama.cpp: router logits, selected expert IDs, softmax weights, each selected expert output, shared expert output, and final MoE residual.
+
+### Prefill problems and todos
+
+- [ ] `qw6_prefill` processes prompt tokens one at a time through full decode-style forward. There is no chunked or batched prefill despite `QW6_PREFILL_CHUNK`.
+- [ ] Implement chunked prefill for full-attention layers so prompt tokens share projection and attention work.
+- [ ] Design a linear-attention prefill strategy for Gated DeltaNet. The recurrence is sequential, but the command scheduling, projections, and MoE work can still be batched or pipelined.
+- [ ] Avoid rebuilding or resubmitting the same layer command sequence per prompt token.
+- [ ] Add prefill throughput metrics separate from decode throughput. The current smoke timing mixes prompt processing and generated-token timing.
+
+### Sampling and output problems
+
+- [ ] `qw6_sample` ignores temperature and top-p and effectively performs greedy argmax. That is acceptable for deterministic validation but not for a server.
+- [ ] The Vulkan path reads the full vocab logits back to CPU every token. For greedy or top-k/top-p, sampling should run on GPU and read back only the chosen token and optional debug values.
+- [ ] Existing `argmax.comp` and `sampling.comp` are self-test wrappers, not integrated into the pipeline.
+- [ ] Add a mode to dump logits for correctness and another mode to avoid full-logit readback for performance.
+
+### Benchmark and profiling problems
+
+- [ ] The old 150+ tok/s target is aspirational until correctness and a fair llama.cpp baseline are recorded.
+- [ ] Benchmark llama.cpp and qw6 on the same BC-250, same GGUF, same prompt, same context, same token count, same sampling, warm run, and cold run.
+- [ ] Measure wall-clock time, GPU timestamp time, CPU submit/setup time, model load time, first-token latency, prefill tok/s, and decode tok/s separately.
+- [ ] Use wall-clock timers for user-visible throughput. CPU `clock()` is not enough for GPU queue timing.
+- [ ] Report whether weights are host-visible or device-local in each benchmark.
+- [ ] Report dispatch counts per generated token and per layer. This is currently a primary bottleneck.
+- [ ] Add roofline-style estimates for each dominant kernel: quant bytes read, activation bytes read, FLOPs or effective ops, achieved bandwidth, and occupancy estimate.
+
+### Cleanup and maintainability problems
+
+- [ ] `qw6_vk_pipe.h` describes an older separate pipeline structure and API that no longer matches the monolithic implementation in `qw6_vk.c`. Either delete it or bring it back in sync.
+- [ ] `qw6_vk_int.h` declares extension helpers that are not used by the current monolithic implementation. Remove or reintegrate them.
+- [ ] File headers still describe Phase 1/Phase 2 as if the project is a clean CPU reference plus planned Vulkan backend. Update once correctness status is clear.
+- [ ] Split the Vulkan backend into device/memory, shader dispatch, model upload, kernels, and pipeline orchestration modules once behavior stabilizes. Do not refactor before parity tests exist.
+- [ ] Add CI or local scripts for `make cpu`, `make vulkan`, shader compilation, tokenizer tests, CPU self-test, Vulkan self-test, load-only, and a short deterministic generation check.
+
+### Verification currently available
+
+- `make vulkan`
+- `./qw6 --self-test`
+- `./qw6 --vulkan-self-test`
+- `./qw6 --load-only --vulkan -m models/qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf`
+- `./qw6 -m models/qwen3.6-35b-a3b/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf -p "Hi" -n 1 --nothink --raw --vulkan`
+
+These checks prove that the program builds, enumerates the GPU, loads the complete GGUF, and executes a smoke prompt. They do not prove correct model output or competitive performance.
 
 ---
 
-## Phase 3: Optimization
+## Phase 3: Correctness and llama.cpp-Class Optimization
 
-Goal: exceed the llama.cpp baseline. Target 150+ tok/s generation.
+Goal: first match llama.cpp numerically, then surpass its BC-250 throughput for this exact Qwen 3.6-35B-A3B IQ2_XXS GGUF and hardware.
 
-- [ ] Fix pipeline caching (VkPipeline reuse, descriptor pooling)
-- [ ] Wire up GPU attention, conv1d, DeltaNet, MoE gather dispatches
-- [ ] Fix Q5_K matmul shader (port dequant logic from llama.cpp)
-- [ ] Add IQ2_S / IQ3_S GPU shaders (port from llama.cpp)
-- [ ] Chunked prefill: batch N tokens through forward pass
-- [ ] Wave64-optimized tiling for GFX1013
-- [ ] Fused kernels (RMSNorm+attention, MRoPE+attention, IQ2 dequant+matmul)
-- [ ] Persistent kernel design (reduce per-dispatch overhead)
-- [ ] Memory layout tuning for GPU cache hierarchy
-- [ ] `qw6-bench` and roofline measurement
+### Milestone 0: Make correctness measurable
+
+- [ ] Add deterministic llama.cpp comparison fixtures for tokenizer output, prompt format, layer traces, logits, and generated tokens.
+- [ ] Add CPU vs Vulkan tensor-dump comparison for one-token and multi-token prompts.
+- [ ] Add full-model smoke tests that fail on NaN, inf, bad tensor shape, unsupported quant, CPU fallback in Vulkan performance mode, or missing shader.
+- [ ] Fix all correctness mismatches before optimizing kernels whose output is not yet proven.
+
+### Milestone 1: Remove unintended CPU work from decode
+
+- [ ] GPU token embedding lookup/dequant.
+- [ ] GPU norm weight binding without per-layer CPU copies.
+- [ ] GPU Q/K RMSNorm and L2 norm.
+- [ ] GPU alpha, beta, gate, sigmoid, softplus, and SiLU post-processing.
+- [ ] GPU KV cache writes and long-context attention.
+- [ ] GPU MoE routing, expert selection, expert accumulation, shared expert weighting.
+- [ ] GPU final argmax or sampling without full-logit readback.
+
+### Milestone 2: Replace per-dispatch synchronization with a backend graph
+
+- [ ] Build a static per-layer execution plan for the exact model.
+- [ ] Allocate persistent descriptors or descriptor buffers for all stable resources.
+- [ ] Record batched command buffers for each decode token or layer group.
+- [ ] Use barriers between dependent kernels and fence only at the token boundary.
+- [ ] Add GPU timestamp queries and fallback counters.
+- [ ] Keep debug mode separate from performance mode.
+
+### Milestone 3: Move weights and state to the right memory
+
+- [ ] Upload weights to device-local memory through staging.
+- [ ] Put scratch, KV cache, DeltaNet state, and Conv1D state in device-local memory.
+- [ ] Use small host-visible buffers only for input token IDs, control data, and final token readback.
+- [ ] Remove the FP32 `attn_o` mutation by fixing Q5_K or storing an explicit replacement tensor outside the model object.
+- [ ] Add memory-budget checks for BC-250 before allocation.
+
+### Milestone 4: Model-specific fused kernels
+
+- [ ] Fused linear-attention block for the 30 DeltaNet layers.
+- [ ] Fused full-attention block for the 10 GQA layers.
+- [ ] Fused selected-expert MoE executor for top-k 8.
+- [ ] Optimized output projection plus GPU sampling.
+- [ ] Specialized quant matvec kernels for the exact matrix shapes in this GGUF.
+- [ ] Wave64/subgroup versions tuned for RADV GFX1013.
+
+### Milestone 5: Batched prefill and server-ready decode
+
+- [ ] Chunked prefill for prompt throughput.
+- [ ] Decode loop that keeps all recurrent state on GPU.
+- [ ] Prompt cache and session reset semantics.
+- [ ] Correct greedy, temperature, top-k, and top-p sampling.
+- [ ] Benchmark harness that reports prefill tok/s, decode tok/s, first-token latency, and steady-state latency.
 
 ---
 
@@ -153,8 +339,8 @@ Goal: exceed the llama.cpp baseline. Target 150+ tok/s generation.
 |---|---|---|---|
 | 0 | Research & design | Done | Design docs |
 | 1 | CPU reference | In progress | Correct native logits (needs ref validation) |
-| 2 | Vulkan backend | **Active** | GPU dispatch pipeline on BC-250 |
-| 3 | Optimization | Not started | 150+ tok/s |
+| 2 | Vulkan backend | Partial / active | Runs on BC-250, not yet proven correct or fast |
+| 3 | Correctness + optimization | Planned | llama.cpp parity, then tuned Vulkan backend |
 | 4 | Server + tooling | Not started | OpenAI API server |
 | 5 | MTP | Not started | Speculative decoding |
 | 6 | Agent | Future | Coding agent |
