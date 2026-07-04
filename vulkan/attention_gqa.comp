@@ -1,0 +1,74 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer K { float k_cache[]; };
+layout(set = 0, binding = 2) readonly buffer V { float v_cache[]; };
+layout(set = 0, binding = 3) writeonly buffer Out { float outv[]; };
+
+layout(push_constant) uniform Push {
+    uint seq_len;
+    uint n_q_heads;
+    uint n_kv_heads;
+    uint head_dim;
+} pc;
+
+shared float scores[256];
+shared float max_part[256];
+shared float sum_part[256];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (h >= pc.n_q_heads) return;
+
+    uint group = pc.n_q_heads / pc.n_kv_heads;
+    uint kv_h = h / group;
+    float inv_sqrt = inversesqrt(float(pc.head_dim));
+
+    float max_score = -3.4028234663852886e38;
+    for (uint t = lid; t < pc.seq_len; t += gl_WorkGroupSize.x) {
+        float dotv = 0.0;
+        uint q_base = h * pc.head_dim;
+        uint k_base = (t * pc.n_kv_heads + kv_h) * pc.head_dim;
+        for (uint d = 0; d < pc.head_dim; d++) {
+            dotv += q[q_base + d] * k_cache[k_base + d];
+        }
+        float s = dotv * inv_sqrt;
+        scores[t] = s;
+        if (s > max_score) max_score = s;
+    }
+
+    max_part[lid] = max_score;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride && max_part[lid + stride] > max_part[lid]) {
+            max_part[lid] = max_part[lid + stride];
+        }
+        barrier();
+    }
+
+    float sumv = 0.0;
+    for (uint t = lid; t < pc.seq_len; t += gl_WorkGroupSize.x) {
+        float e = exp(scores[t] - max_part[0]);
+        scores[t] = e;
+        sumv += e;
+    }
+    sum_part[lid] = sumv;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) sum_part[lid] += sum_part[lid + stride];
+        barrier();
+    }
+
+    for (uint d = lid; d < pc.head_dim; d += gl_WorkGroupSize.x) {
+        float acc = 0.0;
+        for (uint t = 0; t < pc.seq_len; t++) {
+            float w = scores[t] / sum_part[0];
+            uint v_base = (t * pc.n_kv_heads + kv_h) * pc.head_dim;
+            acc += w * v_cache[v_base + d];
+        }
+        outv[h * pc.head_dim + d] = acc;
+    }
+}

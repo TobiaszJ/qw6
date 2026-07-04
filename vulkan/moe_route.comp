@@ -1,0 +1,51 @@
+#version 450
+
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Logits { float logits[]; };
+layout(set = 0, binding = 1) writeonly buffer Indices { uint indices[]; };
+layout(set = 0, binding = 2) writeonly buffer Weights { float weights[]; };
+
+layout(push_constant) uniform Push {
+    uint n_experts;
+    uint top_k;
+} pc;
+
+void main() {
+    float selected[8];
+    uint selected_idx[8];
+
+    for (uint k = 0; k < pc.top_k; k++) {
+        uint best_i = 0;
+        float best_v = -3.4028234663852886e38;
+        for (uint i = 0; i < pc.n_experts; i++) {
+            float v = logits[i];
+            bool used = false;
+            for (uint j = 0; j < k; j++) {
+                if (selected_idx[j] == i) used = true;
+            }
+            if (!used && v > best_v) {
+                best_v = v;
+                best_i = i;
+            }
+        }
+        selected[k] = best_v;
+        selected_idx[k] = best_i;
+    }
+
+    float max_w = selected[0];
+    for (uint k = 1; k < pc.top_k; k++) {
+        if (selected[k] > max_w) max_w = selected[k];
+    }
+
+    float sum = 0.0;
+    for (uint k = 0; k < pc.top_k; k++) {
+        selected[k] = exp(selected[k] - max_w);
+        sum += selected[k];
+    }
+
+    for (uint k = 0; k < pc.top_k; k++) {
+        indices[k] = selected_idx[k];
+        weights[k] = selected[k] / sum;
+    }
+}

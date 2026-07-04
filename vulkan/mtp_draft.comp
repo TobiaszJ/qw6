@@ -1,0 +1,34 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W { float w[]; };
+layout(set = 0, binding = 1) readonly buffer Hidden { float hidden[]; };
+layout(set = 0, binding = 2) writeonly buffer Logits { float logits[]; };
+
+layout(push_constant) uniform Push {
+    uint vocab_size;
+    uint hidden_size;
+} pc;
+
+shared float sums[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (row >= pc.vocab_size) return;
+
+    float acc = 0.0;
+    uint base = row * pc.hidden_size;
+    for (uint h = lid; h < pc.hidden_size; h += gl_WorkGroupSize.x) {
+        acc += w[base + h] * hidden[h];
+    }
+    sums[lid] = acc;
+    barrier();
+
+    for (uint stride = gl_WorkGroupSize.x >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) sums[lid] += sums[lid + stride];
+        barrier();
+    }
+    if (lid == 0) logits[row] = sums[0];
+}

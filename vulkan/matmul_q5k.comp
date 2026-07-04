@@ -1,0 +1,91 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+} pc;
+
+shared float sums[256];
+
+float fp16_to_f32(uint h) {
+    uint sign = (h >> 15) & 1;
+    uint expv = (h >> 10) & 31;
+    uint mant = h & 1023;
+    if (expv == 0) {
+        float s = sign != 0 ? -1.0 : 1.0;
+        return s * (float(mant) / 1048576.0);
+    }
+    if (expv == 31) {
+        uint bits = (sign << 31) | 0x7f800000u | (mant << 13);
+        return uintBitsToFloat(bits);
+    }
+    uint bits = (sign << 31) | ((expv + 112) << 23) | (mant << 13);
+    return uintBitsToFloat(bits);
+}
+
+uint byte_at(uint base, uint off) {
+    uint word = w[(base + off) >> 2];
+    return (word >> (((base + off) & 3) << 3)) & 255;
+}
+
+uint u16_at(uint base, uint off) {
+    return byte_at(base, off) | (byte_at(base, off + 1) << 8);
+}
+
+void get_scale_min(uint base, uint j, out uint d, out uint m) {
+    uint qj;
+    if (j < 4) {
+        qj = byte_at(base, 4 + j);
+        d = qj & 63;
+        m = byte_at(base, 8 + j) & 63;
+    } else {
+        qj = byte_at(base, 8 + j);
+        d = (qj & 15) | ((byte_at(base, j) >> 6) << 4);
+        m = (qj >> 4) | ((byte_at(base, j + 4) >> 6) << 4);
+    }
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (row >= pc.rows) return;
+
+    uint n_blocks = pc.cols / 256;
+    float acc = 0.0;
+    for (uint b = 0; b < n_blocks; b++) {
+        uint block_base = (row * n_blocks + b) * 176;
+        float dbase = fp16_to_f32(u16_at(block_base, 0));
+        float minbase = fp16_to_f32(u16_at(block_base, 2));
+        uint qh_base = block_base + 16;
+        uint ql_base = block_base + 48;
+        for (uint c = lid; c < 256; c += gl_WorkGroupSize.x) {
+            uint group64 = c >> 6;
+            uint sub = (c >> 5) & 1;
+            uint lane = c & 31;
+            uint sc;
+            uint mn;
+            get_scale_min(block_base, group64 * 2 + sub, sc, mn);
+            uint qbyte = byte_at(ql_base, group64 * 32 + lane);
+            uint qh = byte_at(qh_base, lane);
+            uint mask = uint(1) << (group64 * 2 + sub);
+            uint high = (qh & mask) != 0 ? 16 : 0;
+            uint qv = (sub == 0 ? (qbyte & 15) : (qbyte >> 4)) + high;
+            float v = dbase * float(sc) * float(qv) - minbase * float(mn);
+            acc += v * x[b * 256 + c];
+        }
+    }
+    sums[lid] = acc;
+    barrier();
+
+    for (uint stride = gl_WorkGroupSize.x >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) sums[lid] += sums[lid + stride];
+        barrier();
+    }
+    if (lid == 0) y[row] = sums[0];
+}

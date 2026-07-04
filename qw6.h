@@ -100,6 +100,9 @@ typedef struct {
     void *data;         /* quantised data ( 格式取决于 quant) */
     size_t data_size;   /* bytes */
     uint64_t file_offset;
+#ifdef QW6_VULKAN
+    size_t vk_offset;   /* byte offset in GPU weight buffer (0 = not uploaded) */
+#endif
 } qw6_tensor_t;
 
 /* ---- Layer types ---- */
@@ -197,6 +200,9 @@ typedef struct {
     uint32_t capacity;
     float *conv_state[QW6_NUM_LAYERS];
     float *logits;             /* [vocab] — last token logits */
+#ifdef QW6_VULKAN
+    void *vk_pipe;             /* qw6_vk_pipe_t*, NULL = CPU */
+#endif
 } qw6_session_t;
 
 /* ---- API ---- */
@@ -237,8 +243,15 @@ void qw6_cpu_matmul_iq2m(float *out, const void *w, const float *x,
                          int rows, int cols);
 int qw6_tensor_matvec(float *out, const qw6_tensor_t *t, const float *x,
                       uint32_t max_rows);
+int qw6_tensor_dequantize_row(const qw6_tensor_t *t, uint32_t row,
+                              float *dst);
 
 /* Gated DeltaNet operations */
+void qw6_l2_norm_heads(float *x, int heads, int dim);
+void qw6_gated_delta_net_single(float *out, float *state,
+                                const float *q16, const float *k16,
+                                const float *v, const float *gate,
+                                const float *beta);
 /* x is laid out as [kernel_size, dim] from newest sample to oldest sample. */
 void qw6_cpu_conv1d_causal(float *out, const float *x, const void *conv_w,
                            int dim, int kernel_size);
@@ -271,6 +284,14 @@ void qw6_cpu_mtp_draft(float *logits, const float *hidden,
 /* SiLU */
 static inline float qw6_silu(float x) {
     return x / (1.0f + expf(-x));
+}
+static inline float qw6_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+static inline float qw6_softplus(float x) {
+    if (x > 20.0f) return x;
+    if (x < -20.0f) return expf(x);
+    return log1pf(expf(x));
 }
 
 /* Softmax */

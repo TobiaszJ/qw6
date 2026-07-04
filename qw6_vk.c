@@ -1,5 +1,6 @@
 #ifdef QW6_VULKAN
 
+#include "qw6.h"
 #include "qw6_vk.h"
 
 #include <vulkan/vulkan.h>
@@ -199,7 +200,8 @@ static void qw6_vk_free(qw6_vk_t *vk) {
 }
 
 static int qw6_vk_dispatch(qw6_vk_t *vk, const char *shader_path,
-                           qw6_vk_buffer_t **buffers, uint32_t n_buffers,
+                           qw6_vk_buffer_t **buffers, const size_t *offsets,
+                           uint32_t n_buffers,
                            const void *push, uint32_t push_size,
                            uint32_t gx, uint32_t gy, uint32_t gz) {
     VkDescriptorSetLayoutBinding *bindings = calloc(n_buffers, sizeof(*bindings));
@@ -285,7 +287,7 @@ static int qw6_vk_dispatch(qw6_vk_t *vk, const char *shader_path,
     if (!infos || !writes) return -1;
     for (uint32_t i = 0; i < n_buffers; i++) {
         infos[i].buffer = buffers[i]->buffer;
-        infos[i].offset = 0;
+        infos[i].offset = offsets ? offsets[i] : 0;
         infos[i].range = buffers[i]->size;
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = ds;
@@ -340,6 +342,12 @@ typedef struct {
     float eps;
 } qw6_vk_rmsnorm_push_t;
 
+typedef struct {
+    uint32_t n;
+    uint32_t n_groups;
+    float eps;
+} qw6_vk_rmsnorm_apply_push_t;
+
 static int qw6_vk_rmsnorm(qw6_vk_t *vk, const float *x, const float *w,
                           float *y, uint32_t n, float eps) {
     qw6_vk_buffer_t bx, bw, by;
@@ -350,9 +358,54 @@ static int qw6_vk_rmsnorm(qw6_vk_t *vk, const float *x, const float *w,
     memcpy(bw.mapped, w, n * sizeof(float));
     qw6_vk_buffer_t *bufs[3] = {&bx, &bw, &by};
     qw6_vk_rmsnorm_push_t push = {.n = n, .eps = eps};
-    int rc = qw6_vk_dispatch(vk, "vulkan/rmsnorm_full.spv", bufs, 3,
+        int rc = qw6_vk_dispatch(vk, "vulkan/rmsnorm_full.spv", bufs, NULL, 3,
                              &push, sizeof(push), 1, 1, 1);
     if (rc == 0) memcpy(y, by.mapped, n * sizeof(float));
+    qw6_vk_buffer_destroy(vk, &by);
+    qw6_vk_buffer_destroy(vk, &bw);
+    qw6_vk_buffer_destroy(vk, &bx);
+    return rc;
+}
+
+static int qw6_vk_rmsnorm_chunked(qw6_vk_t *vk, const float *x, const float *w,
+                                  float *y, uint32_t n, float eps,
+                                  uint32_t n_groups) {
+    if (n == 0 || n_groups == 0) return -1;
+    qw6_vk_buffer_t bx, bw, by, bs;
+    if (qw6_vk_buffer_create(vk, &bx, n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bw, n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bx);
+        return -1;
+    }
+    if (qw6_vk_buffer_create(vk, &by, n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bw);
+        qw6_vk_buffer_destroy(vk, &bx);
+        return -1;
+    }
+    if (qw6_vk_buffer_create(vk, &bs, n_groups * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &by);
+        qw6_vk_buffer_destroy(vk, &bw);
+        qw6_vk_buffer_destroy(vk, &bx);
+        return -1;
+    }
+    memcpy(bx.mapped, x, n * sizeof(float));
+    memcpy(bw.mapped, w, n * sizeof(float));
+
+    qw6_vk_buffer_t *bufs[4] = {&bx, &bw, &by, &bs};
+    qw6_vk_rmsnorm_push_t reduce_push = {.n = n, .eps = eps};
+        int rc = qw6_vk_dispatch(vk, "vulkan/rmsnorm.spv", bufs, NULL, 4,
+                             &reduce_push, sizeof(reduce_push), n_groups, 1, 1);
+    if (rc == 0) {
+        qw6_vk_rmsnorm_apply_push_t apply_push = {
+            .n = n,
+            .n_groups = n_groups,
+            .eps = eps,
+        };
+        rc = qw6_vk_dispatch(vk, "vulkan/rmsnorm_apply.spv", bufs, NULL, 4,
+                             &apply_push, sizeof(apply_push), n_groups, 1, 1);
+    }
+    if (rc == 0) memcpy(y, by.mapped, n * sizeof(float));
+    qw6_vk_buffer_destroy(vk, &bs);
     qw6_vk_buffer_destroy(vk, &by);
     qw6_vk_buffer_destroy(vk, &bw);
     qw6_vk_buffer_destroy(vk, &bx);
@@ -364,6 +417,60 @@ typedef struct {
     uint32_t cols;
 } qw6_vk_matvec_push_t;
 
+typedef struct {
+    uint32_t idx;
+    uint32_t val_bits;
+} qw6_vk_argmax_out_t;
+
+typedef struct {
+    uint32_t n;
+} qw6_vk_n_push_t;
+
+typedef struct {
+    uint32_t n_experts;
+    uint32_t top_k;
+} qw6_vk_moe_route_push_t;
+
+typedef struct {
+    uint32_t dim;
+    uint32_t top_k;
+    uint32_t has_shared;
+    float shared_weight;
+} qw6_vk_moe_gather_push_t;
+
+typedef struct {
+    uint32_t seq_len;
+    uint32_t n_q_heads;
+    uint32_t n_kv_heads;
+    uint32_t head_dim;
+} qw6_vk_attention_gqa_push_t;
+
+typedef struct {
+    uint32_t dim;
+    uint32_t kernel_size;
+} qw6_vk_conv1d_push_t;
+
+typedef struct {
+    uint32_t key_heads;
+    uint32_t key_dim;
+    uint32_t val_heads;
+    uint32_t val_dim;
+    uint32_t has_beta;
+} qw6_vk_deltanet_push_t;
+
+typedef struct {
+    uint32_t q_dim;
+    uint32_t kv_dim;
+    uint32_t n_heads;
+    uint32_t n_kv_heads;
+    uint32_t position;
+    uint32_t q_head_dim;
+    uint32_t k_head_dim;
+    uint32_t q_rot;
+    uint32_t k_rot;
+    float theta_base;
+} qw6_vk_mrope_push_t;
+
 static int qw6_vk_matvec_f32(qw6_vk_t *vk, const float *w, const float *x,
                              float *y, uint32_t rows, uint32_t cols) {
     qw6_vk_buffer_t bw, bx, by;
@@ -374,11 +481,521 @@ static int qw6_vk_matvec_f32(qw6_vk_t *vk, const float *w, const float *x,
     memcpy(bx.mapped, x, cols * sizeof(float));
     qw6_vk_buffer_t *bufs[3] = {&bw, &bx, &by};
     qw6_vk_matvec_push_t push = {.rows = rows, .cols = cols};
-    int rc = qw6_vk_dispatch(vk, "vulkan/matvec_f32.spv", bufs, 3,
+        int rc = qw6_vk_dispatch(vk, "vulkan/matvec_f32.spv", bufs, NULL, 3,
                              &push, sizeof(push), rows, 1, 1);
     if (rc == 0) memcpy(y, by.mapped, rows * sizeof(float));
     qw6_vk_buffer_destroy(vk, &by);
     qw6_vk_buffer_destroy(vk, &bx);
+    qw6_vk_buffer_destroy(vk, &bw);
+    return rc;
+}
+
+static int qw6_vk_matmul_q4k(qw6_vk_t *vk, const void *w, const float *x,
+                             float *y, uint32_t rows, uint32_t cols) {
+    if (rows == 0 || cols == 0 || (cols % 256) != 0) return -1;
+    const uint32_t block_size = 144;
+    VkDeviceSize w_size = (VkDeviceSize)rows * (cols / 256) * block_size;
+    qw6_vk_buffer_t bw, bx, by;
+    if (qw6_vk_buffer_create(vk, &bw, w_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bx, cols * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bw);
+        return -1;
+    }
+    if (qw6_vk_buffer_create(vk, &by, rows * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bx);
+        qw6_vk_buffer_destroy(vk, &bw);
+        return -1;
+    }
+    memcpy(bw.mapped, w, (size_t)w_size);
+    memcpy(bx.mapped, x, cols * sizeof(float));
+    qw6_vk_buffer_t *bufs[3] = {&bw, &bx, &by};
+    qw6_vk_matvec_push_t push = {.rows = rows, .cols = cols};
+        int rc = qw6_vk_dispatch(vk, "vulkan/matmul_q4k.spv", bufs, NULL, 3,
+                             &push, sizeof(push), rows, 1, 1);
+    if (rc == 0) memcpy(y, by.mapped, rows * sizeof(float));
+    qw6_vk_buffer_destroy(vk, &by);
+    qw6_vk_buffer_destroy(vk, &bx);
+    qw6_vk_buffer_destroy(vk, &bw);
+    return rc;
+}
+
+static int qw6_vk_matmul_q5k(qw6_vk_t *vk, const void *w, const float *x,
+                             float *y, uint32_t rows, uint32_t cols) {
+    if (rows == 0 || cols == 0 || (cols % 256) != 0) return -1;
+    const uint32_t block_size = 176;
+    VkDeviceSize w_size = (VkDeviceSize)rows * (cols / 256) * block_size;
+    qw6_vk_buffer_t bw, bx, by;
+    if (qw6_vk_buffer_create(vk, &bw, w_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bx, cols * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bw);
+        return -1;
+    }
+    if (qw6_vk_buffer_create(vk, &by, rows * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bx);
+        qw6_vk_buffer_destroy(vk, &bw);
+        return -1;
+    }
+    memcpy(bw.mapped, w, (size_t)w_size);
+    memcpy(bx.mapped, x, cols * sizeof(float));
+    qw6_vk_buffer_t *bufs[3] = {&bw, &bx, &by};
+    qw6_vk_matvec_push_t push = {.rows = rows, .cols = cols};
+        int rc = qw6_vk_dispatch(vk, "vulkan/matmul_q5k.spv", bufs, NULL, 3,
+                             &push, sizeof(push), rows, 1, 1);
+    if (rc == 0) memcpy(y, by.mapped, rows * sizeof(float));
+    qw6_vk_buffer_destroy(vk, &by);
+    qw6_vk_buffer_destroy(vk, &bx);
+    qw6_vk_buffer_destroy(vk, &bw);
+    return rc;
+}
+
+static int qw6_vk_matmul_q6k(qw6_vk_t *vk, const void *w, const float *x,
+                             float *y, uint32_t rows, uint32_t cols) {
+    if (rows == 0 || cols == 0 || (cols % 256) != 0) return -1;
+    const uint32_t block_size = 210;
+    VkDeviceSize w_size = (VkDeviceSize)rows * (cols / 256) * block_size;
+    qw6_vk_buffer_t bw, bx, by;
+    if (qw6_vk_buffer_create(vk, &bw, w_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bx, cols * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bw);
+        return -1;
+    }
+    if (qw6_vk_buffer_create(vk, &by, rows * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bx);
+        qw6_vk_buffer_destroy(vk, &bw);
+        return -1;
+    }
+    memcpy(bw.mapped, w, (size_t)w_size);
+    memcpy(bx.mapped, x, cols * sizeof(float));
+    qw6_vk_buffer_t *bufs[3] = {&bw, &bx, &by};
+    qw6_vk_matvec_push_t push = {.rows = rows, .cols = cols};
+        int rc = qw6_vk_dispatch(vk, "vulkan/matmul_q6k.spv", bufs, NULL, 3,
+                             &push, sizeof(push), rows, 1, 1);
+    if (rc == 0) memcpy(y, by.mapped, rows * sizeof(float));
+    qw6_vk_buffer_destroy(vk, &by);
+    qw6_vk_buffer_destroy(vk, &bx);
+    qw6_vk_buffer_destroy(vk, &bw);
+    return rc;
+}
+
+static int qw6_vk_matmul_iq2xxs(qw6_vk_t *vk, const void *w, const float *x,
+                                float *y, uint32_t rows, uint32_t cols) {
+    if (rows == 0 || cols == 0 || (cols % 256) != 0) return -1;
+    const uint32_t block_size = 66;
+    VkDeviceSize w_size = (VkDeviceSize)rows * (cols / 256) * block_size;
+    qw6_vk_buffer_t bw, bx, by;
+    if (qw6_vk_buffer_create(vk, &bw, w_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bx, cols * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bw);
+        return -1;
+    }
+    if (qw6_vk_buffer_create(vk, &by, rows * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bx);
+        qw6_vk_buffer_destroy(vk, &bw);
+        return -1;
+    }
+    memcpy(bw.mapped, w, (size_t)w_size);
+    memcpy(bx.mapped, x, cols * sizeof(float));
+    qw6_vk_buffer_t *bufs[3] = {&bw, &bx, &by};
+    qw6_vk_matvec_push_t push = {.rows = rows, .cols = cols};
+        int rc = qw6_vk_dispatch(vk, "vulkan/matmul_iq2xxs.spv", bufs, NULL, 3,
+                             &push, sizeof(push), rows, 1, 1);
+    if (rc == 0) memcpy(y, by.mapped, rows * sizeof(float));
+    qw6_vk_buffer_destroy(vk, &by);
+    qw6_vk_buffer_destroy(vk, &bx);
+    qw6_vk_buffer_destroy(vk, &bw);
+    return rc;
+}
+
+static int qw6_vk_silu_mul(qw6_vk_t *vk, const float *gate, const float *up,
+                           float *out, uint32_t n) {
+    qw6_vk_buffer_t bg, bu, bo;
+    if (qw6_vk_buffer_create(vk, &bg, n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bu, n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bo, n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    memcpy(bg.mapped, gate, n * sizeof(float));
+    memcpy(bu.mapped, up, n * sizeof(float));
+    qw6_vk_buffer_t *bufs[3] = {&bg, &bu, &bo};
+    qw6_vk_n_push_t push = {.n = n};
+        int rc = qw6_vk_dispatch(vk, "vulkan/silu_mul.spv", bufs, NULL, 3,
+                             &push, sizeof(push), (n + 255) / 256, 1, 1);
+    if (rc == 0) memcpy(out, bo.mapped, n * sizeof(float));
+    qw6_vk_buffer_destroy(vk, &bo);
+    qw6_vk_buffer_destroy(vk, &bu);
+    qw6_vk_buffer_destroy(vk, &bg);
+    return rc;
+}
+
+static int qw6_vk_argmax(qw6_vk_t *vk, const float *x, uint32_t n,
+                         uint32_t *out_idx, float *out_val) {
+    qw6_vk_buffer_t bx, bout, bscratch;
+    if (qw6_vk_buffer_create(vk, &bx, n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bout, sizeof(qw6_vk_argmax_out_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bscratch, sizeof(qw6_vk_argmax_out_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    memcpy(bx.mapped, x, n * sizeof(float));
+    memset(bout.mapped, 0, sizeof(qw6_vk_argmax_out_t));
+    memset(bscratch.mapped, 0, sizeof(qw6_vk_argmax_out_t));
+    qw6_vk_buffer_t *bufs[3] = {&bx, &bout, &bscratch};
+    qw6_vk_n_push_t push = {.n = n};
+        int rc = qw6_vk_dispatch(vk, "vulkan/argmax.spv", bufs, NULL, 3,
+                             &push, sizeof(push), 1, 1, 1);
+    if (rc == 0) {
+        const qw6_vk_argmax_out_t *o = (const qw6_vk_argmax_out_t *)bout.mapped;
+        *out_idx = o->idx;
+        memcpy(out_val, &o->val_bits, sizeof(*out_val));
+    }
+    qw6_vk_buffer_destroy(vk, &bscratch);
+    qw6_vk_buffer_destroy(vk, &bout);
+    qw6_vk_buffer_destroy(vk, &bx);
+    return rc;
+}
+
+static int qw6_vk_sampling_greedy(qw6_vk_t *vk, const float *logits,
+                                  uint32_t n, uint32_t *token) {
+    if (n == 0) return -1;
+    qw6_vk_buffer_t bl, bo;
+    if (qw6_vk_buffer_create(vk, &bl, n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bo, sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bl);
+        return -1;
+    }
+    memcpy(bl.mapped, logits, n * sizeof(float));
+    memset(bo.mapped, 0, sizeof(uint32_t));
+    qw6_vk_buffer_t *bufs[2] = {&bl, &bo};
+    qw6_vk_n_push_t push = {.n = n};
+        int rc = qw6_vk_dispatch(vk, "vulkan/sampling.spv", bufs, NULL, 2,
+                             &push, sizeof(push), 1, 1, 1);
+    if (rc == 0) memcpy(token, bo.mapped, sizeof(uint32_t));
+    qw6_vk_buffer_destroy(vk, &bo);
+    qw6_vk_buffer_destroy(vk, &bl);
+    return rc;
+}
+
+static int qw6_vk_attention_gqa(qw6_vk_t *vk, const float *q,
+                                const float *k_cache, const float *v_cache,
+                                float *out, uint32_t seq_len,
+                                uint32_t n_q_heads, uint32_t n_kv_heads,
+                                uint32_t head_dim) {
+    if (seq_len == 0 || seq_len > 256 || n_q_heads == 0 ||
+        n_kv_heads == 0 || head_dim == 0 || n_q_heads % n_kv_heads != 0)
+        return -1;
+    size_t q_n = (size_t)n_q_heads * head_dim;
+    size_t kv_n = (size_t)seq_len * n_kv_heads * head_dim;
+    qw6_vk_buffer_t bq, bk, bv, bo;
+    if (qw6_vk_buffer_create(vk, &bq, q_n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bk, kv_n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bq);
+        return -1;
+    }
+    if (qw6_vk_buffer_create(vk, &bv, kv_n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bk);
+        qw6_vk_buffer_destroy(vk, &bq);
+        return -1;
+    }
+    if (qw6_vk_buffer_create(vk, &bo, q_n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bv);
+        qw6_vk_buffer_destroy(vk, &bk);
+        qw6_vk_buffer_destroy(vk, &bq);
+        return -1;
+    }
+    memcpy(bq.mapped, q, q_n * sizeof(float));
+    memcpy(bk.mapped, k_cache, kv_n * sizeof(float));
+    memcpy(bv.mapped, v_cache, kv_n * sizeof(float));
+    qw6_vk_buffer_t *bufs[4] = {&bq, &bk, &bv, &bo};
+    qw6_vk_attention_gqa_push_t push = {
+        .seq_len = seq_len,
+        .n_q_heads = n_q_heads,
+        .n_kv_heads = n_kv_heads,
+        .head_dim = head_dim,
+    };
+        int rc = qw6_vk_dispatch(vk, "vulkan/attention_gqa.spv", bufs, NULL, 4,
+                             &push, sizeof(push), n_q_heads, 1, 1);
+    if (rc == 0) memcpy(out, bo.mapped, q_n * sizeof(float));
+    qw6_vk_buffer_destroy(vk, &bo);
+    qw6_vk_buffer_destroy(vk, &bv);
+    qw6_vk_buffer_destroy(vk, &bk);
+    qw6_vk_buffer_destroy(vk, &bq);
+    return rc;
+}
+
+static int qw6_vk_moe_route(qw6_vk_t *vk, const float *logits,
+                            uint32_t *indices, float *weights,
+                            uint32_t n_experts, uint32_t top_k) {
+    if (n_experts == 0 || n_experts > 256 || top_k == 0 || top_k > n_experts || top_k > 8) return -1;
+
+    qw6_vk_buffer_t blogits, bindices, bweights;
+    if (qw6_vk_buffer_create(vk, &blogits, n_experts * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bindices, top_k * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bweights, top_k * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    memcpy(blogits.mapped, logits, n_experts * sizeof(float));
+    memset(bindices.mapped, 0, top_k * sizeof(uint32_t));
+    memset(bweights.mapped, 0, top_k * sizeof(float));
+    qw6_vk_buffer_t *bufs[3] = {&blogits, &bindices, &bweights};
+    qw6_vk_moe_route_push_t push = {.n_experts = n_experts, .top_k = top_k};
+        int rc = qw6_vk_dispatch(vk, "vulkan/moe_route.spv", bufs, NULL, 3,
+                             &push, sizeof(push), 1, 1, 1);
+    if (rc == 0) {
+        memcpy(indices, bindices.mapped, top_k * sizeof(uint32_t));
+        memcpy(weights, bweights.mapped, top_k * sizeof(float));
+    }
+    qw6_vk_buffer_destroy(vk, &bweights);
+    qw6_vk_buffer_destroy(vk, &bindices);
+    qw6_vk_buffer_destroy(vk, &blogits);
+    return rc;
+}
+
+static int qw6_vk_moe_gather(qw6_vk_t *vk, const float *expert_out,
+                             const float *expert_weights,
+                             const float *shared_out, float shared_weight,
+                             float *out, uint32_t dim, uint32_t top_k) {
+    if (dim == 0 || top_k == 0 || top_k > 8) return -1;
+    qw6_vk_buffer_t be, bw, bs, bo;
+    if (qw6_vk_buffer_create(vk, &be, (VkDeviceSize)top_k * dim * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bw, top_k * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &be);
+        return -1;
+    }
+    if (qw6_vk_buffer_create(vk, &bs, dim * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bw);
+        qw6_vk_buffer_destroy(vk, &be);
+        return -1;
+    }
+    if (qw6_vk_buffer_create(vk, &bo, dim * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bs);
+        qw6_vk_buffer_destroy(vk, &bw);
+        qw6_vk_buffer_destroy(vk, &be);
+        return -1;
+    }
+    memcpy(be.mapped, expert_out, (size_t)top_k * dim * sizeof(float));
+    memcpy(bw.mapped, expert_weights, top_k * sizeof(float));
+    if (shared_out) memcpy(bs.mapped, shared_out, dim * sizeof(float));
+    else memset(bs.mapped, 0, dim * sizeof(float));
+    qw6_vk_buffer_t *bufs[4] = {&be, &bw, &bs, &bo};
+    qw6_vk_moe_gather_push_t push = {
+        .dim = dim,
+        .top_k = top_k,
+        .has_shared = shared_out ? 1u : 0u,
+        .shared_weight = shared_weight,
+    };
+        int rc = qw6_vk_dispatch(vk, "vulkan/moe_gather.spv", bufs, NULL, 4,
+                             &push, sizeof(push), (dim + 255) / 256, 1, 1);
+    if (rc == 0) memcpy(out, bo.mapped, dim * sizeof(float));
+    qw6_vk_buffer_destroy(vk, &bo);
+    qw6_vk_buffer_destroy(vk, &bs);
+    qw6_vk_buffer_destroy(vk, &bw);
+    qw6_vk_buffer_destroy(vk, &be);
+    return rc;
+}
+
+static int qw6_vk_deltanet_conv1d(qw6_vk_t *vk, const float *x,
+                                  const uint16_t *w, float *out,
+                                  uint32_t dim, uint32_t kernel_size) {
+    if (dim == 0 || kernel_size == 0) return -1;
+    uint32_t n_weights = dim * kernel_size;
+    uint32_t n_words = (n_weights + 1) / 2;
+    uint32_t *packed = calloc(n_words, sizeof(uint32_t));
+    if (!packed) return -1;
+    for (uint32_t i = 0; i < n_weights; i++) {
+        uint32_t shift = (i & 1) ? 16u : 0u;
+        packed[i >> 1] |= (uint32_t)w[i] << shift;
+    }
+
+    qw6_vk_buffer_t bx, bw, bo;
+    if (qw6_vk_buffer_create(vk, &bx, dim * kernel_size * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        free(packed);
+        return -1;
+    }
+    if (qw6_vk_buffer_create(vk, &bw, n_words * sizeof(uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bx);
+        free(packed);
+        return -1;
+    }
+    if (qw6_vk_buffer_create(vk, &bo, dim * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bw);
+        qw6_vk_buffer_destroy(vk, &bx);
+        free(packed);
+        return -1;
+    }
+    memcpy(bx.mapped, x, dim * kernel_size * sizeof(float));
+    memcpy(bw.mapped, packed, n_words * sizeof(uint32_t));
+    free(packed);
+    qw6_vk_buffer_t *bufs[3] = {&bx, &bw, &bo};
+    qw6_vk_conv1d_push_t push = {.dim = dim, .kernel_size = kernel_size};
+        int rc = qw6_vk_dispatch(vk, "vulkan/deltanet_conv1d.spv", bufs, NULL, 3,
+                             &push, sizeof(push), (dim + 255) / 256, 1, 1);
+    if (rc == 0) memcpy(out, bo.mapped, dim * sizeof(float));
+    qw6_vk_buffer_destroy(vk, &bo);
+    qw6_vk_buffer_destroy(vk, &bw);
+    qw6_vk_buffer_destroy(vk, &bx);
+    return rc;
+}
+
+static int qw6_vk_deltanet_retrieve(qw6_vk_t *vk, const float *state,
+                                    const float *query, float *out,
+                                    uint32_t key_heads, uint32_t key_dim,
+                                    uint32_t val_heads, uint32_t val_dim) {
+    if (key_heads == 0 || key_dim == 0 || val_heads == 0 || val_dim == 0) return -1;
+    size_t state_n = (size_t)key_heads * key_dim * val_heads * val_dim;
+    size_t query_n = (size_t)key_heads * key_dim;
+    size_t out_n = (size_t)val_heads * val_dim;
+
+    qw6_vk_buffer_t bs, bq, bo;
+    if (qw6_vk_buffer_create(vk, &bs, state_n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bq, query_n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bs);
+        return -1;
+    }
+    if (qw6_vk_buffer_create(vk, &bo, out_n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bq);
+        qw6_vk_buffer_destroy(vk, &bs);
+        return -1;
+    }
+    memcpy(bs.mapped, state, state_n * sizeof(float));
+    memcpy(bq.mapped, query, query_n * sizeof(float));
+    qw6_vk_buffer_t *bufs[3] = {&bs, &bq, &bo};
+    qw6_vk_deltanet_push_t push = {
+        .key_heads = key_heads,
+        .key_dim = key_dim,
+        .val_heads = val_heads,
+        .val_dim = val_dim,
+        .has_beta = 0,
+    };
+        int rc = qw6_vk_dispatch(vk, "vulkan/deltanet_retrieve.spv", bufs, NULL, 3,
+                             &push, sizeof(push), (uint32_t)((out_n + 255) / 256), 1, 1);
+    if (rc == 0) memcpy(out, bo.mapped, out_n * sizeof(float));
+    qw6_vk_buffer_destroy(vk, &bo);
+    qw6_vk_buffer_destroy(vk, &bq);
+    qw6_vk_buffer_destroy(vk, &bs);
+    return rc;
+}
+
+static int qw6_vk_deltanet_update(qw6_vk_t *vk, float *state,
+                                  const float *key, const float *value,
+                                  const float *query, const float *beta,
+                                  uint32_t key_heads, uint32_t key_dim,
+                                  uint32_t val_heads, uint32_t val_dim) {
+    if (key_heads == 0 || key_dim == 0 || val_heads == 0 || val_dim == 0) return -1;
+    size_t state_n = (size_t)key_heads * key_dim * val_heads * val_dim;
+    size_t key_n = (size_t)key_heads * key_dim;
+    size_t value_n = (size_t)val_heads * val_dim;
+
+    qw6_vk_buffer_t bs, bk, bv, bq, bbeta;
+    if (qw6_vk_buffer_create(vk, &bs, state_n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bk, key_n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bs);
+        return -1;
+    }
+    if (qw6_vk_buffer_create(vk, &bv, value_n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bk);
+        qw6_vk_buffer_destroy(vk, &bs);
+        return -1;
+    }
+    if (qw6_vk_buffer_create(vk, &bq, key_n * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bv);
+        qw6_vk_buffer_destroy(vk, &bk);
+        qw6_vk_buffer_destroy(vk, &bs);
+        return -1;
+    }
+    if (qw6_vk_buffer_create(vk, &bbeta, key_heads * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bq);
+        qw6_vk_buffer_destroy(vk, &bv);
+        qw6_vk_buffer_destroy(vk, &bk);
+        qw6_vk_buffer_destroy(vk, &bs);
+        return -1;
+    }
+    memcpy(bs.mapped, state, state_n * sizeof(float));
+    memcpy(bk.mapped, key, key_n * sizeof(float));
+    memcpy(bv.mapped, value, value_n * sizeof(float));
+    memcpy(bq.mapped, query, key_n * sizeof(float));
+    if (beta) memcpy(bbeta.mapped, beta, key_heads * sizeof(float));
+    else memset(bbeta.mapped, 0, key_heads * sizeof(float));
+    qw6_vk_buffer_t *bufs[5] = {&bs, &bk, &bv, &bq, &bbeta};
+    qw6_vk_deltanet_push_t push = {
+        .key_heads = key_heads,
+        .key_dim = key_dim,
+        .val_heads = val_heads,
+        .val_dim = val_dim,
+        .has_beta = beta ? 1u : 0u,
+    };
+        int rc = qw6_vk_dispatch(vk, "vulkan/deltanet_update.spv", bufs, NULL, 5,
+                             &push, sizeof(push), (uint32_t)((state_n + 255) / 256), 1, 1);
+    if (rc == 0) memcpy(state, bs.mapped, state_n * sizeof(float));
+    qw6_vk_buffer_destroy(vk, &bbeta);
+    qw6_vk_buffer_destroy(vk, &bq);
+    qw6_vk_buffer_destroy(vk, &bv);
+    qw6_vk_buffer_destroy(vk, &bk);
+    qw6_vk_buffer_destroy(vk, &bs);
+    return rc;
+}
+
+static int qw6_vk_mrope(qw6_vk_t *vk, float *q, float *k,
+                        uint32_t q_dim, uint32_t kv_dim,
+                        uint32_t n_heads, uint32_t n_kv_heads,
+                        uint32_t position, uint32_t rotary_dim) {
+    if (q_dim == 0 || kv_dim == 0 || n_heads == 0 || n_kv_heads == 0) return -1;
+    if (q_dim % n_heads != 0 || kv_dim % n_kv_heads != 0) return -1;
+
+    uint32_t q_head_dim = q_dim / n_heads;
+    uint32_t k_head_dim = kv_dim / n_kv_heads;
+    uint32_t q_rot = rotary_dim < q_head_dim ? rotary_dim : q_head_dim;
+    uint32_t k_rot = rotary_dim < k_head_dim ? rotary_dim : k_head_dim;
+    uint32_t q_pairs = n_heads * (q_rot / 2);
+    uint32_t k_pairs = n_kv_heads * (k_rot / 2);
+    uint32_t total_pairs = q_pairs + k_pairs;
+    if (total_pairs == 0) return 0;
+
+    qw6_vk_buffer_t bq, bk;
+    if (qw6_vk_buffer_create(vk, &bq, q_dim * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bk, kv_dim * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    memcpy(bq.mapped, q, q_dim * sizeof(float));
+    memcpy(bk.mapped, k, kv_dim * sizeof(float));
+    qw6_vk_buffer_t *bufs[2] = {&bq, &bk};
+    qw6_vk_mrope_push_t push = {
+        .q_dim = q_dim,
+        .kv_dim = kv_dim,
+        .n_heads = n_heads,
+        .n_kv_heads = n_kv_heads,
+        .position = position,
+        .q_head_dim = q_head_dim,
+        .k_head_dim = k_head_dim,
+        .q_rot = q_rot,
+        .k_rot = k_rot,
+        .theta_base = QW6_ROPE_THETA,
+    };
+        int rc = qw6_vk_dispatch(vk, "vulkan/rope_mrope.spv", bufs, NULL, 2,
+                             &push, sizeof(push), (total_pairs + 255) / 256, 1, 1);
+    if (rc == 0) {
+        memcpy(q, bq.mapped, q_dim * sizeof(float));
+        memcpy(k, bk.mapped, kv_dim * sizeof(float));
+    }
+    qw6_vk_buffer_destroy(vk, &bk);
+    qw6_vk_buffer_destroy(vk, &bq);
+    return rc;
+}
+
+static int qw6_vk_mtp_draft(qw6_vk_t *vk, const float *w, const float *hidden,
+                            float *logits, uint32_t vocab_size,
+                            uint32_t hidden_size) {
+    if (vocab_size == 0 || hidden_size == 0) return -1;
+    qw6_vk_buffer_t bw, bh, bl;
+    if (qw6_vk_buffer_create(vk, &bw, (VkDeviceSize)vocab_size * hidden_size * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) return -1;
+    if (qw6_vk_buffer_create(vk, &bh, hidden_size * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bw);
+        return -1;
+    }
+    if (qw6_vk_buffer_create(vk, &bl, vocab_size * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_buffer_destroy(vk, &bh);
+        qw6_vk_buffer_destroy(vk, &bw);
+        return -1;
+    }
+    memcpy(bw.mapped, w, (size_t)vocab_size * hidden_size * sizeof(float));
+    memcpy(bh.mapped, hidden, hidden_size * sizeof(float));
+    qw6_vk_buffer_t *bufs[3] = {&bw, &bh, &bl};
+    qw6_vk_matvec_push_t push = {.rows = vocab_size, .cols = hidden_size};
+        int rc = qw6_vk_dispatch(vk, "vulkan/mtp_draft.spv", bufs, NULL, 3,
+                             &push, sizeof(push), vocab_size, 1, 1);
+    if (rc == 0) memcpy(logits, bl.mapped, vocab_size * sizeof(float));
+    qw6_vk_buffer_destroy(vk, &bl);
+    qw6_vk_buffer_destroy(vk, &bh);
     qw6_vk_buffer_destroy(vk, &bw);
     return rc;
 }
@@ -392,11 +1009,171 @@ int qw6_vk_matvec_f32_host(const float *w, const float *x, float *y,
     return rc;
 }
 
+int qw6_vk_matmul_q4k_host(const void *w, const float *x, float *y,
+                           uint32_t rows, uint32_t cols) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_matmul_q4k(&vk, w, x, y, rows, cols);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
+int qw6_vk_matmul_q5k_host(const void *w, const float *x, float *y,
+                           uint32_t rows, uint32_t cols) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_matmul_q5k(&vk, w, x, y, rows, cols);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
+int qw6_vk_matmul_q6k_host(const void *w, const float *x, float *y,
+                           uint32_t rows, uint32_t cols) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_matmul_q6k(&vk, w, x, y, rows, cols);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
+int qw6_vk_matmul_iq2xxs_host(const void *w, const float *x, float *y,
+                              uint32_t rows, uint32_t cols) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_matmul_iq2xxs(&vk, w, x, y, rows, cols);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
 int qw6_vk_rmsnorm_host(const float *x, const float *w, float *y,
                         uint32_t n, float eps) {
     qw6_vk_t vk;
     if (qw6_vk_init(&vk) != 0) return -1;
     int rc = qw6_vk_rmsnorm(&vk, x, w, y, n, eps);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
+int qw6_vk_rmsnorm_chunked_host(const float *x, const float *w, float *y,
+                                uint32_t n, float eps, uint32_t n_groups) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_rmsnorm_chunked(&vk, x, w, y, n, eps, n_groups);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
+int qw6_vk_silu_mul_host(const float *gate, const float *up, float *out,
+                         uint32_t n) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_silu_mul(&vk, gate, up, out, n);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
+int qw6_vk_argmax_host(const float *x, uint32_t n, uint32_t *out_idx,
+                       float *out_val) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_argmax(&vk, x, n, out_idx, out_val);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
+int qw6_vk_sampling_greedy_host(const float *logits, uint32_t n,
+                                uint32_t *token) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_sampling_greedy(&vk, logits, n, token);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
+int qw6_vk_attention_gqa_host(const float *q, const float *k_cache,
+                              const float *v_cache, float *out,
+                              uint32_t seq_len, uint32_t n_q_heads,
+                              uint32_t n_kv_heads, uint32_t head_dim) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_attention_gqa(&vk, q, k_cache, v_cache, out, seq_len,
+                                  n_q_heads, n_kv_heads, head_dim);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
+int qw6_vk_moe_route_host(const float *logits, uint32_t *indices,
+                          float *weights, uint32_t n_experts,
+                          uint32_t top_k) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_moe_route(&vk, logits, indices, weights, n_experts, top_k);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
+int qw6_vk_moe_gather_host(const float *expert_out,
+                           const float *expert_weights,
+                           const float *shared_out, float shared_weight,
+                           float *out, uint32_t dim, uint32_t top_k) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_moe_gather(&vk, expert_out, expert_weights, shared_out,
+                               shared_weight, out, dim, top_k);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
+int qw6_vk_deltanet_conv1d_host(const float *x, const uint16_t *w, float *out,
+                                uint32_t dim, uint32_t kernel_size) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_deltanet_conv1d(&vk, x, w, out, dim, kernel_size);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
+int qw6_vk_deltanet_retrieve_host(const float *state, const float *query,
+                                  float *out, uint32_t key_heads,
+                                  uint32_t key_dim, uint32_t val_heads,
+                                  uint32_t val_dim) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_deltanet_retrieve(&vk, state, query, out, key_heads,
+                                      key_dim, val_heads, val_dim);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
+int qw6_vk_deltanet_update_host(float *state, const float *key,
+                                const float *value, const float *query,
+                                const float *beta, uint32_t key_heads,
+                                uint32_t key_dim, uint32_t val_heads,
+                                uint32_t val_dim) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_deltanet_update(&vk, state, key, value, query, beta,
+                                    key_heads, key_dim, val_heads, val_dim);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
+int qw6_vk_mrope_host(float *q, float *k, uint32_t q_dim, uint32_t kv_dim,
+                      uint32_t n_heads, uint32_t n_kv_heads,
+                      uint32_t position, uint32_t rotary_dim) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_mrope(&vk, q, k, q_dim, kv_dim, n_heads, n_kv_heads,
+                          position, rotary_dim);
+    qw6_vk_free(&vk);
+    return rc;
+}
+
+int qw6_vk_mtp_draft_host(const float *w, const float *hidden, float *logits,
+                          uint32_t vocab_size, uint32_t hidden_size) {
+    qw6_vk_t vk;
+    if (qw6_vk_init(&vk) != 0) return -1;
+    int rc = qw6_vk_mtp_draft(&vk, w, hidden, logits, vocab_size, hidden_size);
     qw6_vk_free(&vk);
     return rc;
 }
@@ -546,6 +1323,11 @@ static int qw6_vk_vec_add(qw6_vk_t *vk, const float *a, const float *b,
     return 0;
 }
 
+static void qw6_vk_put_u16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xffu);
+    p[1] = (uint8_t)(v >> 8);
+}
+
 int qw6_vk_selftest(void) {
     qw6_vk_t vk;
     if (qw6_vk_init(&vk) != 0) return 1;
@@ -593,6 +1375,30 @@ int qw6_vk_selftest(void) {
         }
     }
 
+    const uint32_t crn = 4099, crg = 8;
+    float *crx = calloc(crn, sizeof(float));
+    float *crw = calloc(crn, sizeof(float));
+    float *cry = calloc(crn, sizeof(float));
+    if (!crx || !crw || !cry) fail = 1;
+    if (!fail) {
+        double ss = 0.0;
+        for (uint32_t i = 0; i < crn; i++) {
+            crx[i] = sinf((float)i * 0.009f) + 0.1f * cosf((float)i * 0.017f);
+            crw[i] = 0.5f + 0.0002f * (float)(i % 23);
+            ss += (double)crx[i] * crx[i];
+        }
+        fail = qw6_vk_rmsnorm_chunked(&vk, crx, crw, cry, crn, 1e-6f, crg) != 0;
+        float scale = 1.0f / sqrtf((float)(ss / crn) + 1e-6f);
+        for (uint32_t i = 0; i < crn && !fail; i++) {
+            float expected = crx[i] * scale * crw[i];
+            if (fabsf(cry[i] - expected) > 2e-5f) {
+                fprintf(stderr, "qw6_vk: rmsnorm_chunked mismatch at %u got %.6f expected %.6f\n",
+                        i, cry[i], expected);
+                fail = 1;
+            }
+        }
+    }
+
     const uint32_t rows = 7, cols = 19;
     float *mw = calloc(rows * cols, sizeof(float));
     float *mx = calloc(cols, sizeof(float));
@@ -617,15 +1423,523 @@ int qw6_vk_selftest(void) {
         }
     }
 
+    const uint32_t q4_rows = 3, q4_cols = 256, q4_block = 144;
+    uint8_t *q4w = calloc((size_t)q4_rows * q4_block, 1);
+    float *q4x = calloc(q4_cols, sizeof(float));
+    float *q4y = calloc(q4_rows, sizeof(float));
+    float q4_expected[3] = {0};
+    if (!q4w || !q4x || !q4y) fail = 1;
+    if (!fail) {
+        for (uint32_t c = 0; c < q4_cols; c++)
+            q4x[c] = sinf((float)c * 0.031f);
+        for (uint32_t r = 0; r < q4_rows; r++) {
+            uint8_t *blk = q4w + (size_t)r * q4_block;
+            qw6_vk_put_u16(blk + 0, 0x3c00); /* d = 1.0 */
+            qw6_vk_put_u16(blk + 2, 0x0000); /* dmin = 0.0 */
+            for (uint32_t j = 0; j < 8; j++) {
+                uint8_t sc = 1;
+                if (j < 4) blk[4 + j] = sc;
+                else blk[8 + j] = sc;
+            }
+            for (uint32_t c = 0; c < q4_cols; c++) {
+                uint32_t group64 = c >> 6;
+                uint32_t sub = (c >> 5) & 1u;
+                uint32_t off = 16 + group64 * 32 + (c & 31u);
+                uint8_t qv = (uint8_t)((r * 3 + c * 5 + 7) & 15u);
+                if (sub == 0) blk[off] = (uint8_t)((blk[off] & 0xf0u) | qv);
+                else blk[off] = (uint8_t)((blk[off] & 0x0fu) | (qv << 4));
+                uint32_t sj = group64 * 2 + sub;
+                uint8_t sc = sj < 4
+                    ? (uint8_t)(blk[4 + sj] & 63u)
+                    : (uint8_t)((blk[8 + sj] & 0x0fu) | ((blk[sj] >> 6) << 4));
+                q4_expected[r] += (float)sc * (float)qv * q4x[c];
+            }
+        }
+        fail = qw6_vk_matmul_q4k(&vk, q4w, q4x, q4y, q4_rows, q4_cols) != 0;
+        for (uint32_t r = 0; r < q4_rows && !fail; r++) {
+            if (fabsf(q4y[r] - q4_expected[r]) > 1e-2f) {
+                fprintf(stderr, "qw6_vk: matmul_q4k mismatch row %u got %.6f expected %.6f\n",
+                        r, q4y[r], q4_expected[r]);
+                fail = 1;
+            }
+        }
+    }
+
+    const uint32_t q5_rows = 3, q5_cols = 256, q5_block = 176;
+    uint8_t *q5w = calloc((size_t)q5_rows * q5_block, 1);
+    float *q5x = calloc(q5_cols, sizeof(float));
+    float *q5y = calloc(q5_rows, sizeof(float));
+    float q5_expected[3] = {0};
+    if (!q5w || !q5x || !q5y) fail = 1;
+    if (!fail) {
+        for (uint32_t c = 0; c < q5_cols; c++)
+            q5x[c] = cosf((float)c * 0.027f);
+        for (uint32_t r = 0; r < q5_rows; r++) {
+            uint8_t *blk = q5w + (size_t)r * q5_block;
+            qw6_vk_put_u16(blk + 0, 0x3c00); /* d = 1.0 */
+            qw6_vk_put_u16(blk + 2, 0x0000); /* dmin = 0.0 */
+            for (uint32_t j = 0; j < 8; j++) {
+                uint8_t sc = 1;
+                if (j < 4) blk[4 + j] = sc;
+                else blk[8 + j] = sc;
+            }
+            for (uint32_t c = 0; c < q5_cols; c++) {
+                uint32_t group64 = c >> 6;
+                uint32_t sub = (c >> 5) & 1u;
+                uint32_t lane = c & 31u;
+                uint32_t off = 48 + group64 * 32 + lane;
+                uint8_t qv = (uint8_t)((r * 7 + c * 3 + 5) & 31u);
+                if (sub == 0) blk[off] = (uint8_t)((blk[off] & 0xf0u) | (qv & 15u));
+                else blk[off] = (uint8_t)((blk[off] & 0x0fu) | ((qv & 15u) << 4));
+                if (qv & 16u) blk[16 + lane] |= (uint8_t)(1u << (group64 * 2 + sub));
+            }
+            const uint8_t *ql = blk + 48;
+            const uint8_t *qh = blk + 16;
+            uint8_t u1 = 1, u2 = 2;
+            for (uint32_t group64 = 0; group64 < 4; group64++) {
+                for (uint32_t lane = 0; lane < 32; lane++) {
+                    uint32_t qv = (ql[lane] & 0x0fu) + ((qh[lane] & u1) ? 16u : 0u);
+                    q5_expected[r] += (float)qv * q5x[group64 * 64 + lane];
+                }
+                for (uint32_t lane = 0; lane < 32; lane++) {
+                    uint32_t qv = (ql[lane] >> 4) + ((qh[lane] & u2) ? 16u : 0u);
+                    q5_expected[r] += (float)qv * q5x[group64 * 64 + 32 + lane];
+                }
+                ql += 32;
+                u1 <<= 2;
+                u2 <<= 2;
+            }
+        }
+        fail = qw6_vk_matmul_q5k(&vk, q5w, q5x, q5y, q5_rows, q5_cols) != 0;
+        for (uint32_t r = 0; r < q5_rows && !fail; r++) {
+            if (fabsf(q5y[r] - q5_expected[r]) > 1e-2f) {
+                fprintf(stderr, "qw6_vk: matmul_q5k mismatch row %u got %.6f expected %.6f\n",
+                        r, q5y[r], q5_expected[r]);
+                fail = 1;
+            }
+        }
+    }
+
+    const uint32_t q6_rows = 3, q6_cols = 256, q6_block = 210;
+    uint8_t *q6w = calloc((size_t)q6_rows * q6_block, 1);
+    float *q6x = calloc(q6_cols, sizeof(float));
+    float *q6y = calloc(q6_rows, sizeof(float));
+    float q6_expected[3] = {0};
+    if (!q6w || !q6x || !q6y) fail = 1;
+    if (!fail) {
+        for (uint32_t c = 0; c < q6_cols; c++)
+            q6x[c] = sinf((float)c * 0.019f) + 0.2f * cosf((float)c * 0.013f);
+        for (uint32_t r = 0; r < q6_rows; r++) {
+            uint8_t *blk = q6w + (size_t)r * q6_block;
+            qw6_vk_put_u16(blk + 208, 0x3c00); /* d = 1.0 */
+            for (uint32_t i = 0; i < 16; i++) blk[192 + i] = 1;
+            for (uint32_t c = 0; c < q6_cols; c++) {
+                uint32_t half = c >> 7;
+                uint32_t in_half = c & 127u;
+                uint32_t lane = in_half & 31u;
+                uint32_t quad = in_half >> 5;
+                int qv = (int)((r * 11 + c * 7 + 9) & 63u) - 32;
+                uint32_t u = (uint32_t)(qv + 32);
+                uint32_t ql_off = half * 64 + lane + ((quad == 1 || quad == 3) ? 32 : 0);
+                uint32_t qh_off = 128 + half * 32 + lane;
+                if (quad < 2) blk[ql_off] = (uint8_t)((blk[ql_off] & 0xf0u) | (u & 15u));
+                else blk[ql_off] = (uint8_t)((blk[ql_off] & 0x0fu) | ((u & 15u) << 4));
+                blk[qh_off] |= (uint8_t)(((u >> 4) & 3u) << (quad * 2));
+                q6_expected[r] += (float)qv * q6x[c];
+            }
+        }
+        fail = qw6_vk_matmul_q6k(&vk, q6w, q6x, q6y, q6_rows, q6_cols) != 0;
+        for (uint32_t r = 0; r < q6_rows && !fail; r++) {
+            if (fabsf(q6y[r] - q6_expected[r]) > 1e-2f) {
+                fprintf(stderr, "qw6_vk: matmul_q6k mismatch row %u got %.6f expected %.6f\n",
+                        r, q6y[r], q6_expected[r]);
+                fail = 1;
+            }
+        }
+    }
+
+    /* IQ2_XXS matmul self-test */
+    {
+        const uint32_t iq_rows = 3, iq_cols = 256, iq_block = 66;
+        uint8_t *iqw = calloc((size_t)iq_rows * iq_block, 1);
+        float *iqx = calloc(iq_cols, sizeof(float));
+        float *iqy = calloc(iq_rows, sizeof(float));
+        float iq_expected[3] = {0};
+        if (!iqw || !iqx || !iqy) fail = 1;
+        if (!fail) {
+            for (uint32_t c = 0; c < iq_cols; c++)
+                iqx[c] = sinf((float)c * 0.029f) + 0.15f * cosf((float)c * 0.017f);
+            for (uint32_t r = 0; r < iq_rows; r++) {
+                uint8_t *blk = iqw + (size_t)r * iq_block;
+                float d_val = 1.0f + 0.5f * (float)r;
+                qw6_vk_put_u16(blk + 0, 0x3c00); /* d = 1.0 (overwrite below for r>0) */
+                if (r == 1) qw6_vk_put_u16(blk + 0, 0x3e00); /* d = 1.5 */
+                if (r == 2) qw6_vk_put_u16(blk + 0, 0x4000); /* d = 2.0 */
+                d_val = (r == 0) ? 1.0f : (r == 1) ? 1.5f : 2.0f;
+                /* Fill all 8 ib32 sub-blocks with grid_idx=0, sign_idx=0, scale_extra=0 */
+                for (uint32_t ib = 0; ib < 8; ib++) {
+                    uint32_t ib_off = 2 + ib * 8;
+                    /* aux32[0] = 4 grid indices all 0 */
+                    memset(blk + ib_off, 0, 4);
+                    /* aux32[1] = 0 (sign idx all 0, scale_extra=0) */
+                    memset(blk + ib_off + 4, 0, 4);
+                }
+                /* Compute expected: each dequantized value = d * 0.125 * 8 = d */
+                for (uint32_t c = 0; c < iq_cols; c++)
+                    iq_expected[r] += d_val * iqx[c];
+            }
+            fail = qw6_vk_matmul_iq2xxs(&vk, iqw, iqx, iqy, iq_rows, iq_cols) != 0;
+            for (uint32_t r = 0; r < iq_rows && !fail; r++) {
+                if (fabsf(iqy[r] - iq_expected[r]) > 2e-2f) {
+                    fprintf(stderr,
+                            "qw6_vk: matmul_iq2xxs mismatch row %u got %.6f expected %.6f\n",
+                            r, iqy[r], iq_expected[r]);
+                    fail = 1;
+                }
+            }
+        }
+        free(iqy);
+        free(iqx);
+        free(iqw);
+    }
+
+    const uint32_t sn = 513;
+    float *sg = calloc(sn, sizeof(float));
+    float *su = calloc(sn, sizeof(float));
+    float *so = calloc(sn, sizeof(float));
+    if (!sg || !su || !so) fail = 1;
+    if (!fail) {
+        for (uint32_t i = 0; i < sn; i++) {
+            sg[i] = ((float)(int)(i % 31) - 15.0f) * 0.125f;
+            su[i] = cosf((float)i * 0.031f);
+        }
+        fail = qw6_vk_silu_mul(&vk, sg, su, so, sn) != 0;
+        for (uint32_t i = 0; i < sn && !fail; i++) {
+            float expected = (sg[i] / (1.0f + expf(-sg[i]))) * su[i];
+            if (fabsf(so[i] - expected) > 2e-5f) {
+                fprintf(stderr, "qw6_vk: silu_mul mismatch at %u got %.6f expected %.6f\n",
+                        i, so[i], expected);
+                fail = 1;
+            }
+        }
+    }
+
+    const uint32_t an = 4097;
+    float *ax = calloc(an, sizeof(float));
+    if (!ax) fail = 1;
+    if (!fail) {
+        uint32_t got_idx = 0;
+        float got_val = 0.0f;
+        for (uint32_t i = 0; i < an; i++) ax[i] = sinf((float)i * 0.019f) - (float)(i % 7) * 0.01f;
+        ax[3079] = 42.0f;
+        fail = qw6_vk_argmax(&vk, ax, an, &got_idx, &got_val) != 0;
+        if (!fail && (got_idx != 3079 || fabsf(got_val - 42.0f) > 1e-6f)) {
+            fprintf(stderr, "qw6_vk: argmax mismatch got idx=%u val=%.6f expected idx=3079 val=42.000000\n",
+                    got_idx, got_val);
+            fail = 1;
+        }
+    }
+
+    const uint32_t gn = 1029;
+    float *gx = calloc(gn, sizeof(float));
+    if (!gx) fail = 1;
+    if (!fail) {
+        uint32_t token = 0;
+        for (uint32_t i = 0; i < gn; i++)
+            gx[i] = cosf((float)i * 0.023f) - 0.001f * (float)i;
+        gx[877] = 11.0f;
+        fail = qw6_vk_sampling_greedy(&vk, gx, gn, &token) != 0;
+        if (!fail && token != 877) {
+            fprintf(stderr, "qw6_vk: sampling_greedy mismatch got %u expected 877\n", token);
+            fail = 1;
+        }
+    }
+
+    const uint32_t q_dim = 64, kv_dim = 16, q_heads = 4, kv_heads = 1, rot = 8;
+    float *mq_cpu = calloc(q_dim, sizeof(float));
+    float *mk_cpu = calloc(kv_dim, sizeof(float));
+    float *mq_gpu = calloc(q_dim, sizeof(float));
+    float *mk_gpu = calloc(kv_dim, sizeof(float));
+    if (!mq_cpu || !mk_cpu || !mq_gpu || !mk_gpu) fail = 1;
+    if (!fail) {
+        for (uint32_t i = 0; i < q_dim; i++) mq_cpu[i] = sinf((float)i * 0.07f);
+        for (uint32_t i = 0; i < kv_dim; i++) mk_cpu[i] = cosf((float)i * 0.11f);
+        memcpy(mq_gpu, mq_cpu, q_dim * sizeof(float));
+        memcpy(mk_gpu, mk_cpu, kv_dim * sizeof(float));
+        qw6_cpu_mrope(mq_cpu, mk_cpu, (int)q_dim, (int)kv_dim,
+                      (int)q_heads, (int)kv_heads, 17, (int)rot);
+        fail = qw6_vk_mrope(&vk, mq_gpu, mk_gpu, q_dim, kv_dim,
+                            q_heads, kv_heads, 17, rot) != 0;
+        for (uint32_t i = 0; i < q_dim && !fail; i++) {
+            if (fabsf(mq_gpu[i] - mq_cpu[i]) > 2e-5f) {
+                fprintf(stderr, "qw6_vk: mrope q mismatch at %u got %.6f expected %.6f\n",
+                        i, mq_gpu[i], mq_cpu[i]);
+                fail = 1;
+            }
+        }
+        for (uint32_t i = 0; i < kv_dim && !fail; i++) {
+            if (fabsf(mk_gpu[i] - mk_cpu[i]) > 2e-5f) {
+                fprintf(stderr, "qw6_vk: mrope k mismatch at %u got %.6f expected %.6f\n",
+                        i, mk_gpu[i], mk_cpu[i]);
+                fail = 1;
+            }
+        }
+    }
+
+    const uint32_t as = 5, aqh = 4, akvh = 2, ahd = 8;
+    float *aq = calloc(aqh * ahd, sizeof(float));
+    float *ak = calloc(as * akvh * ahd, sizeof(float));
+    float *av = calloc(as * akvh * ahd, sizeof(float));
+    float *ao_cpu = calloc(aqh * ahd, sizeof(float));
+    float *ao_gpu = calloc(aqh * ahd, sizeof(float));
+    if (!aq || !ak || !av || !ao_cpu || !ao_gpu) fail = 1;
+    if (!fail) {
+        for (uint32_t i = 0; i < aqh * ahd; i++) aq[i] = sinf((float)i * 0.071f);
+        for (uint32_t i = 0; i < as * akvh * ahd; i++) {
+            ak[i] = cosf((float)i * 0.037f);
+            av[i] = sinf((float)i * 0.053f) + 0.25f * cosf((float)i * 0.011f);
+        }
+        qw6_cpu_attention_gqa(ao_cpu, aq, ak, av, (int)as, (int)aqh,
+                              (int)akvh, (int)ahd);
+        fail = qw6_vk_attention_gqa(&vk, aq, ak, av, ao_gpu, as, aqh, akvh, ahd) != 0;
+        for (uint32_t i = 0; i < aqh * ahd && !fail; i++) {
+            if (fabsf(ao_gpu[i] - ao_cpu[i]) > 2e-5f) {
+                fprintf(stderr,
+                        "qw6_vk: attention_gqa mismatch at %u got %.6f expected %.6f\n",
+                        i, ao_gpu[i], ao_cpu[i]);
+                fail = 1;
+            }
+        }
+    }
+
+    const uint32_t en = 256, top_k = 8;
+    float *elogits = calloc(en, sizeof(float));
+    int *eidx_cpu = calloc(top_k, sizeof(int));
+    float *ew_cpu = calloc(top_k, sizeof(float));
+    uint32_t *eidx_gpu = calloc(top_k, sizeof(uint32_t));
+    float *ew_gpu = calloc(top_k, sizeof(float));
+    if (!elogits || !eidx_cpu || !ew_cpu || !eidx_gpu || !ew_gpu) fail = 1;
+    if (!fail) {
+        for (uint32_t i = 0; i < en; i++)
+            elogits[i] = sinf((float)i * 0.17f) + cosf((float)i * 0.031f);
+        elogits[7] = 5.0f;
+        elogits[149] = 4.5f;
+        qw6_cpu_moe_route(eidx_cpu, ew_cpu, elogits, (int)en, (int)top_k);
+        fail = qw6_vk_moe_route(&vk, elogits, eidx_gpu, ew_gpu, en, top_k) != 0;
+        for (uint32_t i = 0; i < top_k && !fail; i++) {
+            if (eidx_gpu[i] != (uint32_t)eidx_cpu[i] || fabsf(ew_gpu[i] - ew_cpu[i]) > 2e-5f) {
+                fprintf(stderr,
+                        "qw6_vk: moe_route mismatch at %u got idx=%u weight=%.6f expected idx=%d weight=%.6f\n",
+                        i, eidx_gpu[i], ew_gpu[i], eidx_cpu[i], ew_cpu[i]);
+                fail = 1;
+            }
+        }
+    }
+
+    const uint32_t gd = 257, gtop = 8;
+    float *gexpert = calloc((size_t)gd * gtop, sizeof(float));
+    float *gweights = calloc(gtop, sizeof(float));
+    float *gshared = calloc(gd, sizeof(float));
+    float *go_cpu = calloc(gd, sizeof(float));
+    float *go_gpu = calloc(gd, sizeof(float));
+    if (!gexpert || !gweights || !gshared || !go_cpu || !go_gpu) fail = 1;
+    if (!fail) {
+        float wsum = 0.0f;
+        for (uint32_t e = 0; e < gtop; e++) {
+            gweights[e] = 0.1f + 0.03f * (float)e;
+            wsum += gweights[e];
+            for (uint32_t i = 0; i < gd; i++)
+                gexpert[(size_t)e * gd + i] = sinf((float)(e * 17 + i) * 0.021f);
+        }
+        for (uint32_t e = 0; e < gtop; e++) gweights[e] /= wsum;
+        for (uint32_t i = 0; i < gd; i++) {
+            gshared[i] = cosf((float)i * 0.019f);
+            go_cpu[i] = 0.25f * gshared[i];
+            for (uint32_t e = 0; e < gtop; e++)
+                go_cpu[i] += gweights[e] * gexpert[(size_t)e * gd + i];
+        }
+        fail = qw6_vk_moe_gather(&vk, gexpert, gweights, gshared, 0.25f,
+                                 go_gpu, gd, gtop) != 0;
+        for (uint32_t i = 0; i < gd && !fail; i++) {
+            if (fabsf(go_gpu[i] - go_cpu[i]) > 2e-5f) {
+                fprintf(stderr,
+                        "qw6_vk: moe_gather mismatch at %u got %.6f expected %.6f\n",
+                        i, go_gpu[i], go_cpu[i]);
+                fail = 1;
+            }
+        }
+    }
+
+    const uint32_t cd = 17, cks = 4;
+    float *cx = calloc(cd * cks, sizeof(float));
+    uint16_t *cw = calloc(cd * cks, sizeof(uint16_t));
+    float *co_cpu = calloc(cd, sizeof(float));
+    float *co_gpu = calloc(cd, sizeof(float));
+    if (!cx || !cw || !co_cpu || !co_gpu) fail = 1;
+    if (!fail) {
+        const uint16_t fp16_vals[4] = {0x3c00, 0x4000, 0x3800, 0xbc00};
+        for (uint32_t i = 0; i < cd * cks; i++) {
+            cx[i] = sinf((float)i * 0.09f) + 0.25f * cosf((float)i * 0.07f);
+            cw[i] = fp16_vals[i % 4];
+        }
+        qw6_cpu_conv1d_causal(co_cpu, cx, cw, (int)cd, (int)cks);
+        fail = qw6_vk_deltanet_conv1d(&vk, cx, cw, co_gpu, cd, cks) != 0;
+        for (uint32_t i = 0; i < cd && !fail; i++) {
+            if (fabsf(co_gpu[i] - co_cpu[i]) > 2e-5f) {
+                fprintf(stderr,
+                        "qw6_vk: deltanet_conv1d mismatch at %u got %.6f expected %.6f\n",
+                        i, co_gpu[i], co_cpu[i]);
+                fail = 1;
+            }
+        }
+    }
+
+    const uint32_t rkh = 2, rkd = 3, rvh = 2, rvd = 4;
+    float *rstate = calloc((size_t)rkh * rkd * rvh * rvd, sizeof(float));
+    float *rquery = calloc((size_t)rkh * rkd, sizeof(float));
+    float *ro_cpu = calloc((size_t)rvh * rvd, sizeof(float));
+    float *ro_gpu = calloc((size_t)rvh * rvd, sizeof(float));
+    if (!rstate || !rquery || !ro_cpu || !ro_gpu) fail = 1;
+    if (!fail) {
+        for (uint32_t i = 0; i < rkh * rkd * rvh * rvd; i++)
+            rstate[i] = sinf((float)i * 0.041f) - 0.5f * cosf((float)i * 0.013f);
+        for (uint32_t i = 0; i < rkh * rkd; i++)
+            rquery[i] = cosf((float)i * 0.19f);
+        qw6_cpu_deltanet_retrieve(ro_cpu, rstate, rquery,
+                                  (int)rkh, (int)rkd, (int)rvh, (int)rvd);
+        fail = qw6_vk_deltanet_retrieve(&vk, rstate, rquery, ro_gpu,
+                                        rkh, rkd, rvh, rvd) != 0;
+        for (uint32_t i = 0; i < rvh * rvd && !fail; i++) {
+            if (fabsf(ro_gpu[i] - ro_cpu[i]) > 2e-5f) {
+                fprintf(stderr,
+                        "qw6_vk: deltanet_retrieve mismatch at %u got %.6f expected %.6f\n",
+                        i, ro_gpu[i], ro_cpu[i]);
+                fail = 1;
+            }
+        }
+    }
+
+    const uint32_t ukh = 2, ukd = 3, uvh = 2, uvd = 4;
+    float *us_cpu = calloc((size_t)ukh * ukd * uvh * uvd, sizeof(float));
+    float *us_gpu = calloc((size_t)ukh * ukd * uvh * uvd, sizeof(float));
+    float *ukey = calloc((size_t)ukh * ukd, sizeof(float));
+    float *uquery = calloc((size_t)ukh * ukd, sizeof(float));
+    float *uvalue = calloc((size_t)uvh * uvd, sizeof(float));
+    float *ubeta = calloc(ukh, sizeof(float));
+    if (!us_cpu || !us_gpu || !ukey || !uquery || !uvalue || !ubeta) fail = 1;
+    if (!fail) {
+        for (uint32_t i = 0; i < ukh * ukd * uvh * uvd; i++) {
+            us_cpu[i] = 0.01f * (float)((int)(i % 9) - 4);
+            us_gpu[i] = us_cpu[i];
+        }
+        for (uint32_t i = 0; i < ukh * ukd; i++) {
+            ukey[i] = sinf((float)i * 0.23f);
+            uquery[i] = cosf((float)i * 0.17f);
+        }
+        for (uint32_t i = 0; i < uvh * uvd; i++)
+            uvalue[i] = 0.5f * sinf((float)i * 0.11f);
+        for (uint32_t i = 0; i < ukh; i++)
+            ubeta[i] = 0.75f + 0.1f * (float)i;
+        qw6_cpu_deltanet_update(us_cpu, ukey, uvalue, uquery, ubeta,
+                                (int)ukh, (int)ukd, (int)uvh, (int)uvd);
+        fail = qw6_vk_deltanet_update(&vk, us_gpu, ukey, uvalue, uquery,
+                                      ubeta, ukh, ukd, uvh, uvd) != 0;
+        for (uint32_t i = 0; i < ukh * ukd * uvh * uvd && !fail; i++) {
+            if (fabsf(us_gpu[i] - us_cpu[i]) > 2e-5f) {
+                fprintf(stderr,
+                        "qw6_vk: deltanet_update mismatch at %u got %.6f expected %.6f\n",
+                        i, us_gpu[i], us_cpu[i]);
+                fail = 1;
+            }
+        }
+    }
+
+    const uint32_t mv = 13, mh = 37;
+    float *mtp_w = calloc(mv * mh, sizeof(float));
+    float *mtp_hidden = calloc(mh, sizeof(float));
+    float *mtp_cpu = calloc(mv, sizeof(float));
+    float *mtp_gpu = calloc(mv, sizeof(float));
+    if (!mtp_w || !mtp_hidden || !mtp_cpu || !mtp_gpu) fail = 1;
+    if (!fail) {
+        for (uint32_t i = 0; i < mv * mh; i++)
+            mtp_w[i] = 0.03f * sinf((float)i * 0.07f);
+        for (uint32_t i = 0; i < mh; i++)
+            mtp_hidden[i] = cosf((float)i * 0.13f);
+        qw6_cpu_mtp_draft(mtp_cpu, mtp_hidden, mtp_w, (int)mv, (int)mh);
+        fail = qw6_vk_mtp_draft(&vk, mtp_w, mtp_hidden, mtp_gpu, mv, mh) != 0;
+        for (uint32_t i = 0; i < mv && !fail; i++) {
+            if (fabsf(mtp_gpu[i] - mtp_cpu[i]) > 2e-5f) {
+                fprintf(stderr,
+                        "qw6_vk: mtp_draft mismatch at %u got %.6f expected %.6f\n",
+                        i, mtp_gpu[i], mtp_cpu[i]);
+                fail = 1;
+            }
+        }
+    }
+
     free(a);
     free(b);
     free(c);
     free(rx);
     free(rw);
     free(ry);
+    free(crx);
+    free(crw);
+    free(cry);
     free(mw);
     free(mx);
     free(my);
+    free(q4w);
+    free(q4x);
+    free(q4y);
+    free(q5w);
+    free(q5x);
+    free(q5y);
+    free(q6w);
+    free(q6x);
+    free(q6y);
+    free(sg);
+    free(su);
+    free(so);
+    free(ax);
+    free(gx);
+    free(mq_cpu);
+    free(mk_cpu);
+    free(mq_gpu);
+    free(mk_gpu);
+    free(aq);
+    free(ak);
+    free(av);
+    free(ao_cpu);
+    free(ao_gpu);
+    free(elogits);
+    free(eidx_cpu);
+    free(ew_cpu);
+    free(eidx_gpu);
+    free(ew_gpu);
+    free(gexpert);
+    free(gweights);
+    free(gshared);
+    free(go_cpu);
+    free(go_gpu);
+    free(cx);
+    free(cw);
+    free(co_cpu);
+    free(co_gpu);
+    free(rstate);
+    free(rquery);
+    free(ro_cpu);
+    free(ro_gpu);
+    free(us_cpu);
+    free(us_gpu);
+    free(ukey);
+    free(uquery);
+    free(uvalue);
+    free(ubeta);
+    free(mtp_w);
+    free(mtp_hidden);
+    free(mtp_cpu);
+    free(mtp_gpu);
     qw6_vk_free(&vk);
     if (fail) {
         fprintf(stderr, "qw6_vk: self-test failed\n");
@@ -633,6 +1947,601 @@ int qw6_vk_selftest(void) {
     }
     fprintf(stderr, "qw6_vk: self-test passed\n");
     return 0;
+}
+
+/* ========================================================================
+ * Phase 2: Full GPU dispatch pipeline
+ * ======================================================================== */
+
+struct qw6_vk_pipe_s {
+    qw6_vk_t vk;
+
+    /* Big buffer housing all weight tensors */
+    qw6_vk_buffer_t weights;
+    size_t weight_capacity;
+
+    /* Persistent scratch buffers */
+    qw6_vk_buffer_t scr_hidden;    /* [HIDDEN_SIZE] float */
+    qw6_vk_buffer_t scr_resid;     /* [HIDDEN_SIZE] float */
+    qw6_vk_buffer_t scr_normed;    /* [HIDDEN_SIZE] float */
+    qw6_vk_buffer_t scr_norm_w;    /* [HIDDEN_SIZE] float */
+    qw6_vk_buffer_t scr_attn;      /* [HIDDEN_SIZE] float */
+    qw6_vk_buffer_t scr_ffn;       /* [HIDDEN_SIZE] float */
+    qw6_vk_buffer_t scr_s0;        /* [HIDDEN_SIZE*2] float */
+    qw6_vk_buffer_t scr_s1;        /* [HIDDEN_SIZE*2] float */
+    qw6_vk_buffer_t scr_logits;    /* [VOCAB_SIZE] float */
+
+    /* KV cache for full-attn layers */
+    qw6_vk_buffer_t k_cache[QW6_NUM_LAYERS];
+    qw6_vk_buffer_t v_cache[QW6_NUM_LAYERS];
+
+    /* DeltaNet state + Conv1D state for linear-attn layers */
+    qw6_vk_buffer_t dn_state[QW6_NUM_LAYERS];
+    qw6_vk_buffer_t conv_state[QW6_NUM_LAYERS];
+
+    uint32_t max_ctx;
+};
+
+/* ---- Helpers ---- */
+
+/* Upload a single tensor's data to the big weight buffer.
+ * Returns the byte offset within the weight buffer, or (size_t)-1 on error. */
+static size_t qw6_vk_upload_tensor(struct qw6_vk_pipe_s *p,
+                                    const qw6_tensor_t *t) {
+    if (!t || !t->data || t->data_size == 0) return (size_t)-1;
+    /* Mark as not yet uploaded in case of failure below */
+    ((qw6_tensor_t *)t)->vk_offset = (size_t)-1;
+    /* Align offset to 256 bytes for GPU-friendly access */
+    size_t off = p->weight_capacity;
+    off = (off + 255) & ~(size_t)255;
+    if (off + t->data_size > p->weights.size) return (size_t)-1;
+    memcpy((uint8_t *)p->weights.mapped + off, t->data, t->data_size);
+    /* Store offset back to tensor for later dispatch */
+    /* (t is const, but vk_offset is mutable via the union / cast) */
+    ((qw6_tensor_t *)t)->vk_offset = off;
+    p->weight_capacity = off + t->data_size;
+    return off;
+}
+
+/* Dispatch a quantised MatVec for a tensor, reading from the weight buffer
+ * at t->vk_offset, applying against input buffer, writing to output buffer.
+ * Returns 0 on success. */
+static int qw6_vk_pipe_matvec(struct qw6_vk_pipe_s *p,
+                               const qw6_tensor_t *t,
+                               qw6_vk_buffer_t *inp, qw6_vk_buffer_t *out,
+                               uint32_t rows, uint32_t cols) {
+    if (!t->data || t->vk_offset == (size_t)-1) return -1;
+    const size_t offs[3] = {t->vk_offset, 0, 0};
+    qw6_vk_buffer_t *bufs[3] = {&p->weights, inp, out};
+    qw6_vk_matvec_push_t push = {.rows = rows, .cols = cols};
+
+
+    switch (t->quant) {
+    case QW6_Q_FP32:
+        return qw6_vk_dispatch(&p->vk, "vulkan/matvec_f32.spv",
+                               bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
+    case QW6_Q_Q5_K:
+        return qw6_vk_dispatch(&p->vk, "vulkan/matmul_q5k.spv",
+                               bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
+    case QW6_Q_Q6_K:
+        return qw6_vk_dispatch(&p->vk, "vulkan/matmul_q6k.spv",
+                               bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
+    case QW6_Q_Q4_K_M:
+    case QW6_Q_Q4_K_S:
+        return qw6_vk_dispatch(&p->vk, "vulkan/matmul_q4k.spv",
+                               bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
+    case QW6_Q_IQ2_XXS:
+    case QW6_Q_IQ2_M:
+        return qw6_vk_dispatch(&p->vk, "vulkan/matmul_iq2xxs.spv",
+                               bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
+    default:
+        /* Unsupported on GPU — caller must fall back to CPU */
+        return -1;
+    }
+}
+
+/* GPU dispatch helpers for pipeline ops */
+
+static int qw6_vk_pipe_rmsnorm(struct qw6_vk_pipe_s *p,
+                                qw6_vk_buffer_t *x, qw6_vk_buffer_t *w,
+                                qw6_vk_buffer_t *y, uint32_t n, float eps) {
+    const size_t zero[3] = {0, 0, 0};
+    qw6_vk_buffer_t *bufs[3] = {x, w, y};
+    qw6_vk_rmsnorm_push_t push = {.n = n, .eps = eps};
+    return qw6_vk_dispatch(&p->vk, "vulkan/rmsnorm_full.spv",
+                           bufs, zero, 3, &push, sizeof(push), 1, 1, 1);
+}
+
+static int qw6_vk_pipe_add(struct qw6_vk_pipe_s *p,
+                            qw6_vk_buffer_t *a, qw6_vk_buffer_t *b,
+                            qw6_vk_buffer_t *c, uint32_t n) {
+    const size_t zero[3] = {0, 0, 0};
+    qw6_vk_buffer_t *bufs[3] = {a, b, c};
+    return qw6_vk_dispatch(&p->vk, "vulkan/add.spv",
+                           bufs, zero, 3, &n, sizeof(n),
+                           (n + 255) / 256, 1, 1);
+}
+
+static int qw6_vk_pipe_silu_mul(struct qw6_vk_pipe_s *p,
+                                 qw6_vk_buffer_t *gate, qw6_vk_buffer_t *up,
+                                 qw6_vk_buffer_t *out, uint32_t n) {
+    const size_t zero[3] = {0, 0, 0};
+    qw6_vk_buffer_t *bufs[3] = {gate, up, out};
+    qw6_vk_n_push_t push = {.n = n};
+    return qw6_vk_dispatch(&p->vk, "vulkan/silu_mul.spv",
+                           bufs, zero, 3, &push, sizeof(push),
+                           (n + 255) / 256, 1, 1);
+}
+
+/* ---- Init ---- */
+
+int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m) {
+    if (!p || !m) return -1;
+    qw6_vk_pipe_t *ctx = calloc(1, sizeof(qw6_vk_pipe_t));
+    if (!ctx) return -1;
+
+    if (qw6_vk_init(&ctx->vk) != 0) {
+        free(ctx);
+        return -1;
+    }
+
+    ctx->max_ctx = m->max_context > 0 ? m->max_context : QW6_DEFAULT_CTX;
+
+    /* ---- Allocate the big weight buffer ---- */
+    size_t total_w = m->total_weight_bytes + 1024 * 1024; /* +1 MB headroom */
+    if (qw6_vk_buffer_create(&ctx->vk, &ctx->weights, total_w,
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_free(&ctx->vk); free(ctx); return -1;
+    }
+
+    /* ---- Allocate scratch buffers ---- */
+    /* Hidden-size buffers */
+#define VK_BUF_SZ(nm, sz) do { \
+    if (qw6_vk_buffer_create(&ctx->vk, &ctx->nm, (sz) * sizeof(float), \
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) \
+        { qw6_vk_pipe_free(ctx); return -1; } \
+} while(0)
+    VK_BUF_SZ(scr_hidden, QW6_HIDDEN_SIZE);
+    VK_BUF_SZ(scr_resid, QW6_HIDDEN_SIZE);
+    VK_BUF_SZ(scr_normed, QW6_HIDDEN_SIZE);
+    VK_BUF_SZ(scr_norm_w, QW6_HIDDEN_SIZE);
+    VK_BUF_SZ(scr_attn, QW6_HIDDEN_SIZE);
+    VK_BUF_SZ(scr_ffn, QW6_HIDDEN_SIZE);
+    VK_BUF_SZ(scr_s0, QW6_LINEAR_QKV_DIM);
+    VK_BUF_SZ(scr_s1, QW6_LINEAR_QKV_DIM);
+    VK_BUF_SZ(scr_logits, QW6_VOCAB_SIZE);
+#undef VK_BUF_SZ
+
+    /* ---- Upload embedding and output tensors ---- */
+    qw6_vk_upload_tensor(ctx, &m->tok_embeddings);
+    qw6_vk_upload_tensor(ctx, &m->output);
+    qw6_vk_upload_tensor(ctx, &m->output_norm);
+
+    /* ---- Upload per-layer tensors ---- */
+    for (int l = 0; l < QW6_NUM_LAYERS; l++) {
+        qw6_vk_upload_tensor(ctx, &m->layers[l].norm);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].post_norm);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].attn_q);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].attn_k);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].attn_v);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].attn_o);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].attn_gate);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].attn_q_norm);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].attn_k_norm);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].conv1d);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].dn_key);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].dn_value);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].dn_query);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].dn_out);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].dn_gate);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].dn_norm);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].dn_alpha);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].dn_beta);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].dn_dt);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].dn_a);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].moe_router);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].shared_gate);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].shared_up);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].shared_down);
+        qw6_vk_upload_tensor(ctx, &m->layers[l].shared_router);
+        /* Upload all 256 expert gate/up/down tensors */
+        for (int e = 0; e < QW6_NUM_EXPERTS; e++) {
+            qw6_vk_upload_tensor(ctx, &m->layers[l].expert_gate[e]);
+            qw6_vk_upload_tensor(ctx, &m->layers[l].expert_up[e]);
+            qw6_vk_upload_tensor(ctx, &m->layers[l].expert_down[e]);
+        }
+    }
+
+    /* ---- Allocate KV caches (full-attn layers only) ---- */
+    size_t kv_ctx = ctx->max_ctx < 4096 ? 4096 : ctx->max_ctx;
+    size_t kv_layer_bytes = (size_t)kv_ctx * QW6_NUM_KV_HEADS * QW6_HEAD_DIM * sizeof(float);
+    for (int l = 0; l < QW6_NUM_LAYERS; l++) {
+        if (qw6_layer_type(l) != QW6_LAYER_FULL_ATTN) continue;
+        if (qw6_vk_buffer_create(&ctx->vk, &ctx->k_cache[l], kv_layer_bytes,
+                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+            qw6_vk_pipe_free(ctx); return -1;
+        }
+        if (qw6_vk_buffer_create(&ctx->vk, &ctx->v_cache[l], kv_layer_bytes,
+                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+            qw6_vk_pipe_free(ctx); return -1;
+        }
+    }
+
+    /* ---- Allocate DeltaNet state buffers (linear-attn layers) ---- */
+    size_t dn_bytes = (size_t)QW6_NUM_VALUE_HEADS * QW6_VALUE_HEAD_DIM * QW6_VALUE_HEAD_DIM * sizeof(float);
+    size_t conv_bytes = (size_t)QW6_CONV1D_KERNEL * QW6_LINEAR_QKV_DIM * sizeof(float);
+    for (int l = 0; l < QW6_NUM_LAYERS; l++) {
+        if (qw6_layer_type(l) != QW6_LAYER_LINEAR_ATTN) continue;
+        if (qw6_vk_buffer_create(&ctx->vk, &ctx->dn_state[l], dn_bytes,
+                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+            qw6_vk_pipe_free(ctx); return -1;
+        }
+        memset(ctx->dn_state[l].mapped, 0, dn_bytes);
+        if (qw6_vk_buffer_create(&ctx->vk, &ctx->conv_state[l], conv_bytes,
+                                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+            qw6_vk_pipe_free(ctx); return -1;
+        }
+        memset(ctx->conv_state[l].mapped, 0, conv_bytes);
+    }
+
+    fprintf(stderr, "qw6_vk_pipe: %zu bytes weights uploaded, %u max_ctx\n",
+            ctx->weight_capacity, ctx->max_ctx);
+    *p = ctx;
+    return 0;
+}
+
+/* ---- Forward pass ---- */
+
+int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
+                        uint32_t token, uint32_t pos,
+                        float *logits_out) {
+    if (!p || !m || !logits_out) return -1;
+
+    /* Step 1: Token embedding lookup.
+     * Dequantize tok_embeddings[token] into hidden buffer.
+     * Since embedding is a single row, we copy from mmap'd data directly.
+     * For GPU, we upload the row and dispatch matvec with identity input. */
+    const qw6_tensor_t *emb = &m->tok_embeddings;
+    if (!emb->data || emb->vk_offset == (size_t)-1) {
+        fprintf(stderr, "qw6_vk_pipe: tok_embeddings not uploaded "
+                "(data=%p vk_offset=%zu)\n",
+                (void *)emb->data, emb->vk_offset);
+        return -1;
+    }
+
+    /* Upload embeddings row (it's Q5_K -- dequant on CPU for now, then copy to GPU) */
+    float *hidden_cpu = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    if (!hidden_cpu) return -1;
+    if (qw6_tensor_dequantize_row(emb, (int)token, hidden_cpu) != 0) {
+        free(hidden_cpu);
+        return -1;
+    }
+    memcpy(p->scr_hidden.mapped, hidden_cpu, QW6_HIDDEN_SIZE * sizeof(float));
+
+
+    /* Scratch buffers for inter-layer state */
+    qw6_vk_buffer_t *hid = &p->scr_hidden;
+    qw6_vk_buffer_t *res = &p->scr_resid;
+    qw6_vk_buffer_t *nrm = &p->scr_normed;
+    qw6_vk_buffer_t *nw  = &p->scr_norm_w;
+    qw6_vk_buffer_t *att = &p->scr_attn;
+    qw6_vk_buffer_t *ffn = &p->scr_ffn;
+    qw6_vk_buffer_t *s0  = &p->scr_s0;
+    qw6_vk_buffer_t *s1  = &p->scr_s1;
+    qw6_vk_buffer_t *lg  = &p->scr_logits;
+
+    /* Helper: dispatch RMSNorm on GPU using persistent buffers */
+#define VK_RMSNORM(x, w, y) \
+    qw6_vk_pipe_rmsnorm(p, x, w, y, QW6_HIDDEN_SIZE, QW6_RMS_EPS)
+
+    /* Helper: dispatch a matmul for tensor t, using x as input, y as output.
+     * Tries GPU first; if quant not supported, falls back to CPU. */
+#define VK_MATMUL(t, x, y, rows, cols) do { \
+        if ((t)->vk_offset != (size_t)-1 && \
+            qw6_vk_pipe_matvec(p, t, x, y, rows, cols) == 0) { \
+            /* GPU dispatch succeeded */ \
+        } else { \
+            /* Fall back to CPU */ \
+            float *_x = (float *)(x)->mapped; \
+            float *_y = (float *)(y)->mapped; \
+            qw6_tensor_matvec(_y, t, _x, rows); \
+            memcpy((y)->mapped, _y, (rows) * sizeof(float)); \
+        } \
+    } while(0)
+
+    /* Helper: GPU element-wise add */
+#define VK_ADD(dst, src, n) \
+    qw6_vk_pipe_add(p, dst, src, dst, n)
+
+    /* Helper: GPU SiLU multiply */
+#define VK_SILU_MUL(gate, up, out, n) \
+    qw6_vk_pipe_silu_mul(p, gate, up, out, n)
+
+    /* Helper: read back a GPU buffer to CPU */
+#define VK_READ(buf, dst, n) memcpy(dst, (buf)->mapped, (n) * sizeof(float))
+
+    /* Helper: write CPU data to GPU buffer */
+#define VK_WRITE(buf, src, n) memcpy((buf)->mapped, src, (n) * sizeof(float))
+
+
+
+    /* ---- Layer loop ---- */
+    for (int l = 0; l < QW6_NUM_LAYERS; l++) {
+        /* Copy hidden -> resid */
+        memcpy(res->mapped, hid->mapped, QW6_HIDDEN_SIZE * sizeof(float));
+
+        /* Pre-attention RMSNorm: normed = rmsnorm(hidden, norm_w) */
+        /* Upload norm weights to GPU scratch */
+        VK_WRITE(nw, ((float *)m->layers[l].norm.data), QW6_HIDDEN_SIZE);
+        VK_RMSNORM(hid, nw, nrm);
+
+        if (qw6_layer_type(l) == QW6_LAYER_LINEAR_ATTN) {
+            /* ---- Linear Attention (Gated DeltaNet) ---- */
+            /* QKV projection: attn_q = [qkv_dim, hidden] */
+            VK_MATMUL(&m->layers[l].attn_q, nrm, s0,
+                      QW6_LINEAR_QKV_DIM, QW6_HIDDEN_SIZE);
+
+            /* Z (gate) projection */
+            VK_MATMUL(&m->layers[l].attn_gate, nrm, s1,
+                      QW6_LINEAR_VALUE_DIM, QW6_HIDDEN_SIZE);
+
+            /* Beta, Alpha projections */
+            VK_MATMUL(&m->layers[l].dn_beta, nrm, att,  /* reuse attn as tmp */
+                      QW6_NUM_VALUE_HEADS, QW6_HIDDEN_SIZE);
+            float *beta_cpu = (float *)att->mapped;
+
+            VK_MATMUL(&m->layers[l].dn_alpha, nrm, ffn,  /* reuse ffn as tmp */
+                      QW6_NUM_VALUE_HEADS, QW6_HIDDEN_SIZE);
+            float *alpha_cpu = (float *)ffn->mapped;
+
+            /* Conv1D state: shift and apply causal conv1d on CPU for now
+             * (conv_state is small per step) */
+            float *qkv = (float *)s0->mapped;
+            float *z   = (float *)s1->mapped;
+            float *cs  = (float *)p->conv_state[l].mapped;
+            float *conv_out = (float *)s0->mapped; /* reuse s0 */
+
+            /* Shift conv state and apply causal conv1d */
+            memmove(cs, cs + QW6_LINEAR_QKV_DIM,
+                    (size_t)(QW6_CONV1D_KERNEL - 1) * QW6_LINEAR_QKV_DIM * sizeof(float));
+            memcpy(cs + (size_t)(QW6_CONV1D_KERNEL - 1) * QW6_LINEAR_QKV_DIM,
+                   qkv, QW6_LINEAR_QKV_DIM * sizeof(float));
+
+            const float *cw = (const float *)m->layers[l].conv1d.data;
+            for (int c = 0; c < QW6_LINEAR_QKV_DIM; c++) {
+                float sum = 0.0f;
+                for (int k = 0; k < QW6_CONV1D_KERNEL; k++)
+                    sum += cs[(size_t)k * QW6_LINEAR_QKV_DIM + c] *
+                           cw[(size_t)c * QW6_CONV1D_KERNEL + k];
+                conv_out[c] = qw6_silu(sum);
+            }
+
+            /* Split QKV, L2-normalize heads */
+            float *q = conv_out;
+            float *k = conv_out + QW6_NUM_KEY_HEADS * QW6_KEY_HEAD_DIM;
+            float *v = conv_out + 2 * QW6_NUM_KEY_HEADS * QW6_KEY_HEAD_DIM;
+            qw6_l2_norm_heads(q, QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM);
+            qw6_l2_norm_heads(k, QW6_NUM_KEY_HEADS, QW6_KEY_HEAD_DIM);
+
+            /* Apply sigmoid/softplus to beta/alpha */
+            float *dt_cpu = (float *)m->layers[l].dn_dt.data;
+            float *a_cpu  = (float *)m->layers[l].dn_a.data;
+            for (int h = 0; h < QW6_NUM_VALUE_HEADS; h++) {
+                beta_cpu[h] = qw6_sigmoid(beta_cpu[h]);
+                alpha_cpu[h] = qw6_softplus(alpha_cpu[h] + dt_cpu[h]) * a_cpu[h];
+            }
+
+            /* Gated DeltaNet single-token forward on CPU */
+            float *state = (float *)p->dn_state[l].mapped;
+            float *gdn = (float *)s0->mapped; /* reuse s0 for gdn output */
+            qw6_gated_delta_net_single(gdn, state, q, k, v, alpha_cpu, beta_cpu);
+            memcpy(p->dn_state[l].mapped, state, 
+                   (size_t)QW6_NUM_VALUE_HEADS * QW6_VALUE_HEAD_DIM * QW6_VALUE_HEAD_DIM * sizeof(float));
+
+            /* RMSNorm the GDN output, multiply by SiLU(z) */
+            float *dn_norm_w = (float *)m->layers[l].dn_norm.data;
+            float *gated = (float *)s1->mapped; /* reuse s1 */
+            for (int h = 0; h < QW6_NUM_VALUE_HEADS; h++) {
+                float *dst = gated + h * QW6_VALUE_HEAD_DIM;
+                qw6_cpu_rmsnorm(dst, gdn + h * QW6_VALUE_HEAD_DIM,
+                                dn_norm_w, QW6_VALUE_HEAD_DIM);
+                for (int i = 0; i < QW6_VALUE_HEAD_DIM; i++)
+                    dst[i] *= qw6_silu(z[h * QW6_VALUE_HEAD_DIM + i]);
+            }
+            memcpy(s1->mapped, gated, QW6_LINEAR_VALUE_DIM * sizeof(float));
+
+            /* Output projection: dn_out * gated -> attn */
+            VK_MATMUL(&m->layers[l].dn_out, s1, att,
+                      QW6_HIDDEN_SIZE, QW6_LINEAR_VALUE_DIM);
+
+        } else {
+            /* ---- Full Attention (GQA) ---- */
+            /* Q projection (with gate) */
+            VK_MATMUL(&m->layers[l].attn_q, nrm, s0,
+                      QW6_NUM_Q_HEADS * QW6_HEAD_DIM * 2, QW6_HIDDEN_SIZE);
+
+            /* K and V projections */
+            VK_MATMUL(&m->layers[l].attn_k, nrm, s1,
+                      QW6_NUM_KV_HEADS * QW6_HEAD_DIM, QW6_HIDDEN_SIZE);
+            VK_MATMUL(&m->layers[l].attn_v, nrm, ffn,
+                      QW6_NUM_KV_HEADS * QW6_HEAD_DIM, QW6_HIDDEN_SIZE);
+
+            /* Q/K norms */
+            float *q_norm_w = (float *)m->layers[l].attn_q_norm.data;
+            float *k_norm_w = (float *)m->layers[l].attn_k_norm.data;
+            float *k_cpu = (float *)s1->mapped;
+
+            /* Split Q and gate */
+            float *q_cpu = (float *)s0->mapped; /* first half */
+            float *gate_cpu = (float *)s0->mapped + QW6_NUM_Q_HEADS * QW6_HEAD_DIM;
+            /* Already laid out as [Q, gate] interleaved per head */
+
+            /* Apply Q/K RMSNorm per head */
+            for (int h = 0; h < QW6_NUM_Q_HEADS; h++)
+                qw6_cpu_rmsnorm(q_cpu + h * QW6_HEAD_DIM,
+                                q_cpu + h * QW6_HEAD_DIM,
+                                q_norm_w, QW6_HEAD_DIM);
+            for (int h = 0; h < QW6_NUM_KV_HEADS; h++)
+                qw6_cpu_rmsnorm(k_cpu + h * QW6_HEAD_DIM,
+                                k_cpu + h * QW6_HEAD_DIM,
+                                k_norm_w, QW6_HEAD_DIM);
+
+            /* MRoPE */
+            int rot_dim = (int)(QW6_HEAD_DIM * QW6_PARTIAL_ROTARY);
+            qw6_cpu_mrope(q_cpu, k_cpu,
+                          QW6_NUM_Q_HEADS * QW6_HEAD_DIM,
+                          QW6_NUM_KV_HEADS * QW6_HEAD_DIM,
+                          QW6_NUM_Q_HEADS, QW6_NUM_KV_HEADS,
+                          pos, rot_dim);
+
+            /* Write K,V to KV cache (on GPU) */
+            float *k_slot = (float *)p->k_cache[l].mapped +
+                (size_t)pos * QW6_NUM_KV_HEADS * QW6_HEAD_DIM;
+            float *v_slot = (float *)p->v_cache[l].mapped +
+                (size_t)pos * QW6_NUM_KV_HEADS * QW6_HEAD_DIM;
+            memcpy(k_slot, k_cpu, QW6_NUM_KV_HEADS * QW6_HEAD_DIM * sizeof(float));
+            memcpy(v_slot, (float *)ffn->mapped, QW6_NUM_KV_HEADS * QW6_HEAD_DIM * sizeof(float));
+            /* GQA attention on CPU (for now) */
+            float *attn_cpu = (float *)att->mapped;
+            qw6_cpu_attention_gqa(attn_cpu, q_cpu,
+                                  (float *)p->k_cache[l].mapped,
+                                  (float *)p->v_cache[l].mapped,
+                                  (int)pos + 1,
+                                  QW6_NUM_Q_HEADS, QW6_NUM_KV_HEADS, QW6_HEAD_DIM);
+
+            /* Apply gate */
+            for (int i = 0; i < QW6_NUM_Q_HEADS * QW6_HEAD_DIM; i++)
+                attn_cpu[i] *= qw6_sigmoid(gate_cpu[i]);
+            memcpy(att->mapped, attn_cpu, QW6_NUM_Q_HEADS * QW6_HEAD_DIM * sizeof(float));
+
+            /* Output projection */
+            VK_MATMUL(&m->layers[l].attn_o, att, att,
+                      QW6_HIDDEN_SIZE, QW6_NUM_Q_HEADS * QW6_HEAD_DIM);
+        }
+
+        /* Residual: hidden = resid + attn */
+        VK_ADD(hid, att, QW6_HIDDEN_SIZE);
+
+        /* ---- MoE Block ---- */
+        memcpy(res->mapped, hid->mapped, QW6_HIDDEN_SIZE * sizeof(float));
+
+        /* Post-attention RMSNorm */
+        VK_WRITE(nw, ((float *)m->layers[l].post_norm.data), QW6_HIDDEN_SIZE);
+        VK_RMSNORM(hid, nw, nrm);
+
+        /* Router matvec: 256 experts, top-k=8 */
+        VK_MATMUL(&m->layers[l].moe_router, nrm, s0,
+                  QW6_NUM_EXPERTS, QW6_HIDDEN_SIZE);
+
+        /* Read back router logits and do CPU MoE routing */
+        float *router_logits = (float *)s0->mapped;
+        int idx[QW6_EXPERTS_PER_TOK] = {0};
+        float w[QW6_EXPERTS_PER_TOK] = {0};
+        qw6_cpu_moe_route(idx, w, router_logits,
+                          QW6_NUM_EXPERTS, QW6_EXPERTS_PER_TOK);
+
+        /* Zero out FFN output on GPU */
+        memset(ffn->mapped, 0, QW6_HIDDEN_SIZE * sizeof(float));
+
+        /* For each selected expert, dispatch gate/up/down matmuls */
+        for (int e = 0; e < QW6_EXPERTS_PER_TOK; e++) {
+            int expert = idx[e];
+            const qw6_tensor_t *eg = &m->layers[l].expert_gate[expert];
+            const qw6_tensor_t *eu = &m->layers[l].expert_up[expert];
+            const qw6_tensor_t *ed = &m->layers[l].expert_down[expert];
+
+            /* gate = expert_gate * normed, up = expert_up * normed */
+            VK_MATMUL(eg, nrm, s1, QW6_MOE_INTER, QW6_HIDDEN_SIZE);
+            VK_MATMUL(eu, nrm, att, QW6_MOE_INTER, QW6_HIDDEN_SIZE);
+
+            /* SiLU gate * up -> mid (GPU dispatch) */
+            VK_SILU_MUL(s1, att, s0, QW6_MOE_INTER);
+
+            /* down = expert_down * mid  (reuse nrm buffer) */
+            VK_MATMUL(ed, s0, nrm, QW6_HIDDEN_SIZE, QW6_MOE_INTER);
+
+            /* Accumulate: ffn += w[e] * nrm */
+            float *ffn_p = (float *)ffn->mapped;
+            float *tmp_p = (float *)nrm->mapped;
+            for (int i = 0; i < QW6_HIDDEN_SIZE; i++)
+                ffn_p[i] += w[e] * tmp_p[i];
+            memcpy(ffn->mapped, ffn_p, QW6_HIDDEN_SIZE * sizeof(float));
+        }
+
+        /* Shared expert */
+        if (m->layers[l].shared_gate.data &&
+            m->layers[l].shared_up.data &&
+            m->layers[l].shared_down.data) {
+            float shared_weight = 1.0f;
+            if (m->layers[l].shared_router.data) {
+                float sw = 0;
+                VK_MATMUL(&m->layers[l].shared_router, nrm, att, 1, QW6_HIDDEN_SIZE);
+                sw = *(float *)att->mapped;
+                shared_weight = qw6_sigmoid(sw);
+            }
+            VK_MATMUL(&m->layers[l].shared_gate, nrm, s0,
+                      QW6_SHARED_INTER, QW6_HIDDEN_SIZE);
+            VK_MATMUL(&m->layers[l].shared_up, nrm, s1,
+                      QW6_SHARED_INTER, QW6_HIDDEN_SIZE);
+            /* mid = silu(sg) * su (GPU dispatch) */
+            VK_SILU_MUL(s0, s1, s0, QW6_SHARED_INTER);
+
+            VK_MATMUL(&m->layers[l].shared_down, s0, nrm,
+                      QW6_HIDDEN_SIZE, QW6_SHARED_INTER);
+
+            float *ffn_p = (float *)ffn->mapped;
+            float *tmp_p = (float *)nrm->mapped;
+            for (int i = 0; i < QW6_HIDDEN_SIZE; i++)
+                ffn_p[i] += shared_weight * tmp_p[i];
+            memcpy(ffn->mapped, ffn_p, QW6_HIDDEN_SIZE * sizeof(float));
+        }
+
+        /* Residual: hidden = resid + ffn */
+        VK_ADD(hid, ffn, QW6_HIDDEN_SIZE);
+    }
+
+
+    /* ---- Output: Final RMSNorm + output projection ---- */
+    {
+        VK_WRITE(nw, ((float *)m->output_norm.data), QW6_HIDDEN_SIZE);
+        VK_RMSNORM(hid, nw, nrm);
+
+        /* Output projection: [vocab, hidden] matvec. This is 248320 rows - large! */
+        VK_MATMUL(&m->output, nrm, lg, QW6_VOCAB_SIZE, QW6_HIDDEN_SIZE);
+    }
+
+    /* Read back logits to CPU */
+    memcpy(logits_out, lg->mapped, QW6_VOCAB_SIZE * sizeof(float));
+    free(hidden_cpu);
+    return 0;
+}
+
+/* ---- Free ---- */
+
+void qw6_vk_pipe_free(qw6_vk_pipe_t *p) {
+    if (!p) return;
+    if (p->weights.buffer) qw6_vk_buffer_destroy(&p->vk, &p->weights);
+    if (p->scr_hidden.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_hidden);
+    if (p->scr_resid.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_resid);
+    if (p->scr_normed.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_normed);
+    if (p->scr_norm_w.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_norm_w);
+    if (p->scr_attn.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_attn);
+    if (p->scr_ffn.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_ffn);
+    if (p->scr_s0.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_s0);
+    if (p->scr_s1.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_s1);
+    if (p->scr_logits.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_logits);
+    for (int i = 0; i < QW6_NUM_LAYERS; i++) {
+        if (qw6_layer_type(i) == QW6_LAYER_FULL_ATTN) {
+            if (p->k_cache[i].buffer) qw6_vk_buffer_destroy(&p->vk, &p->k_cache[i]);
+            if (p->v_cache[i].buffer) qw6_vk_buffer_destroy(&p->vk, &p->v_cache[i]);
+        } else {
+            if (p->dn_state[i].buffer) qw6_vk_buffer_destroy(&p->vk, &p->dn_state[i]);
+            if (p->conv_state[i].buffer) qw6_vk_buffer_destroy(&p->vk, &p->conv_state[i]);
+        }
+    }
+    qw6_vk_free(&p->vk);
+    memset(p, 0, sizeof(*p));
+    free(p);
 }
 
 #endif

@@ -77,29 +77,37 @@ exceed llama.cpp Vulkan performance as baseline.
 - [x] host-visible buffer allocation and compute dispatch self-test
 - [x] SPIR-V shader build via `glslc`
 - [x] `matvec_f32.comp` + layer-0 router probe against real Qwen weights
-- [ ] `matmul_iq2.comp` for IQ2 routed experts
-- [ ] `matmul_q4k.comp`, `matmul_q5k.comp`, `matmul_q6k.comp`
+- [x] `matmul_iq2xxs.comp` for IQ2_XXS routed experts (dequant + MatMul on GPU)
+- [x] `matmul_q4k.comp`, `matmul_q5k.comp`, `matmul_q6k.comp`
 - [x] `rmsnorm_full.comp` single-vector RMSNorm
-- [ ] `rmsnorm.comp` multi-workgroup/chunked RMSNorm
-- [ ] `rope_mrope.comp`
-- [ ] `attention_gqa.comp`
-- [ ] `deltanet_conv1d.comp`
-- [ ] `deltanet_update.comp`
-- [ ] `deltanet_retrieve.comp`
-- [ ] `moe_route.comp`
-- [ ] `moe_gather.comp`
-- [ ] `mtp_draft.comp`
-- [ ] `argmax.comp` / `sampling.comp` (partial: single-dispatch scaffold)
+- [x] `rmsnorm.comp` multi-workgroup/chunked RMSNorm
+- [x] `rope_mrope.comp`
+- [ ] `attention_gqa.comp` (partial: short-context shader, host path, and
+  Vulkan self-test coverage; full-context/chunked attention pending)
+- [x] `deltanet_conv1d.comp`
+- [x] `deltanet_update.comp`
+- [x] `deltanet_retrieve.comp`
+- [x] `moe_route.comp`
+- [x] `moe_gather.comp`
+- [x] `mtp_draft.comp`
+- [x] `argmax.comp` / `sampling.comp` (greedy)
 - [ ] pipeline barriers and dispatch orchestration (partial: backend self-test only)
 - [x] `make vulkan` build target
 - [ ] performance benchmark vs llama.cpp Vulkan baseline
 
 **Current Vulkan smoke path:** `make vulkan && ./qw6 --vulkan-self-test`
 compiles SPIR-V shaders, selects the BC-250 RADV device, dispatches GPU
-`vec_add`, `rmsnorm_full`, and `matvec_f32`, and validates results on the host.
+`vec_add`, `rmsnorm_full`, chunked `rmsnorm`, `matvec_f32`, `matmul_q4k`,
+`matmul_q5k`, `matmul_q6k`, `silu_mul`,
+`argmax`, `sampling_greedy`, `rope_mrope`, short-context `attention_gqa`,
+`moe_route`, `moe_gather`,
+`deltanet_conv1d`, `deltanet_update`, `deltanet_retrieve`, and `mtp_draft`, and
+validates results on the host. IQ2_XXS matmul is also covered by the self-test
+with synthetic block data.
 `./qw6 --load-only --vulkan -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf` additionally
 runs layer-0 router MatVec on the GPU against real Qwen weights and compares it
-to CPU (`max_diff ~= 7.6e-6`). Full model inference still falls back to CPU
+to CPU (`max_diff ~= 7.6e-6`), and probes the first expert's IQ2 gate tensor
+on GPU vs CPU. Full model inference still falls back to CPU
 kernels.
 
 **Deliverable:** `./qw6 -p "Hello" --vulkan` with all 40 layers on GPU at or

@@ -50,8 +50,13 @@ project builds on top of that.
 - native dequantization for F32, F16, BF16, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_S, and IQ3_S
 - layer-0 Gated DeltaNet single-token forward probe through SSM conv, GDN update, gated norm, and `ssm_out`
 - 40-layer CPU greedy generation smoke path
-- Phase 2 Vulkan runtime smoke path with SPIR-V shader build, GPU `rmsnorm_full`,
-  GPU `matvec_f32`, and a layer-0 router probe against real Qwen weights
+- Phase 2 Vulkan runtime smoke path with SPIR-V shader build, GPU
+  `rmsnorm_full`, chunked GPU `rmsnorm`, GPU `matvec_f32`, GPU `matmul_q4k`,
+  GPU `matmul_q5k`, GPU `matmul_q6k`, GPU `matmul_iq2xxs`, GPU `silu_mul`, single-workgroup GPU
+  `argmax`, GPU greedy `sampling`, GPU `rope_mrope`, GPU short-context
+  `attention_gqa`, GPU `moe_route`, GPU `moe_gather`, GPU `deltanet_conv1d`,
+  GPU `deltanet_update`, GPU `deltanet_retrieve`, GPU `mtp_draft`, and a
+  layer-0 router probe against real Qwen weights
 
 The repository currently contains CPU engine code, tokenizer implementation,
 native GGUF loader/indexing, kernel scaffolding, and design documentation:

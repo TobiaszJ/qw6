@@ -25,8 +25,12 @@ path before the Vulkan backend:
 - Phase 2 has a Vulkan runtime smoke layer: device selection, host-visible
   buffers, descriptor/pipeline creation, SPIR-V shader build, and a verified
   compute dispatch on BC-250 RADV.
-- GPU `rmsnorm_full` and `matvec_f32` kernels are validated numerically; the
-  Vulkan `matvec_f32` path is also probed against the real layer-0 MoE router
+- GPU `rmsnorm_full`, chunked `rmsnorm`, `matvec_f32`, `matmul_q4k`,
+  `matmul_q5k`, `matmul_q6k`, `silu_mul`, single-workgroup `argmax`, greedy
+  `sampling`, `rope_mrope`, `moe_route`, `moe_gather`, `deltanet_conv1d`,
+  `deltanet_update`, `deltanet_retrieve`, and `mtp_draft` kernels are covered
+  by the Vulkan self-test; short-context `attention_gqa` is also covered. The
+  Vulkan `matvec_f32` path is probed against the real layer-0 MoE router
   weights from Qwen3.6.
 
 Not yet implemented:

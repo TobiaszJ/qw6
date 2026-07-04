@@ -1333,7 +1333,7 @@ static int qw6_dequantize_row_iq3_s(const void *src, float *dst, int k) {
     return 0;
 }
 
-static int qw6_tensor_dequantize_row(const qw6_tensor_t *t, uint32_t row,
+int qw6_tensor_dequantize_row(const qw6_tensor_t *t, uint32_t row,
                                      float *dst) {
     QW6_ASSERT_PTR(t); QW6_ASSERT_PTR(dst);
     QW6_ASSERT(t->data != NULL, "tensor has data");
@@ -1555,6 +1555,59 @@ static int qw6_probe_layer0_router_vulkan(qw6_model_t *m) {
     free(hidden); free(norm_w); free(normed); free(cpu); free(gpu);
     return rc;
 }
+
+static int qw6_probe_layer0_expert_iq2_vulkan(qw6_model_t *m) {
+    QW6_ASSERT_PTR(m);
+    /* Pick the first routed expert's gate tensor (IQ2 format) */
+    qw6_tensor_t *eg = &m->layers[0].expert_gate[0];
+    qw6_tensor_t *eu = &m->layers[0].expert_up[0];
+    qw6_tensor_t *ed = &m->layers[0].expert_down[0];
+    if (!eg->data || !eu->data || !ed->data) return -1;
+    if (eg->quant != QW6_Q_IQ2_XXS && eg->quant != QW6_Q_IQ2_M &&
+        eg->quant != QW6_Q_IQ2_S) {
+        fprintf(stderr, "qw6_vk: expert gate quant %d not IQ2, skipping GPU probe\n",
+                eg->quant);
+        return 0;
+    }
+
+    float *hidden = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *norm_w = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *normed = calloc(QW6_HIDDEN_SIZE, sizeof(float));
+    float *cpu = calloc(QW6_MOE_INTER, sizeof(float));
+    float *gpu = calloc(QW6_MOE_INTER, sizeof(float));
+    QW6_ASSERT_PTR(hidden); QW6_ASSERT_PTR(norm_w); QW6_ASSERT_PTR(normed);
+    QW6_ASSERT_PTR(cpu); QW6_ASSERT_PTR(gpu);
+
+    int rc = qw6_tensor_dequantize_row(&m->tok_embeddings, 0, hidden);
+    if (rc == 0) rc = qw6_tensor_dequantize_row(&m->layers[0].norm, 0, norm_w);
+    if (rc == 0) {
+        qw6_cpu_rmsnorm(normed, hidden, norm_w, QW6_HIDDEN_SIZE);
+        rc = qw6_tensor_matvec(cpu, eg, normed, QW6_MOE_INTER);
+    }
+    if (rc == 0) {
+        rc = qw6_vk_matmul_iq2xxs_host(eg->data, normed, gpu,
+                                       eg->rows, eg->cols);
+    }
+    if (rc == 0) {
+        double max_diff = 0.0, sum_diff = 0.0;
+        for (uint32_t i = 0; i < QW6_MOE_INTER; i++) {
+            double d = fabs((double)cpu[i] - gpu[i]);
+            if (d > max_diff) max_diff = d;
+            sum_diff += d;
+        }
+        fprintf(stderr,
+                "qw6_vk: probe layer0 expert[0] gate IQ2 matmul "
+                "max_diff=%.8f mean_diff=%.8f first_gpu=%.5f\n",
+                max_diff, sum_diff / QW6_MOE_INTER, gpu[0]);
+        if (max_diff > 5e-2f) {
+            fprintf(stderr, "qw6_vk: IQ2 matmul diff too large (%.8f)\n", max_diff);
+            rc = -1;
+        }
+    }
+
+    free(hidden); free(norm_w); free(normed); free(cpu); free(gpu);
+    return rc;
+}
 #endif
 
 static int qw6_probe_layer0_shared_ffn(qw6_model_t *m) {
@@ -1660,17 +1713,8 @@ static int qw6_probe_layer0_routed_ffn(qw6_model_t *m) {
     return rc;
 }
 
-static float qw6_sigmoid(float x) {
-    return 1.0f / (1.0f + expf(-x));
-}
 
-static float qw6_softplus(float x) {
-    if (x > 20.0f) return x;
-    if (x < -20.0f) return expf(x);
-    return log1pf(expf(x));
-}
-
-static void qw6_l2_norm_heads(float *x, int heads, int dim) {
+void qw6_l2_norm_heads(float *x, int heads, int dim) {
     for (int h = 0; h < heads; h++) {
         float ss = 0.0f;
         float *row = x + h * dim;
@@ -1694,7 +1738,7 @@ static int qw6_ssm_conv1d_single(float *out, const qw6_tensor_t *conv,
     return 0;
 }
 
-static void qw6_gated_delta_net_single(float *out, float *state,
+void qw6_gated_delta_net_single(float *out, float *state,
                                        const float *q16, const float *k16,
                                        const float *v, const float *gate,
                                        const float *beta) {
@@ -2051,6 +2095,17 @@ static int qw6_forward_token(qw6_session_t *s, uint32_t token, uint32_t pos) {
     float *ffn = calloc(QW6_HIDDEN_SIZE, sizeof(float));
     QW6_ASSERT_PTR(hidden); QW6_ASSERT_PTR(resid); QW6_ASSERT_PTR(norm_w);
     QW6_ASSERT_PTR(normed); QW6_ASSERT_PTR(attn); QW6_ASSERT_PTR(ffn);
+
+#ifdef QW6_VULKAN
+    /* GPU pipeline path */
+    if (s->vk_pipe) {
+        int rc = qw6_vk_pipe_forward((qw6_vk_pipe_t *)s->vk_pipe,
+                                      m, token, pos, s->logits);
+        free(hidden); free(resid); free(norm_w); free(normed);
+        free(attn); free(ffn);
+        return rc;
+    }
+#endif
 
     int rc = qw6_tensor_dequantize_row(&m->tok_embeddings, token, hidden);
     for (int l = 0; l < QW6_NUM_LAYERS && rc == 0; l++) {
@@ -2788,6 +2843,10 @@ int main(int argc, char **argv) {
     bool nothink = false, dump_tokens = false, bench = false, self_test = false;
     bool use_vulkan = false, vulkan_self_test = false;
     bool load_only = false;
+#ifdef QW6_VULKAN
+    void *pipe = NULL;
+    int vk_pipe_ok = 0;
+#endif
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i+1 < argc) model_path = argv[++i];
@@ -2875,6 +2934,11 @@ int main(int argc, char **argv) {
             qw6_model_free(&model);
             return 1;
         }
+        if (use_vulkan && qw6_probe_layer0_expert_iq2_vulkan(&model) != 0) {
+            fprintf(stderr, "qw6: Vulkan layer0 expert IQ2 probe failed\n");
+            qw6_model_free(&model);
+            return 1;
+        }
 #endif
         if (qw6_probe_layer0_shared_ffn(&model) != 0) {
             fprintf(stderr, "qw6: native layer0 shared FFN probe failed\n");
@@ -2951,13 +3015,34 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+#ifdef QW6_VULKAN
+    if (use_vulkan) {
+        if (qw6_vk_pipe_init((qw6_vk_pipe_t **)&pipe, &model) == 0) {
+            fprintf(stderr, "qw6: Vulkan pipeline initialized\n");
+            vk_pipe_ok = 1;
+        } else {
+            fprintf(stderr, "qw6: Vulkan pipeline init failed, falling back to CPU\n");
+        }
+    }
+#endif
+
     qw6_session_t session;
     if (qw6_session_init(&session, &model, (uint32_t)ctx) != 0) {
-        fprintf(stderr, "qw6: session init failed\n");
+#ifdef QW6_VULKAN
+        if (vk_pipe_ok) qw6_vk_pipe_free((qw6_vk_pipe_t *)pipe);
+#endif
         qw6_model_free(&model);
         qw6_tok_free(&tokenizer);
         return 1;
     }
+
+#ifdef QW6_VULKAN
+    session.vk_pipe = vk_pipe_ok ? pipe : NULL;
+    if (use_vulkan) {
+        fprintf(stderr, "qw6: using %s for inference\n",
+                vk_pipe_ok ? "Vulkan GPU pipeline" : "CPU fallback");
+    }
+#endif
 
     if (prompt) {
         fprintf(stderr, "qw6: prompt: \"%s\"\n", prompt);
@@ -3002,6 +3087,9 @@ int main(int argc, char **argv) {
     if (bench) fprintf(stderr, "qw6: benchmarks not yet implemented\n");
 
     qw6_session_free(&session);
+#ifdef QW6_VULKAN
+    if (vk_pipe_ok) qw6_vk_pipe_free((qw6_vk_pipe_t *)pipe);
+#endif
     qw6_model_free(&model);
     qw6_tok_free(&tokenizer);
     return 0;

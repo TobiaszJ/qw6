@@ -1,0 +1,60 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer Q { float q[]; };
+layout(set = 0, binding = 1) buffer K { float k[]; };
+
+layout(push_constant) uniform Push {
+    uint q_dim;
+    uint kv_dim;
+    uint n_heads;
+    uint n_kv_heads;
+    uint position;
+    uint q_head_dim;
+    uint k_head_dim;
+    uint q_rot;
+    uint k_rot;
+    float theta_base;
+} pc;
+
+void rotate_pair_q(uint pair) {
+    uint q_pairs_per_head = pc.q_rot >> 1;
+    uint head = pair / q_pairs_per_head;
+    uint pi = pair - head * q_pairs_per_head;
+    uint i = pi << 1;
+    uint base = head * pc.q_head_dim + i;
+    float theta = float(pc.position) / pow(pc.theta_base, float(i) / float(pc.q_rot));
+    float c = cos(theta);
+    float s = sin(theta);
+    float a = q[base];
+    float b = q[base + 1];
+    q[base] = a * c - b * s;
+    q[base + 1] = a * s + b * c;
+}
+
+void rotate_pair_k(uint pair) {
+    uint k_pairs_per_head = pc.k_rot >> 1;
+    uint head = pair / k_pairs_per_head;
+    uint pi = pair - head * k_pairs_per_head;
+    uint i = pi << 1;
+    uint base = head * pc.k_head_dim + i;
+    float theta = float(pc.position) / pow(pc.theta_base, float(i) / float(pc.k_rot));
+    float c = cos(theta);
+    float s = sin(theta);
+    float a = k[base];
+    float b = k[base + 1];
+    k[base] = a * c - b * s;
+    k[base + 1] = a * s + b * c;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint q_pairs = pc.n_heads * (pc.q_rot >> 1);
+    uint k_pairs = pc.n_kv_heads * (pc.k_rot >> 1);
+    if (gid < q_pairs) {
+        rotate_pair_q(gid);
+    } else if (gid < q_pairs + k_pairs) {
+        rotate_pair_k(gid - q_pairs);
+    }
+}

@@ -1,0 +1,32 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer State { float state[]; };
+layout(set = 0, binding = 1) readonly buffer Query { float query[]; };
+layout(set = 0, binding = 2) writeonly buffer Out { float outv[]; };
+
+layout(push_constant) uniform Push {
+    uint key_heads;
+    uint key_dim;
+    uint val_heads;
+    uint val_dim;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint n = pc.val_heads * pc.val_dim;
+    if (idx >= n) return;
+
+    uint vh = idx / pc.val_dim;
+    uint vd = idx - vh * pc.val_dim;
+    float acc = 0.0;
+    for (uint kh = 0; kh < pc.key_heads; kh++) {
+        uint q_base = kh * pc.key_dim;
+        uint s_base = (kh * pc.key_dim * pc.val_heads + vh) * pc.val_dim;
+        for (uint kd = 0; kd < pc.key_dim; kd++) {
+            acc += state[s_base + kd * pc.val_dim + vd] * query[q_base + kd];
+        }
+    }
+    outv[idx] = acc;
+}

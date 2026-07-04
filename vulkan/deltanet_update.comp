@@ -1,0 +1,47 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer State { float state[]; };
+layout(set = 0, binding = 1) readonly buffer Key { float key[]; };
+layout(set = 0, binding = 2) readonly buffer Value { float value[]; };
+layout(set = 0, binding = 3) readonly buffer Query { float query[]; };
+layout(set = 0, binding = 4) readonly buffer Beta { float beta[]; };
+
+layout(push_constant) uniform Push {
+    uint key_heads;
+    uint key_dim;
+    uint val_heads;
+    uint val_dim;
+    uint has_beta;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint n = pc.key_heads * pc.key_dim * pc.val_heads * pc.val_dim;
+    if (idx >= n) return;
+
+    uint vd = idx % pc.val_dim;
+    uint t = idx / pc.val_dim;
+    uint kh_stride = pc.key_dim * pc.val_heads;
+    uint kh = t / kh_stride;
+    uint q = t - kh * kh_stride;
+
+    uint head_base = kh * pc.key_dim;
+    float dotv = 0.0;
+    for (uint i = 0; i < pc.key_dim; i++) {
+        dotv += key[head_base + i] * query[head_base + i];
+    }
+
+    float b = pc.has_beta != 0 ? beta[kh] : 1.0;
+    float gate = 1.0 / (1.0 + abs(b * dotv));
+    float delta = 0.0;
+    for (uint kd = 0; kd < pc.key_dim; kd++) {
+        for (uint vh = 0; vh < pc.val_heads; vh++) {
+            if (kd + vh == q) {
+                delta += key[head_base + kd] * (value[vh * pc.val_dim + vd] * gate);
+            }
+        }
+    }
+    state[idx] += delta;
+}

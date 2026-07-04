@@ -1,0 +1,37 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer W { uint w16[]; };
+layout(set = 0, binding = 2) writeonly buffer Out { float outv[]; };
+
+layout(push_constant) uniform Push {
+    uint dim;
+    uint kernel_size;
+} pc;
+
+float fp16_to_f32(uint h) {
+    uint sign = (h >> 15) & 1;
+    uint expv = (h >> 10) & 31;
+    uint mant = h & 1023;
+    if (expv == 0) {
+        float s = sign != 0 ? -1.0 : 1.0;
+        return s * (float(mant) / 1048576.0);
+    }
+    uint bits = (sign << 31) | ((expv + 112) << 23) | (mant << 13);
+    return uintBitsToFloat(bits);
+}
+
+void main() {
+    uint d = gl_GlobalInvocationID.x;
+    if (d >= pc.dim) return;
+
+    float acc = 0.0;
+    for (uint k = 0; k < pc.kernel_size; k++) {
+        uint packed = w16[(d * pc.kernel_size + k) >> 1];
+        uint h = ((d * pc.kernel_size + k) & 1) == 0 ? (packed & 0xffff) : (packed >> 16);
+        acc += fp16_to_f32(h) * x[k * pc.dim + d];
+    }
+    outv[d] = acc;
+}
