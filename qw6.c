@@ -529,19 +529,40 @@ static size_t qw6_tensor_row_size_for(qw6_quant_t q, uint32_t cols) {
     return (size_t)(cols / QW6_QK_K) * bs;
 }
 
-static void bind_expert_pack(qw6_tensor_t *dst, const gguf_tensor_info_t *ti,
+static int bind_expert_pack(qw6_tensor_t *dst, const gguf_tensor_info_t *ti,
                              uint8_t *base, uint64_t abs_offset,
                              uint64_t span) {
     QW6_ASSERT_PTR(dst); QW6_ASSERT_PTR(ti);
-    if (ti->n_dims != 3 || ti->dims[2] != QW6_NUM_EXPERTS) return;
+    if (ti->n_dims != 3 || ti->dims[2] != QW6_NUM_EXPERTS) {
+        fprintf(stderr,
+                "qw6: expert pack '%s' has %u dims (expected 3 dims, last=%lld, expected %d)\n",
+                ti->name, ti->n_dims,
+                (long long)(ti->n_dims >= 3 ? ti->dims[2] : 0),
+                QW6_NUM_EXPERTS);
+        return -1;
+    }
 
     qw6_quant_t q = qw6_gguf_to_quant(ti->type);
     uint32_t cols = (uint32_t)ti->dims[0];
     uint32_t rows = (uint32_t)ti->dims[1];
     size_t row_size = qw6_tensor_row_size_for(q, cols);
     size_t expert_size = row_size * rows;
-    if (row_size == 0 || expert_size == 0 ||
-        expert_size * QW6_NUM_EXPERTS > span) return;
+    uint64_t total_needed = (uint64_t)expert_size * QW6_NUM_EXPERTS;
+    if (row_size == 0 || expert_size == 0) {
+        fprintf(stderr,
+                "qw6: expert pack '%s' zero row/expert size: quant=%d cols=%u rows=%u row_size=%zu\n",
+                ti->name, (int)q, cols, rows, row_size);
+        return -1;
+    }
+    if (total_needed > span) {
+        fprintf(stderr,
+                "qw6: expert pack '%s' needs %llu bytes but span is %llu bytes (quant=%d cols=%u rows=%u row_size=%zu)\n",
+                ti->name,
+                (unsigned long long)total_needed,
+                (unsigned long long)span,
+                (int)q, cols, rows, row_size);
+        return -1;
+    }
 
     for (uint32_t e = 0; e < QW6_NUM_EXPERTS; e++) {
         snprintf(dst[e].name, sizeof(dst[e].name), "%.100s#%03u", ti->name, e);
@@ -557,6 +578,7 @@ static void bind_expert_pack(qw6_tensor_t *dst, const gguf_tensor_info_t *ti,
         dst[e].data_size = expert_size;
         dst[e].data = base ? (void *)(base + dst[e].file_offset) : NULL;
     }
+    return 0;
 }
 
 static int bind_layer_tensor(qw6_model_t *m, int layer,
@@ -593,13 +615,16 @@ static int bind_layer_tensor(qw6_model_t *m, int layer,
     else if (strcmp(local, "ffn_gate_inp.weight") == 0) dst = &m->layers[layer].moe_router;
     else if (strcmp(local, "ffn_gate_inp_shexp.weight") == 0) dst = &m->layers[layer].shared_router;
     else if (strcmp(local, "ffn_gate_exps.weight") == 0) {
-        bind_expert_pack(m->layers[layer].expert_gate, ti, base, abs_offset, span);
+        if (bind_expert_pack(m->layers[layer].expert_gate, ti, base, abs_offset, span) != 0)
+            return -1;
         return 1;
     } else if (strcmp(local, "ffn_up_exps.weight") == 0) {
-        bind_expert_pack(m->layers[layer].expert_up, ti, base, abs_offset, span);
+        if (bind_expert_pack(m->layers[layer].expert_up, ti, base, abs_offset, span) != 0)
+            return -1;
         return 1;
     } else if (strcmp(local, "ffn_down_exps.weight") == 0) {
-        bind_expert_pack(m->layers[layer].expert_down, ti, base, abs_offset, span);
+        if (bind_expert_pack(m->layers[layer].expert_down, ti, base, abs_offset, span) != 0)
+            return -1;
         return 1;
     }
     else if (strcmp(local, "ffn_gate_shexp.weight") == 0) dst = &m->layers[layer].shared_gate;
@@ -646,6 +671,41 @@ static int qw6_validate_qwen_metadata(const gguf_ctx_t *ctx) {
         fprintf(stderr, "qw6: expected hidden size %d, got %u\n",
                 QW6_HIDDEN_SIZE, hidden->val.u32);
         return -1;
+    }
+
+    /* Additional checks against hard-coded model constants */
+    const gguf_kv_t *vocab = qw6_gguf_find_kv(ctx, "general.attention.head_count");
+    if (vocab && vocab->type == GGUF_TYPE_UINT32) {
+        if (vocab->val.u32 != QW6_NUM_Q_HEADS)
+            fprintf(stderr, "qw6: WARNING: expected %d query heads, got %u\n",
+                    QW6_NUM_Q_HEADS, vocab->val.u32);
+    }
+    vocab = qw6_gguf_find_kv(ctx, "general.attention.head_count_kv");
+    if (vocab && vocab->type == GGUF_TYPE_UINT32) {
+        if (vocab->val.u32 != QW6_NUM_KV_HEADS)
+            fprintf(stderr, "qw6: WARNING: expected %d KV heads, got %u\n",
+                    QW6_NUM_KV_HEADS, vocab->val.u32);
+    }
+    vocab = qw6_gguf_find_kv(ctx, "qwen3_5_moe.expert_count");
+    if (!vocab) vocab = qw6_gguf_find_kv(ctx, "qwen35moe.expert_count");
+    if (vocab && vocab->type == GGUF_TYPE_UINT32) {
+        if (vocab->val.u32 != QW6_NUM_EXPERTS)
+            fprintf(stderr, "qw6: WARNING: expected %d experts, got %u\n",
+                    QW6_NUM_EXPERTS, vocab->val.u32);
+    }
+    vocab = qw6_gguf_find_kv(ctx, "qwen3_5_moe.expert_count_used");
+    if (!vocab) vocab = qw6_gguf_find_kv(ctx, "qwen35moe.expert_count_used");
+    if (vocab && vocab->type == GGUF_TYPE_UINT32) {
+        if (vocab->val.u32 != QW6_EXPERTS_PER_TOK)
+            fprintf(stderr, "qw6: WARNING: expected %d experts per tok, got %u\n",
+                    QW6_EXPERTS_PER_TOK, vocab->val.u32);
+    }
+    vocab = qw6_gguf_find_kv(ctx, "qwen3_5_moe.feed_forward_length");
+    if (!vocab) vocab = qw6_gguf_find_kv(ctx, "qwen35moe.feed_forward_length");
+    if (vocab && vocab->type == GGUF_TYPE_UINT32) {
+        if (vocab->val.u32 != QW6_MOE_INTER)
+            fprintf(stderr, "qw6: WARNING: expected MoE inter size %d, got %u\n",
+                    QW6_MOE_INTER, vocab->val.u32);
     }
     return 0;
 }
@@ -988,9 +1048,13 @@ int qw6_gguf_read_file(const char *path, qw6_model_t *m) {
         else if (strcmp(name, "output_norm.weight") == 0)
             qw6_tensor_bind(&m->output_norm, &ctx.tensors[i],
                             weight_base, abs_offset, span);
-        else if (layer >= 0)
-            (void)bind_layer_tensor(m, layer, &ctx.tensors[i],
-                                    weight_base, abs_offset, span);
+        else if (layer >= 0) {
+            if (bind_layer_tensor(m, layer, &ctx.tensors[i],
+                                  weight_base, abs_offset, span) < 0) {
+                qw6_gguf_free(&ctx);
+                return -1;
+            }
+        }
     }
 
     uint32_t layers_with_tensors = 0;
