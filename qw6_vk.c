@@ -2,6 +2,7 @@
 
 #include "qw6.h"
 #include "qw6_vk.h"
+#include "qw6_iq_tables.h"
 
 #include <vulkan/vulkan.h>
 
@@ -10,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 
 typedef struct {
     VkBuffer buffer;
@@ -39,10 +41,14 @@ typedef struct {
 #define QW6_VK_CACHE_MAX 32
 typedef struct {
     char shader_path[128];
+    uint32_t n_buffers;
+    uint32_t push_size;
     VkPipelineLayout layout;
     VkDescriptorSetLayout dsl;
     VkPipeline pipeline;
     VkShaderModule sm;
+    uint64_t calls;
+    double total_ms;
     int valid;
 } vk_pipe_cache_t;
 struct qw6_vk_pipe_s;
@@ -78,6 +84,12 @@ static int qw6_vk_read_file(const char *path, uint32_t **out_words, size_t *out_
     *out_words = buf;
     *out_bytes = (size_t)n;
     return 0;
+}
+
+static double qw6_vk_now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
 }
 
 static uint32_t qw6_vk_find_memory_type(qw6_vk_t *vk, uint32_t bits,
@@ -302,7 +314,7 @@ static int qw6_vk_dispatch(qw6_vk_t *vk, const char *shader_path,
     for (uint32_t i = 0; i < n_buffers; i++) {
         infos[i].buffer = buffers[i]->buffer;
         infos[i].offset = offsets ? offsets[i] : 0;
-        infos[i].range = buffers[i]->size;
+        infos[i].range = buffers[i]->size - infos[i].offset;
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = ds;
         writes[i].dstBinding = i;
@@ -471,6 +483,13 @@ typedef struct {
     uint32_t val_dim;
     uint32_t has_beta;
 } qw6_vk_deltanet_push_t;
+
+typedef struct {
+    uint32_t key_heads;
+    uint32_t val_heads;
+    uint32_t dim;
+    float scale;
+} qw6_vk_deltanet_gated_push_t;
 
 typedef struct {
     uint32_t q_dim;
@@ -1973,10 +1992,14 @@ struct qw6_vk_pipe_s {
     qw6_vk_t vk;
     vk_pipe_cache_t pipe_cache[QW6_VK_CACHE_MAX];
     int pipe_cache_count;
+    VkDescriptorPool descriptor_pool;
+    VkCommandBuffer dispatch_cb;
+    VkFence dispatch_fence;
 
     /* Big buffer housing all weight tensors */
     qw6_vk_buffer_t weights;
     size_t weight_capacity;
+    qw6_vk_buffer_t iq2s_grid;
 
     /* Persistent scratch buffers */
     qw6_vk_buffer_t scr_hidden;    /* [HIDDEN_SIZE] float */
@@ -2002,7 +2025,7 @@ struct qw6_vk_pipe_s {
 
 /* Cached dispatch: same as qw6_vk_dispatch but reuses pipelines and layouts.
  * Must be defined here (after struct) so it can access the cache. */
-__attribute__((unused)) static int qw6_vk_pipe_dispatch(struct qw6_vk_pipe_s *p, const char *shader_path,
+static int qw6_vk_pipe_dispatch(struct qw6_vk_pipe_s *p, const char *shader_path,
                                  qw6_vk_buffer_t **buffers, const size_t *offsets,
                                  uint32_t n_buffers,
                                  const void *push, uint32_t push_size,
@@ -2013,7 +2036,9 @@ __attribute__((unused)) static int qw6_vk_pipe_dispatch(struct qw6_vk_pipe_s *p,
     int ci = -1;
     for (int i = 0; i < p->pipe_cache_count; i++) {
         if (p->pipe_cache[i].valid &&
-            strcmp(p->pipe_cache[i].shader_path, shader_path) == 0) {
+            strcmp(p->pipe_cache[i].shader_path, shader_path) == 0 &&
+            p->pipe_cache[i].n_buffers == n_buffers &&
+            p->pipe_cache[i].push_size == push_size) {
             ci = i;
             break;
         }
@@ -2022,9 +2047,12 @@ __attribute__((unused)) static int qw6_vk_pipe_dispatch(struct qw6_vk_pipe_s *p,
         ci = p->pipe_cache_count++;
         vk_pipe_cache_t *c = &p->pipe_cache[ci];
         strncpy(c->shader_path, shader_path, sizeof(c->shader_path) - 1);
+        c->n_buffers = n_buffers;
+        c->push_size = push_size;
         c->valid = 0;
 
         VkDescriptorSetLayoutBinding bindings[5];
+        memset(bindings, 0, sizeof(bindings));
         VkDescriptorSetLayoutCreateInfo dlci = {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .bindingCount = n_buffers,
@@ -2076,25 +2104,30 @@ __attribute__((unused)) static int qw6_vk_pipe_dispatch(struct qw6_vk_pipe_s *p,
         if (vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pci, NULL, &c->pipeline) != VK_SUCCESS) return -1;
         c->valid = 1;
     }
-    if (ci < 0) return qw6_vk_dispatch(vk, shader_path, buffers, offsets, n_buffers, push, push_size, gx, gy, gz);
+    if (ci < 0)
+        return qw6_vk_dispatch(vk, shader_path, buffers, offsets,
+                               n_buffers, push, push_size, gx, gy, gz);
 
     vk_pipe_cache_t *c = &p->pipe_cache[ci];
 
-    /* Allocate descriptor set from temp pool */
-    VkDescriptorPoolSize pool_size = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, n_buffers };
-    VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &pool_size };
-    VkDescriptorPool pool;
-    if (vkCreateDescriptorPool(vk->device, &dpci, NULL, &pool) != VK_SUCCESS) return -1;
-    VkDescriptorSetAllocateInfo dsai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool, .descriptorSetCount = 1, .pSetLayouts = &c->dsl };
+    vkResetDescriptorPool(vk->device, p->descriptor_pool, 0);
+    VkDescriptorSetAllocateInfo dsai = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = p->descriptor_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &c->dsl,
+    };
     VkDescriptorSet ds;
-    if (vkAllocateDescriptorSets(vk->device, &dsai, &ds) != VK_SUCCESS) { vkDestroyDescriptorPool(vk->device, pool, NULL); return -1; }
+    if (vkAllocateDescriptorSets(vk->device, &dsai, &ds) != VK_SUCCESS) return -1;
 
     VkDescriptorBufferInfo infos[5];
     VkWriteDescriptorSet writes[5];
+    memset(infos, 0, sizeof(infos));
+    memset(writes, 0, sizeof(writes));
     for (uint32_t i = 0; i < n_buffers && i < 5; i++) {
         infos[i].buffer = buffers[i]->buffer;
         infos[i].offset = offsets ? offsets[i] : 0;
-        infos[i].range = buffers[i]->size;
+        infos[i].range = buffers[i]->size - infos[i].offset;
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = ds;
         writes[i].dstBinding = i;
@@ -2104,27 +2137,24 @@ __attribute__((unused)) static int qw6_vk_pipe_dispatch(struct qw6_vk_pipe_s *p,
     }
     vkUpdateDescriptorSets(vk->device, n_buffers, writes, 0, NULL);
 
-    VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = vk->command_pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
-    VkCommandBuffer cb;
-    if (vkAllocateCommandBuffers(vk->device, &cbai, &cb) != VK_SUCCESS) { vkDestroyDescriptorPool(vk->device, pool, NULL); return -1; }
+    VkCommandBuffer cb = p->dispatch_cb;
+    vkResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo begin = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    vkBeginCommandBuffer(cb, &begin);
+    if (vkBeginCommandBuffer(cb, &begin) != VK_SUCCESS) return -1;
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, c->pipeline);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, c->layout, 0, 1, &ds, 0, NULL);
     if (push_size) vkCmdPushConstants(cb, c->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
     vkCmdDispatch(cb, gx, gy, gz);
-    vkEndCommandBuffer(cb);
+    if (vkEndCommandBuffer(cb) != VK_SUCCESS) return -1;
 
-    VkFence fence;
-    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    vkCreateFence(vk->device, &fci, NULL, &fence);
+    vkResetFences(vk->device, 1, &p->dispatch_fence);
     VkSubmitInfo submit = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
-    vkQueueSubmit(vk->queue, 1, &submit, fence);
-    vkWaitForFences(vk->device, 1, &fence, VK_TRUE, UINT64_MAX);
+    double t0 = qw6_vk_now_ms();
+    if (vkQueueSubmit(vk->queue, 1, &submit, p->dispatch_fence) != VK_SUCCESS) return -1;
+    if (vkWaitForFences(vk->device, 1, &p->dispatch_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return -1;
+    c->calls++;
+    c->total_ms += qw6_vk_now_ms() - t0;
 
-    vkDestroyFence(vk->device, fence, NULL);
-    vkFreeCommandBuffers(vk->device, vk->command_pool, 1, &cb);
-    vkDestroyDescriptorPool(vk->device, pool, NULL);
     return 0;
 }
 
@@ -2164,22 +2194,28 @@ static int qw6_vk_pipe_matvec(struct qw6_vk_pipe_s *p,
 
     switch (t->quant) {
     case QW6_Q_FP32:
-        return qw6_vk_dispatch(&p->vk, "vulkan/matvec_f32.spv",
-                               bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
+        return qw6_vk_pipe_dispatch(p, "vulkan/matvec_f32.spv",
+                                    bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
     case QW6_Q_Q5_K:
-        return qw6_vk_dispatch(&p->vk, "vulkan/matmul_q5k.spv",
-                               bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
+        return qw6_vk_pipe_dispatch(p, "vulkan/matmul_q5k.spv",
+                                    bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
     case QW6_Q_Q6_K:
-        return qw6_vk_dispatch(&p->vk, "vulkan/matmul_q6k.spv",
-                               bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
+        return qw6_vk_pipe_dispatch(p, "vulkan/matmul_q6k.spv",
+                                    bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
     case QW6_Q_Q4_K_M:
     case QW6_Q_Q4_K_S:
-        return qw6_vk_dispatch(&p->vk, "vulkan/matmul_q4k.spv",
-                               bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
+        return qw6_vk_pipe_dispatch(p, "vulkan/matmul_q4k.spv",
+                                    bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
     case QW6_Q_IQ2_XXS:
     case QW6_Q_IQ2_M:
-        return qw6_vk_dispatch(&p->vk, "vulkan/matmul_iq2xxs.spv",
-                               bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
+        return qw6_vk_pipe_dispatch(p, "vulkan/matmul_iq2xxs.spv",
+                                    bufs, offs, 3, &push, sizeof(push), rows, 1, 1);
+    case QW6_Q_IQ2_S: {
+        const size_t offs4[4] = {t->vk_offset, 0, 0, 0};
+        qw6_vk_buffer_t *bufs4[4] = {&p->weights, inp, out, &p->iq2s_grid};
+        return qw6_vk_pipe_dispatch(p, "vulkan/matmul_iq2s.spv",
+                                    bufs4, offs4, 4, &push, sizeof(push), rows, 1, 1);
+    }
     default:
         /* Unsupported on GPU — caller must fall back to CPU */
         return -1;
@@ -2194,8 +2230,8 @@ static int qw6_vk_pipe_rmsnorm(struct qw6_vk_pipe_s *p,
     const size_t zero[3] = {0, 0, 0};
     qw6_vk_buffer_t *bufs[3] = {x, w, y};
     qw6_vk_rmsnorm_push_t push = {.n = n, .eps = eps};
-    return qw6_vk_dispatch(&p->vk, "vulkan/rmsnorm_full.spv",
-                           bufs, zero, 3, &push, sizeof(push), 1, 1, 1);
+    return qw6_vk_pipe_dispatch(p, "vulkan/rmsnorm_full.spv",
+                                bufs, zero, 3, &push, sizeof(push), 1, 1, 1);
 }
 
 static int qw6_vk_pipe_add(struct qw6_vk_pipe_s *p,
@@ -2203,9 +2239,9 @@ static int qw6_vk_pipe_add(struct qw6_vk_pipe_s *p,
                             qw6_vk_buffer_t *c, uint32_t n) {
     const size_t zero[3] = {0, 0, 0};
     qw6_vk_buffer_t *bufs[3] = {a, b, c};
-    return qw6_vk_dispatch(&p->vk, "vulkan/add.spv",
-                           bufs, zero, 3, &n, sizeof(n),
-                           (n + 255) / 256, 1, 1);
+    return qw6_vk_pipe_dispatch(p, "vulkan/add.spv",
+                                bufs, zero, 3, &n, sizeof(n),
+                                (n + 255) / 256, 1, 1);
 }
 
 static int qw6_vk_pipe_silu_mul(struct qw6_vk_pipe_s *p,
@@ -2214,12 +2250,12 @@ static int qw6_vk_pipe_silu_mul(struct qw6_vk_pipe_s *p,
     const size_t zero[3] = {0, 0, 0};
     qw6_vk_buffer_t *bufs[3] = {gate, up, out};
     qw6_vk_n_push_t push = {.n = n};
-    return qw6_vk_dispatch(&p->vk, "vulkan/silu_mul.spv",
-                           bufs, zero, 3, &push, sizeof(push),
-                           (n + 255) / 256, 1, 1);
+    return qw6_vk_pipe_dispatch(p, "vulkan/silu_mul.spv",
+                                bufs, zero, 3, &push, sizeof(push),
+                                (n + 255) / 256, 1, 1);
 }
 
-__attribute__((unused)) static int qw6_vk_pipe_mrope(struct qw6_vk_pipe_s *p,
+static int qw6_vk_pipe_mrope(struct qw6_vk_pipe_s *p,
                               qw6_vk_buffer_t *qbuf, qw6_vk_buffer_t *kbuf,
                               uint32_t q_dim, uint32_t kv_dim,
                               uint32_t n_heads, uint32_t n_kv_heads,
@@ -2235,12 +2271,12 @@ __attribute__((unused)) static int qw6_vk_pipe_mrope(struct qw6_vk_pipe_s *p,
         .theta_base = QW6_ROPE_THETA,
     };
     uint32_t total_pairs = (q_dim + kv_dim) / 2;
-    return qw6_vk_dispatch(&p->vk, "vulkan/rope_mrope.spv",
-                           bufs, zero, 2, &push, sizeof(push),
-                           (total_pairs + 255) / 256, 1, 1);
+    return qw6_vk_pipe_dispatch(p, "vulkan/rope_mrope.spv",
+                                bufs, zero, 2, &push, sizeof(push),
+                                (total_pairs + 255) / 256, 1, 1);
 }
 
-__attribute__((unused)) static int qw6_vk_pipe_attention_gqa(struct qw6_vk_pipe_s *p,
+static int qw6_vk_pipe_attention_gqa(struct qw6_vk_pipe_s *p,
                                       qw6_vk_buffer_t *qbuf,
                                       qw6_vk_buffer_t *k_cache,
                                       qw6_vk_buffer_t *v_cache,
@@ -2257,9 +2293,9 @@ __attribute__((unused)) static int qw6_vk_pipe_attention_gqa(struct qw6_vk_pipe_
         .n_kv_heads = n_kv_heads,
         .head_dim = head_dim,
     };
-    return qw6_vk_dispatch(&p->vk, "vulkan/attention_gqa.spv",
-                           bufs, zero, 4, &push, sizeof(push),
-                           n_q_heads, 1, 1);
+    return qw6_vk_pipe_dispatch(p, "vulkan/attention_gqa.spv",
+                                bufs, zero, 4, &push, sizeof(push),
+                                n_q_heads, 1, 1);
 }
 
 __attribute__((unused)) static int qw6_vk_pipe_conv1d(struct qw6_vk_pipe_s *p,
@@ -2269,9 +2305,25 @@ __attribute__((unused)) static int qw6_vk_pipe_conv1d(struct qw6_vk_pipe_s *p,
     const size_t zero[3] = {0, 0, 0};
     qw6_vk_buffer_t *bufs[3] = {xbuf, wbuf, outbuf};
     qw6_vk_conv1d_push_t push = {.dim = dim, .kernel_size = kernel_size};
-    return qw6_vk_dispatch(&p->vk, "vulkan/deltanet_conv1d.spv",
-                           bufs, zero, 3, &push, sizeof(push),
-                           (dim + 255) / 256, 1, 1);
+    return qw6_vk_pipe_dispatch(p, "vulkan/deltanet_conv1d.spv",
+                                bufs, zero, 3, &push, sizeof(push),
+                                (dim + 255) / 256, 1, 1);
+}
+
+static int qw6_vk_pipe_conv1d_f32_state(struct qw6_vk_pipe_s *p,
+                                        qw6_vk_buffer_t *state,
+                                        qw6_vk_buffer_t *x,
+                                        const qw6_tensor_t *w,
+                                        qw6_vk_buffer_t *out,
+                                        uint32_t dim,
+                                        uint32_t kernel_size) {
+    if (!w || w->quant != QW6_Q_FP32 || w->vk_offset == (size_t)-1) return -1;
+    const size_t offs[4] = {0, 0, w->vk_offset, 0};
+    qw6_vk_buffer_t *bufs[4] = {state, x, &p->weights, out};
+    qw6_vk_conv1d_push_t push = {.dim = dim, .kernel_size = kernel_size};
+    return qw6_vk_pipe_dispatch(p, "vulkan/deltanet_conv1d_f32.spv",
+                                bufs, offs, 4, &push, sizeof(push),
+                                (dim + 255) / 256, 1, 1);
 }
 
 __attribute__((unused)) static int qw6_vk_pipe_deltanet_retrieve(struct qw6_vk_pipe_s *p,
@@ -2290,9 +2342,32 @@ __attribute__((unused)) static int qw6_vk_pipe_deltanet_retrieve(struct qw6_vk_p
         .has_beta = 0,
     };
     uint32_t out_n = val_heads * val_dim;
-    return qw6_vk_dispatch(&p->vk, "vulkan/deltanet_retrieve.spv",
-                           bufs, zero, 3, &push, sizeof(push),
-                           (out_n + 255) / 256, 1, 1);
+    return qw6_vk_pipe_dispatch(p, "vulkan/deltanet_retrieve.spv",
+                                bufs, zero, 3, &push, sizeof(push),
+                                (out_n + 255) / 256, 1, 1);
+}
+
+static int qw6_vk_pipe_deltanet_gated(struct qw6_vk_pipe_s *p,
+                                      qw6_vk_buffer_t *state,
+                                      qw6_vk_buffer_t *qkv,
+                                      qw6_vk_buffer_t *gate,
+                                      qw6_vk_buffer_t *beta,
+                                      qw6_vk_buffer_t *out,
+                                      uint32_t key_heads,
+                                      uint32_t val_heads,
+                                      uint32_t dim) {
+    const size_t zero[5] = {0, 0, 0, 0, 0};
+    qw6_vk_buffer_t *bufs[5] = {state, qkv, gate, beta, out};
+    qw6_vk_deltanet_gated_push_t push = {
+        .key_heads = key_heads,
+        .val_heads = val_heads,
+        .dim = dim,
+        .scale = 1.0f / sqrtf((float)dim),
+    };
+    uint32_t n = val_heads * dim;
+    return qw6_vk_pipe_dispatch(p, "vulkan/deltanet_gated.spv",
+                                bufs, zero, 5, &push, sizeof(push),
+                                (n + 255) / 256, 1, 1);
 }
 
 __attribute__((unused)) static int qw6_vk_pipe_deltanet_update(struct qw6_vk_pipe_s *p,
@@ -2313,9 +2388,9 @@ __attribute__((unused)) static int qw6_vk_pipe_deltanet_update(struct qw6_vk_pip
         .has_beta = 1,
     };
     uint32_t state_n = val_heads * val_dim * val_dim;
-    return qw6_vk_dispatch(&p->vk, "vulkan/deltanet_update.spv",
-                           bufs, zero, 5, &push, sizeof(push),
-                           (state_n + 255) / 256, 1, 1);
+    return qw6_vk_pipe_dispatch(p, "vulkan/deltanet_update.spv",
+                                bufs, zero, 5, &push, sizeof(push),
+                                (state_n + 255) / 256, 1, 1);
 }
 
 __attribute__((unused)) static int qw6_vk_pipe_moe_route(struct qw6_vk_pipe_s *p,
@@ -2326,8 +2401,8 @@ __attribute__((unused)) static int qw6_vk_pipe_moe_route(struct qw6_vk_pipe_s *p
     const size_t zero[3] = {0, 0, 0};
     qw6_vk_buffer_t *bufs[3] = {logits, indices, weights};
     qw6_vk_moe_route_push_t push = {.n_experts = n_experts, .top_k = top_k};
-    return qw6_vk_dispatch(&p->vk, "vulkan/moe_route.spv",
-                           bufs, zero, 3, &push, sizeof(push), 1, 1, 1);
+    return qw6_vk_pipe_dispatch(p, "vulkan/moe_route.spv",
+                                bufs, zero, 3, &push, sizeof(push), 1, 1, 1);
 }
 
 __attribute__((unused)) static int qw6_vk_pipe_moe_gather(struct qw6_vk_pipe_s *p,
@@ -2344,9 +2419,9 @@ __attribute__((unused)) static int qw6_vk_pipe_moe_gather(struct qw6_vk_pipe_s *
         .has_shared = shared_out ? 1u : 0u,
         .shared_weight = shared_weight,
     };
-    return qw6_vk_dispatch(&p->vk, "vulkan/moe_gather.spv",
-                           bufs, zero, 4, &push, sizeof(push),
-                           (dim + 255) / 256, 1, 1);
+    return qw6_vk_pipe_dispatch(p, "vulkan/moe_gather.spv",
+                                bufs, zero, 4, &push, sizeof(push),
+                                (dim + 255) / 256, 1, 1);
 }
 
 /* ---- Init ---- */
@@ -2361,6 +2436,39 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m) {
         return -1;
     }
 
+    VkDescriptorPoolSize pool_size = {
+        .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 5,
+    };
+    VkDescriptorPoolCreateInfo dpci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+        .maxSets = 1,
+        .poolSizeCount = 1,
+        .pPoolSizes = &pool_size,
+    };
+    if (vkCreateDescriptorPool(ctx->vk.device, &dpci, NULL,
+                               &ctx->descriptor_pool) != VK_SUCCESS) {
+        qw6_vk_free(&ctx->vk); free(ctx); return -1;
+    }
+
+    VkCommandBufferAllocateInfo cbai = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = ctx->vk.command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    if (vkAllocateCommandBuffers(ctx->vk.device, &cbai,
+                                 &ctx->dispatch_cb) != VK_SUCCESS) {
+        qw6_vk_pipe_free(ctx); return -1;
+    }
+
+    VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vkCreateFence(ctx->vk.device, &fci, NULL,
+                      &ctx->dispatch_fence) != VK_SUCCESS) {
+        qw6_vk_pipe_free(ctx); return -1;
+    }
+
     ctx->max_ctx = m->max_context > 0 ? m->max_context : QW6_DEFAULT_CTX;
 
     /* ---- Allocate the big weight buffer ---- */
@@ -2369,6 +2477,11 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m) {
                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
         qw6_vk_free(&ctx->vk); free(ctx); return -1;
     }
+    if (qw6_vk_buffer_create(&ctx->vk, &ctx->iq2s_grid, sizeof(iq2s_grid),
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
+        qw6_vk_pipe_free(ctx); return -1;
+    }
+    memcpy(ctx->iq2s_grid.mapped, iq2s_grid, sizeof(iq2s_grid));
 
     /* ---- Allocate scratch buffers ---- */
     /* Hidden-size buffers */
@@ -2483,6 +2596,7 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m) {
         }
         /* Change quant type to FP32 and point to dequantized data */
         ao->quant = QW6_Q_FP32;
+        ao->data = deq_ptr;
         ao->vk_offset = deq_off;
         ao->data_size = f32_sz;
         ctx->weight_capacity = deq_off + f32_sz;
@@ -2570,6 +2684,8 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
 
     /* ---- Layer loop ---- */
     for (int l = 0; l < QW6_NUM_LAYERS; l++) {
+        qw6_vk_buffer_t *att_out = att;
+
         /* Copy hidden -> resid */
         memcpy(res->mapped, hid->mapped, QW6_HIDDEN_SIZE * sizeof(float));
 
@@ -2597,26 +2713,29 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                       QW6_NUM_VALUE_HEADS, QW6_HIDDEN_SIZE);
             float *alpha_cpu = (float *)ffn->mapped;
 
-            /* Conv1D state: shift and apply causal conv1d on CPU for now
-             * (conv_state is small per step) */
+            /* Conv1D state: shift + causal conv + SiLU */
             float *qkv = (float *)s0->mapped;
             float *z   = (float *)s1->mapped;
             float *cs  = (float *)p->conv_state[l].mapped;
             float *conv_out = (float *)s0->mapped; /* reuse s0 */
 
-            /* Shift conv state and apply causal conv1d */
-            memmove(cs, cs + QW6_LINEAR_QKV_DIM,
-                    (size_t)(QW6_CONV1D_KERNEL - 1) * QW6_LINEAR_QKV_DIM * sizeof(float));
-            memcpy(cs + (size_t)(QW6_CONV1D_KERNEL - 1) * QW6_LINEAR_QKV_DIM,
-                   qkv, QW6_LINEAR_QKV_DIM * sizeof(float));
+            if (qw6_vk_pipe_conv1d_f32_state(p, &p->conv_state[l], s0,
+                                             &m->layers[l].conv1d, s0,
+                                             QW6_LINEAR_QKV_DIM,
+                                             QW6_CONV1D_KERNEL) != 0) {
+                memmove(cs, cs + QW6_LINEAR_QKV_DIM,
+                        (size_t)(QW6_CONV1D_KERNEL - 1) * QW6_LINEAR_QKV_DIM * sizeof(float));
+                memcpy(cs + (size_t)(QW6_CONV1D_KERNEL - 1) * QW6_LINEAR_QKV_DIM,
+                       qkv, QW6_LINEAR_QKV_DIM * sizeof(float));
 
-            const float *cw = (const float *)m->layers[l].conv1d.data;
-            for (int c = 0; c < QW6_LINEAR_QKV_DIM; c++) {
-                float sum = 0.0f;
-                for (int k = 0; k < QW6_CONV1D_KERNEL; k++)
-                    sum += cs[(size_t)k * QW6_LINEAR_QKV_DIM + c] *
-                           cw[(size_t)c * QW6_CONV1D_KERNEL + k];
-                conv_out[c] = qw6_silu(sum);
+                const float *cw = (const float *)m->layers[l].conv1d.data;
+                for (int c = 0; c < QW6_LINEAR_QKV_DIM; c++) {
+                    float sum = 0.0f;
+                    for (int k = 0; k < QW6_CONV1D_KERNEL; k++)
+                        sum += cs[(size_t)k * QW6_LINEAR_QKV_DIM + c] *
+                               cw[(size_t)c * QW6_CONV1D_KERNEL + k];
+                    conv_out[c] = qw6_silu(sum);
+                }
             }
 
             /* Split QKV, L2-normalize heads */
@@ -2634,12 +2753,17 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                 alpha_cpu[h] = qw6_softplus(alpha_cpu[h] + dt_cpu[h]) * a_cpu[h];
             }
 
-            /* Gated DeltaNet single-token forward on CPU */
-            float *state = (float *)p->dn_state[l].mapped;
-            float *gdn = (float *)s0->mapped; /* reuse s0 for gdn output */
-            qw6_gated_delta_net_single(gdn, state, q, k, v, alpha_cpu, beta_cpu);
-            memcpy(p->dn_state[l].mapped, state, 
-                   (size_t)QW6_NUM_VALUE_HEADS * QW6_VALUE_HEAD_DIM * QW6_VALUE_HEAD_DIM * sizeof(float));
+            /* Fused Gated DeltaNet recurrent update + retrieve. */
+            float *gdn = (float *)nrm->mapped; /* reuse nrm for GDN output */
+            if (qw6_vk_pipe_deltanet_gated(p, &p->dn_state[l], s0, ffn, att, nrm,
+                                           QW6_NUM_KEY_HEADS,
+                                           QW6_NUM_VALUE_HEADS,
+                                           QW6_VALUE_HEAD_DIM) != 0) {
+                float *state = (float *)p->dn_state[l].mapped;
+                qw6_gated_delta_net_single(gdn, state, q, k, v, alpha_cpu, beta_cpu);
+                memcpy(p->dn_state[l].mapped, state,
+                       (size_t)QW6_NUM_VALUE_HEADS * QW6_VALUE_HEAD_DIM * QW6_VALUE_HEAD_DIM * sizeof(float));
+            }
 
             /* RMSNorm the GDN output, multiply by SiLU(z) */
             float *dn_norm_w = (float *)m->layers[l].dn_norm.data;
@@ -2656,6 +2780,7 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
             /* Output projection: dn_out * gated -> attn */
             VK_MATMUL(&m->layers[l].dn_out, s1, att,
                       QW6_HIDDEN_SIZE, QW6_LINEAR_VALUE_DIM);
+            att_out = att;
 
         } else {
             /* ---- Full Attention (GQA) ---- */
@@ -2689,14 +2814,20 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                                 k_cpu + h * QW6_HEAD_DIM,
                                 k_norm_w, QW6_HEAD_DIM);
 
-            /* MRoPE (CPU) */
+            /* MRoPE */
             {
                 int rot_dim = (int)(QW6_HEAD_DIM * QW6_PARTIAL_ROTARY);
-                qw6_cpu_mrope(q_cpu, k_cpu,
-                              QW6_NUM_Q_HEADS * QW6_HEAD_DIM,
-                              QW6_NUM_KV_HEADS * QW6_HEAD_DIM,
-                              QW6_NUM_Q_HEADS, QW6_NUM_KV_HEADS,
-                              pos, rot_dim);
+                if (qw6_vk_pipe_mrope(p, s0, s1,
+                                       QW6_NUM_Q_HEADS * QW6_HEAD_DIM,
+                                       QW6_NUM_KV_HEADS * QW6_HEAD_DIM,
+                                       QW6_NUM_Q_HEADS, QW6_NUM_KV_HEADS,
+                                       pos, (uint32_t)rot_dim) != 0) {
+                    qw6_cpu_mrope(q_cpu, k_cpu,
+                                  QW6_NUM_Q_HEADS * QW6_HEAD_DIM,
+                                  QW6_NUM_KV_HEADS * QW6_HEAD_DIM,
+                                  QW6_NUM_Q_HEADS, QW6_NUM_KV_HEADS,
+                                  pos, rot_dim);
+                }
             }
 
             /* Write K,V to KV cache */
@@ -2707,30 +2838,37 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
             memcpy(k_slot, k_cpu, QW6_NUM_KV_HEADS * QW6_HEAD_DIM * sizeof(float));
             memcpy(v_slot, (float *)ffn->mapped, QW6_NUM_KV_HEADS * QW6_HEAD_DIM * sizeof(float));
 
-            /* GQA attention (CPU) */
+            /* GQA attention. Current shader uses a 256-entry shared score
+             * buffer, so keep CPU fallback for longer contexts. */
             float *attn_cpu = (float *)att->mapped;
-            qw6_cpu_attention_gqa(attn_cpu, q_cpu,
-                                  (float *)p->k_cache[l].mapped,
-                                  (float *)p->v_cache[l].mapped,
-                                  (int)pos + 1,
-                                  QW6_NUM_Q_HEADS, QW6_NUM_KV_HEADS, QW6_HEAD_DIM);
+            if (pos < 256 &&
+                qw6_vk_pipe_attention_gqa(p, s0, &p->k_cache[l], &p->v_cache[l], att,
+                                          (uint32_t)pos + 1,
+                                          QW6_NUM_Q_HEADS, QW6_NUM_KV_HEADS,
+                                          QW6_HEAD_DIM) == 0) {
+                /* GPU path wrote attn_cpu through the mapped buffer. */
+            } else {
+                qw6_cpu_attention_gqa(attn_cpu, q_cpu,
+                                      (float *)p->k_cache[l].mapped,
+                                      (float *)p->v_cache[l].mapped,
+                                      (int)pos + 1,
+                                      QW6_NUM_Q_HEADS, QW6_NUM_KV_HEADS, QW6_HEAD_DIM);
+            }
 
             /* Apply gate */
             for (int i = 0; i < QW6_NUM_Q_HEADS * QW6_HEAD_DIM; i++)
                 attn_cpu[i] *= qw6_sigmoid(gate_cpu[i]);
             memcpy(att->mapped, attn_cpu, QW6_NUM_Q_HEADS * QW6_HEAD_DIM * sizeof(float));
 
-            /* Output projection on CPU (attn_o GPU needs fix) */
-            {
-                float tmp[QW6_HIDDEN_SIZE];
-                qw6_tensor_matvec(tmp, &m->layers[l].attn_o,
-                                  (float *)att->mapped, QW6_HIDDEN_SIZE);
-                memcpy(att->mapped, tmp, sizeof(tmp));
-            }
+            /* Output projection. attn_o is pre-dequantized to FP32 at init
+             * because the Q5_K shader is still numerically wrong for it. */
+            VK_MATMUL(&m->layers[l].attn_o, att, s1,
+                      QW6_HIDDEN_SIZE, QW6_NUM_Q_HEADS * QW6_HEAD_DIM);
+            att_out = s1;
         }
 
         /* Residual: hidden = resid + attn */
-        VK_ADD(hid, att, QW6_HIDDEN_SIZE);
+        VK_ADD(hid, att_out, QW6_HIDDEN_SIZE);
 
 
         /* ---- MoE Block ---- */
@@ -2831,7 +2969,31 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
 
 void qw6_vk_pipe_free(qw6_vk_pipe_t *p) {
     if (!p) return;
+    if (getenv("QW6_PROFILE")) {
+        fprintf(stderr, "qw6_vk profile:\n");
+        for (int i = 0; i < p->pipe_cache_count; i++) {
+            vk_pipe_cache_t *c = &p->pipe_cache[i];
+            if (!c->valid || c->calls == 0) continue;
+            fprintf(stderr, "  %-32s calls=%llu total=%.3f ms avg=%.3f ms\n",
+                    c->shader_path,
+                    (unsigned long long)c->calls,
+                    c->total_ms,
+                    c->total_ms / (double)c->calls);
+        }
+    }
+    for (int i = 0; i < p->pipe_cache_count; i++) {
+        vk_pipe_cache_t *c = &p->pipe_cache[i];
+        if (!c->valid) continue;
+        if (c->pipeline) vkDestroyPipeline(p->vk.device, c->pipeline, NULL);
+        if (c->sm) vkDestroyShaderModule(p->vk.device, c->sm, NULL);
+        if (c->layout) vkDestroyPipelineLayout(p->vk.device, c->layout, NULL);
+        if (c->dsl) vkDestroyDescriptorSetLayout(p->vk.device, c->dsl, NULL);
+    }
+    if (p->dispatch_fence) vkDestroyFence(p->vk.device, p->dispatch_fence, NULL);
+    if (p->dispatch_cb) vkFreeCommandBuffers(p->vk.device, p->vk.command_pool, 1, &p->dispatch_cb);
+    if (p->descriptor_pool) vkDestroyDescriptorPool(p->vk.device, p->descriptor_pool, NULL);
     if (p->weights.buffer) qw6_vk_buffer_destroy(&p->vk, &p->weights);
+    if (p->iq2s_grid.buffer) qw6_vk_buffer_destroy(&p->vk, &p->iq2s_grid);
     if (p->scr_hidden.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_hidden);
     if (p->scr_resid.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_resid);
     if (p->scr_normed.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_normed);

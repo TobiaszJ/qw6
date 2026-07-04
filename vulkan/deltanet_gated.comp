@@ -1,0 +1,49 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer State { float state[]; };
+layout(set = 0, binding = 1) readonly buffer QKV { float qkv[]; };
+layout(set = 0, binding = 2) readonly buffer Gate { float gate[]; };
+layout(set = 0, binding = 3) readonly buffer Beta { float beta[]; };
+layout(set = 0, binding = 4) writeonly buffer Out { float outv[]; };
+
+layout(push_constant) uniform Push {
+    uint key_heads;
+    uint val_heads;
+    uint dim;
+    float scale;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint n = pc.val_heads * pc.dim;
+    if (idx >= n) return;
+
+    uint vh = idx / pc.dim;
+    uint j = idx - vh * pc.dim;
+    uint kh = vh % pc.key_heads;
+
+    uint q_base = kh * pc.dim;
+    uint k_base = pc.key_heads * pc.dim + kh * pc.dim;
+    uint v_base = pc.key_heads * pc.dim * 2 + vh * pc.dim;
+    uint s_base = vh * pc.dim * pc.dim + j * pc.dim;
+
+    float decay = exp(gate[vh]);
+    float pred = 0.0;
+    for (uint i = 0; i < pc.dim; i++) {
+        float sv = state[s_base + i] * decay;
+        state[s_base + i] = sv;
+        pred += sv * qkv[k_base + i];
+    }
+
+    float delta = (qkv[v_base + j] - pred) * beta[vh];
+    float sum = 0.0;
+    for (uint i = 0; i < pc.dim; i++) {
+        float sv = state[s_base + i] + delta * qkv[k_base + i];
+        state[s_base + i] = sv;
+        sum += sv * qkv[q_base + i];
+    }
+
+    outv[idx] = sum * pc.scale;
+}

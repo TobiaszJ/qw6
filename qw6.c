@@ -350,6 +350,112 @@ static uint64_t qw6_file_size(FILE *f) {
     return end < 0 ? 0 : (uint64_t)end;
 }
 
+static size_t ggml_type_block_elems(ggml_type_t t) {
+    switch (t) {
+        case GGML_TYPE_Q8_0:
+            return 32;
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_S:
+            return QW6_QK_K;
+        default:
+            return 1;
+    }
+}
+
+static size_t ggml_type_block_bytes(ggml_type_t t) {
+    switch (t) {
+        case GGML_TYPE_F32:      return sizeof(float);
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:     return sizeof(uint16_t);
+        case GGML_TYPE_Q8_0:     return 34;
+        case GGML_TYPE_Q4_K:     return 144;
+        case GGML_TYPE_Q5_K:     return 176;
+        case GGML_TYPE_Q6_K:     return 210;
+        case GGML_TYPE_IQ2_XXS:  return 66;
+        case GGML_TYPE_IQ2_S:    return 82;
+        case GGML_TYPE_IQ3_S:    return 110;
+        default:                 return 0;
+    }
+}
+
+static uint64_t gguf_tensor_expected_bytes(const gguf_tensor_info_t *ti) {
+    QW6_ASSERT_PTR(ti);
+    if (ti->n_dims == 0) return 0;
+
+    size_t block_elems = ggml_type_block_elems(ti->type);
+    size_t block_bytes = ggml_type_block_bytes(ti->type);
+    if (block_elems == 0 || block_bytes == 0) return 0;
+    if (ti->dims[0] <= 0 || (uint64_t)ti->dims[0] % block_elems != 0)
+        return 0;
+
+    uint64_t rows = 1;
+    for (uint32_t d = 1; d < ti->n_dims; d++) {
+        if (ti->dims[d] <= 0) return 0;
+        uint64_t dim = (uint64_t)ti->dims[d];
+        if (rows > UINT64_MAX / dim) return 0;
+        rows *= dim;
+    }
+
+    uint64_t row_blocks = (uint64_t)ti->dims[0] / block_elems;
+    if (row_blocks > UINT64_MAX / block_bytes) return 0;
+    uint64_t row_bytes = row_blocks * block_bytes;
+    if (rows > UINT64_MAX / row_bytes) return 0;
+    return rows * row_bytes;
+}
+
+static int gguf_validate_tensor_ranges(const gguf_ctx_t *ctx) {
+    QW6_ASSERT_PTR(ctx);
+    int bad = 0;
+    uint64_t max_end = ctx->data_offset;
+
+    if (ctx->data_offset > ctx->file_size) {
+        fprintf(stderr, "qw6: GGUF data offset %llu exceeds file size %llu\n",
+                (unsigned long long)ctx->data_offset,
+                (unsigned long long)ctx->file_size);
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < ctx->tensors_parsed; i++) {
+        const gguf_tensor_info_t *ti = &ctx->tensors[i];
+        uint64_t bytes = gguf_tensor_expected_bytes(ti);
+        uint64_t abs_offset = ctx->data_offset + ti->offset;
+        uint64_t end = abs_offset + bytes;
+        bool overflow = abs_offset < ctx->data_offset || end < abs_offset;
+
+        if (!overflow && end > max_end) max_end = end;
+
+        if (bytes == 0 || overflow || end > ctx->file_size) {
+            if (bad < 8) {
+                fprintf(stderr,
+                        "qw6: tensor '%s' range invalid: offset=%llu bytes=%llu end=%llu file_size=%llu type=%s\n",
+                        ti->name,
+                        (unsigned long long)abs_offset,
+                        (unsigned long long)bytes,
+                        (unsigned long long)(overflow ? UINT64_MAX : end),
+                        (unsigned long long)ctx->file_size,
+                        ggml_type_name(ti->type));
+            }
+            bad++;
+            continue;
+        }
+    }
+
+    if (bad > 0) {
+        fprintf(stderr,
+                "qw6: GGUF tensor data is incomplete or corrupt (%d invalid ranges; expected at least %.2f GiB, have %.2f GiB)\n",
+                bad,
+                (double)max_end / (1024.0 * 1024.0 * 1024.0),
+                (double)ctx->file_size / (1024.0 * 1024.0 * 1024.0));
+        return -1;
+    }
+
+    return 0;
+}
+
 static uint64_t gguf_tensor_span(const gguf_ctx_t *ctx, uint32_t i,
                                  uint64_t file_size) {
     QW6_ASSERT_PTR(ctx);
@@ -778,6 +884,10 @@ int qw6_gguf_read_file(const char *path, qw6_model_t *m) {
     gguf_ctx_t ctx;
     if (qw6_gguf_parse(path, &ctx) != 0) return -1;
     if (qw6_validate_qwen_metadata(&ctx) != 0) {
+        qw6_gguf_free(&ctx);
+        return -1;
+    }
+    if (gguf_validate_tensor_ranges(&ctx) != 0) {
         qw6_gguf_free(&ctx);
         return -1;
     }

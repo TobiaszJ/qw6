@@ -1,0 +1,88 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(set = 0, binding = 3) readonly buffer Grid { uint grid[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint cols;
+} pc;
+
+shared float sums[256];
+
+float fp16_to_f32(uint h) {
+    uint sign = (h >> 15) & 1;
+    uint expv = (h >> 10) & 31;
+    uint mant = h & 1023;
+    if (expv == 0) {
+        float s = sign != 0 ? -1.0 : 1.0;
+        return s * (float(mant) / 1048576.0);
+    }
+    if (expv == 31) {
+        uint bits = (sign << 31) | 0x7f800000u | (mant << 13);
+        return uintBitsToFloat(bits);
+    }
+    uint bits = (sign << 31) | ((expv + 112) << 23) | (mant << 13);
+    return uintBitsToFloat(bits);
+}
+
+uint byte_at(uint base, uint off) {
+    uint word = w[(base + off) >> 2];
+    return (word >> (((base + off) & 3) << 3)) & 255;
+}
+
+uint u16_at(uint base, uint off) {
+    return byte_at(base, off) | (byte_at(base, off + 1) << 8);
+}
+
+uint grid_u8(uint grid_idx, uint j) {
+    uint word = grid[grid_idx * 2 + (j >> 2)];
+    return (word >> ((j & 3) << 3)) & 255;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (row >= pc.rows) return;
+
+    uint n_blocks = pc.cols / 256;
+    float acc = 0.0;
+
+    for (uint b = 0; b < n_blocks; b++) {
+        uint block_base = (row * n_blocks + b) * 82;
+        float d = fp16_to_f32(u16_at(block_base, 0));
+        uint qs_base = block_base + 2;
+        uint qh_base = block_base + 66;
+        uint scales_base = block_base + 74;
+
+        for (uint c = lid; c < 256; c += gl_WorkGroupSize.x) {
+            uint ib32 = c >> 5;
+            uint r = c & 31;
+            uint l = r >> 3;
+            uint j = r & 7;
+            uint scale_byte = byte_at(scales_base, ib32);
+            float db0 = d * (0.5 + float(scale_byte & 15)) * 0.25;
+            float db1 = d * (0.5 + float(scale_byte >> 4)) * 0.25;
+            float dl = l < 2 ? db0 : db1;
+            uint qh = byte_at(qh_base, ib32);
+            uint grid_idx = byte_at(qs_base, ib32 * 4 + l) |
+                            ((qh << (8 - 2 * l)) & 0x300);
+            uint signs = byte_at(qs_base, 32 + ib32 * 4 + l);
+            float signv = (signs & (1u << j)) != 0 ? -1.0 : 1.0;
+            float v = dl * float(grid_u8(grid_idx, j)) * signv;
+            acc += v * x[b * 256 + c];
+        }
+    }
+
+    sums[lid] = acc;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x >> 1; stride > 0; stride >>= 1) {
+        if (lid < stride) sums[lid] += sums[lid + stride];
+        barrier();
+    }
+    if (lid == 0) y[row] = sums[0];
+}
