@@ -205,9 +205,9 @@ Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders.
 ### Sampling and output problems
 
 - [x] `qw6_sample` now respects temperature, top-p, and top-k. Greedy remains the `temp <= 0` path for deterministic validation.
-- [ ] The Vulkan path reads the full vocab logits back to CPU every token. For greedy or top-k/top-p, sampling should run on GPU and read back only the chosen token and optional debug values.
+- [x] The Vulkan path reads the full vocab logits back to CPU every token. For greedy or top-k/top-p, sampling should run on GPU and read back only the chosen token and optional debug values.
 - [ ] Existing `argmax.comp` and `sampling.comp` are self-test wrappers, not integrated into the pipeline.
-- [ ] Add a mode to dump logits for correctness and another mode to avoid full-logit readback for performance.
+- [x] Add a mode to dump logits for correctness and another mode to avoid full-logit readback for performance.
 
 ### Benchmark and profiling problems
 

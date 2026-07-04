@@ -3304,6 +3304,7 @@ static void usage(void) {
         "  --vulkan        Vulkan backend (Phase 2)\n"
         "  --vulkan-debug  Vulkan backend with CPU fallback allowed\n"
         "  --vulkan-strict Fail if any GPU fallback would occur\n"
+        "  --vulkan-no-readback  Vulkan greedy decode without full-logit readback\n"
         "  --vulkan-self-test Run Vulkan compute backend self-test\n"
         "  --dump-tokens   Tokenise prompt and exit\n"
         "  --dump-logits   Dump top-10 logits after prefill and each generated token\n"
@@ -3337,6 +3338,7 @@ int main(int argc, char **argv) {
     bool nothink = false, dump_tokens = false, dump_logits = false, dump_logprobs = false;
     bool bench = false, bench_vulkan = false, self_test = false;
     bool use_vulkan = false, vulkan_self_test = false;
+    bool vk_no_readback = false;
     bool load_only = false, raw_prompt = false;
     const char *backend = "cpu";
 #ifdef QW6_VULKAN
@@ -3375,6 +3377,7 @@ int main(int argc, char **argv) {
 #ifdef QW6_VULKAN
         else if (strcmp(argv[i], "--vulkan-debug") == 0) { use_vulkan = true; vk_debug = true; vk_strict = false; }
         else if (strcmp(argv[i], "--vulkan-strict") == 0) { use_vulkan = true; vk_strict = true; }
+        else if (strcmp(argv[i], "--vulkan-no-readback") == 0) { use_vulkan = true; vk_no_readback = true; vk_strict = true; }
 #endif
         else if (strcmp(argv[i], "--vulkan-self-test") == 0) { vulkan_self_test = true; }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -3410,7 +3413,7 @@ int main(int argc, char **argv) {
     }
 #else
     if (use_vulkan) {
-        if (vk_strict || bench_vulkan) {
+        if (vk_strict || bench_vulkan || vk_no_readback) {
             fprintf(stderr, "qw6: Vulkan performance mode active\n");
         } else if (vk_debug) {
             fprintf(stderr, "qw6: Vulkan debug mode active\n");
@@ -3571,22 +3574,27 @@ int main(int argc, char **argv) {
 #ifdef QW6_VULKAN
     session.vk_pipe = vk_pipe_ok ? pipe : NULL;
     if (use_vulkan) {
-        fprintf(stderr, "qw6: using %s for inference\n",
-                vk_pipe_ok ? "Vulkan GPU pipeline" : "CPU fallback");
         backend = vk_pipe_ok ? "vulkan" : "cpu-fallback";
+        if (vk_strict || bench_vulkan || vk_no_readback) {
+            fprintf(stderr, "qw6: Vulkan performance mode: %s\n", backend);
+        } else if (vk_debug) {
+            fprintf(stderr, "qw6: Vulkan debug mode: %s\n", backend);
+        } else {
+            fprintf(stderr, "qw6: Vulkan mode: %s\n", backend);
+        }
     }
 #endif
     session.greedy = (temp <= 0.0f);
     session.dump_logits = dump_logits;
     session.dump_logprobs = dump_logprobs;
-    if (bench_vulkan) {
+    if (bench_vulkan || vk_no_readback) {
         session.greedy = true;
         session.dump_logits = false;
         session.dump_logprobs = false;
         temp = 0.0f;
         top_p = 1.0f;
         top_k = 0;
-        fprintf(stderr, "qw6: strict no-readback Vulkan benchmark enabled\n");
+        fprintf(stderr, "qw6: strict no-readback Vulkan mode enabled\n");
     }
 
     if (prompt) {
