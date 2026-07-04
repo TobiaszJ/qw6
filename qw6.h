@@ -3,8 +3,8 @@
  * Model-specific inference engine for Qwen 3.6-35B-A3B on AMD BC-250.
  * Inspired by antirez/ds4 (DwarfStar4).
  *
- * Phase 1: CPU reference path (correctness, not speed).
- * Phase 2: Vulkan compute backend (GFX1013 / RADV).
+ * CPU reference path remains the correctness baseline.
+ * Vulkan compute support is integrated as a partial BC-250 backend.
  *
  * See ARCHITECTURE.md, MODEL_CARD.md, ROADMAP.md for design.
  */

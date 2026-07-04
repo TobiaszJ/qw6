@@ -142,7 +142,7 @@ qw6: 1 tokens in 28.61s
 | `qw6_tok.h` (~2K) | Tokenizer API |
 | `qw6_vk.c` (~2250 lines) | Vulkan compute backend (shaders, dispatch, pipeline) |
 | `qw6_vk.h` (~3K) | Vulkan backend API |
-| `qw6_vk_pipe.h` (~3K) | GPU pipeline context (opaque handle) |
+| `qw6_vk.h` | Vulkan backend API and opaque pipeline context |
 | `vulkan/*.comp` | 18 GLSL compute shaders + `add.comp` |
 | `Makefile` | Build targets: `cpu`, `vulkan`, `test`, `bench` |
 

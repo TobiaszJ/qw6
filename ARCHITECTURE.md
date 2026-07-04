@@ -329,7 +329,7 @@ Q6_K for critical components: near-lossless quality, +0.37 GB vs Q4_K_M.
 | Core engine | `qw6.c` | Single-file inference engine (GGUF loader, CPU kernels, session) |
 | Tokenizer | `qw6_tok.c` | BPE tokenizer (248k vocab, 247k merges) |
 | Vulkan backend | `qw6_vk.c` | Vulkan device mgmt, shader dispatch, pipeline context |
-| Vulkan pipeline | `qw6_vk_pipe.h` | Opaque pipeline handle for full 40-layer GPU dispatch |
+| Vulkan pipeline | `qw6_vk.h` | Vulkan backend API and opaque pipeline handle for full 40-layer GPU dispatch |
 | Vulkan shaders | `vulkan/*.comp` | 18 compute shaders + `add.comp` |
 | Model header | `qw6.h` | Architecture constants, quant types, tensor structs, API |
 | Tokenizer header | `qw6_tok.h` | Tokenizer API |

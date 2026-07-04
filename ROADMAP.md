@@ -67,7 +67,7 @@ Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders.
 - [x] `qw6.c`: GGUF loading, tensor binding, native dequant, CPU forward, session, prefill, generation, CLI, CPU probes.
 - [x] `qw6_vk.c`: Vulkan device setup, buffer allocation, host wrappers, self-test, pipeline cache, weight upload, full Vulkan pipeline forward, cleanup.
 - [x] `qw6_tok.c`: tokenizer JSON parser, byte-level BPE, pre-tokenization, encode/decode.
-- [x] Headers: `qw6.h`, `qw6_vk.h`, `qw6_tok.h`, `qw6_vk_int.h`, `qw6_vk_pipe.h`, `qw6_iq_tables.h`.
+- [x] Headers: `qw6.h`, `qw6_vk.h`, `qw6_tok.h`, `qw6_iq_tables.h`.
 - [x] Focused shader audit: quant matmuls, attention, Conv1D, Gated DeltaNet, and shader inventory.
 
 ### Current GPU shader inventory
@@ -221,9 +221,9 @@ Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders.
 
 ### Cleanup and maintainability problems
 
-- [ ] `qw6_vk_pipe.h` describes an older separate pipeline structure and API that no longer matches the monolithic implementation in `qw6_vk.c`. Either delete it or bring it back in sync.
-- [ ] `qw6_vk_int.h` declares extension helpers that are not used by the current monolithic implementation. Remove or reintegrate them.
-- [ ] File headers still describe Phase 1/Phase 2 as if the project is a clean CPU reference plus planned Vulkan backend. Update once correctness status is clear.
+- [x] `qw6_vk_pipe.h` describes an older separate pipeline structure and API that no longer matches the monolithic implementation in `qw6_vk.c`. Either delete it or bring it back in sync.
+- [x] `qw6_vk_int.h` declares extension helpers that are not used by the current monolithic implementation. Remove or reintegrate them.
+- [x] File headers still describe Phase 1/Phase 2 as if the project is a clean CPU reference plus planned Vulkan backend. Update once correctness status is clear.
 - [ ] Split the Vulkan backend into device/memory, shader dispatch, model upload, kernels, and pipeline orchestration modules once behavior stabilizes. Do not refactor before parity tests exist.
 - [ ] Add CI or local scripts for `make cpu`, `make vulkan`, shader compilation, tokenizer tests, CPU self-test, Vulkan self-test, load-only, and a short deterministic generation check.
 
