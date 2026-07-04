@@ -646,15 +646,16 @@ int qw6_tok_load_json(qw6_tokenizer_t *t, const char *path) {
         return -1;
     }
 
-    fseek(f, 0, SEEK_END);
-    long fsize = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    fseeko(f, 0, SEEK_END);
+    off_t fsize = ftello(f);
+    fseeko(f, 0, SEEK_SET);
     TOK_ASSERT(fsize > 0, "empty tokenizer.json");
 
-    char *src = malloc(fsize + 1);
+    size_t fsize_sz = (size_t)fsize;
+    char *src = malloc(fsize_sz + 1);
     TOK_ASSERT_PTR(src);
-    size_t nread = fread(src, 1, (size_t)fsize, f);
-    if (nread != (size_t)fsize) {
+    size_t nread = fread(src, 1, fsize_sz, f);
+    if (nread != fsize_sz) {
         fprintf(stderr, "qw6_tok: short read from %s\n", path);
         free(src);
         fclose(f);

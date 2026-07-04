@@ -12,6 +12,8 @@
 #ifndef QW6_H
 #define QW6_H
 
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>

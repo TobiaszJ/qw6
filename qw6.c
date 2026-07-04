@@ -342,13 +342,13 @@ static qw6_quant_t qw6_gguf_to_quant(ggml_type_t t);
 
 static uint64_t qw6_file_size(FILE *f) {
     QW6_ASSERT_PTR(f);
-    long here = ftell(f);
+    off_t here = ftello(f);
     if (here < 0) return 0;
-    if (fseek(f, 0, SEEK_END) != 0) return 0;
-    long end = ftell(f);
-    if (fseek(f, here, SEEK_SET) != 0) return 0;
+    if (fseeko(f, 0, SEEK_END) != 0) return 0;
+    off_t end = ftello(f);
+    if (fseeko(f, here, SEEK_SET) != 0) return 0;
     return end < 0 ? 0 : (uint64_t)end;
-}
+}          
 
 static size_t ggml_type_block_elems(ggml_type_t t) {
     switch (t) {
@@ -833,9 +833,9 @@ int qw6_gguf_parse(const char *path, gguf_ctx_t *ctx) {
 
     /* --- Compute data offset --- */
     /* The data section starts immediately after the metadata, aligned */
-    long meta_end = ftell(f);
+    off_t meta_end = ftello(f);
     if (meta_end < 0) {
-        fprintf(stderr, "qw6: ftell failed\n");
+        fprintf(stderr, "qw6: ftello failed\n");
         qw6_gguf_free(ctx);
         fclose(f);
         return -1;
@@ -907,17 +907,19 @@ int qw6_gguf_read_file(const char *path, qw6_model_t *m) {
     }
 
     /* Count tensor types */
-    int type_counts[30] = {0};
+#define QW6_MAX_GGML_TYPE 36
+    int type_counts[QW6_MAX_GGML_TYPE] = {0};
     for (uint32_t i = 0; i < ctx.tensors_parsed; i++) {
         int t = (int)ctx.tensors[i].type;
-        if (t >= 0 && t < 30) type_counts[t]++;
+        if (t >= 0 && t < QW6_MAX_GGML_TYPE) type_counts[t]++;
     }
     fprintf(stderr, "qw6: tensor type breakdown:\n");
-    for (int t = 0; t < 30; t++) {
+    for (int t = 0; t < QW6_MAX_GGML_TYPE; t++) {
         if (type_counts[t] > 0)
             fprintf(stderr, "  %s: %d tensors\n",
                     ggml_type_name((ggml_type_t)t), type_counts[t]);
     }
+#undef QW6_MAX_GGML_TYPE
 
     /* Check all tensor types are supported */
     int unsupported = 0;
