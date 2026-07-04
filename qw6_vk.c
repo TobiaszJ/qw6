@@ -2364,7 +2364,7 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m) {
     ctx->max_ctx = m->max_context > 0 ? m->max_context : QW6_DEFAULT_CTX;
 
     /* ---- Allocate the big weight buffer ---- */
-    size_t total_w = m->total_weight_bytes + 1024 * 1024; /* +1 MB headroom */
+    size_t total_w = m->total_weight_bytes + 512 * 1024 * 1024; /* +512 MB for dequant temps */
     if (qw6_vk_buffer_create(&ctx->vk, &ctx->weights, total_w,
                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) != 0) {
         qw6_vk_free(&ctx->vk); free(ctx); return -1;
@@ -2462,6 +2462,33 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m) {
 
     fprintf(stderr, "qw6_vk_pipe: %zu bytes weights uploaded, %u max_ctx\n",
             ctx->weight_capacity, ctx->max_ctx);
+    /* Pre-dequantize attn_o weights for GPU (Q5_K shader has a bug) */
+    for (int _li = 0; _li < QW6_NUM_LAYERS; _li++) {
+        qw6_tensor_t *ao = &m->layers[_li].attn_o;
+        if (!ao->data || ao->vk_offset == (size_t)-1 || ao->data_size < 64) continue;
+        uint32_t nrows = ao->rows, ncols = ao->cols;
+        size_t f32_sz = (size_t)nrows * ncols * sizeof(float);
+        /* Extend the weight buffer to hold dequantized version */
+        size_t deq_off = ctx->weight_capacity;
+        deq_off = (deq_off + 255) & ~(size_t)255;
+        if (deq_off + f32_sz > ctx->weights.size) {
+            fprintf(stderr, "qw6_vk_pipe: L%d attn_o dequant buffer too small\n", _li);
+            continue;
+        }
+        float *deq_ptr = (float *)((uint8_t *)ctx->weights.mapped + deq_off);
+        /* Dequantize each row */
+        for (uint32_t _r = 0; _r < nrows; _r++) {
+            if (qw6_tensor_dequantize_row(ao, _r, deq_ptr + _r * ncols) != 0)
+                break;
+        }
+        /* Change quant type to FP32 and point to dequantized data */
+        ao->quant = QW6_Q_FP32;
+        ao->vk_offset = deq_off;
+        ao->data_size = f32_sz;
+        ctx->weight_capacity = deq_off + f32_sz;
+        fprintf(stderr, "qw6_vk_pipe: L%d attn_o dequantized to FP32 (%zu MB)\n",
+                _li, f32_sz / (1024*1024));
+    }
     *p = ctx;
     return 0;
 }
