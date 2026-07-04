@@ -3313,6 +3313,7 @@ static void usage(void) {
         "  --self-test     Run CPU kernel self-tests and exit\n"
         "  --seed <N>      Random seed for deterministic sampling (default: time-based)\n"
         "  --bench         Run benchmark\n"
+        "  --bench-vulkan  Strict Vulkan benchmark with greedy no-readback decode\n"
         "  -h, --help      This help\n\n"
         "Status: pre-alpha. CPU reference path under development.\n",
         QW6_VERSION, QW6_BUILD_PHASE, QW6_DEFAULT_CTX
@@ -3332,7 +3333,7 @@ int main(int argc, char **argv) {
     int top_k = 0;
     unsigned int seed = 0;
     bool nothink = false, dump_tokens = false, dump_logits = false, dump_logprobs = false;
-    bool bench = false, self_test = false;
+    bool bench = false, bench_vulkan = false, self_test = false;
     bool use_vulkan = false, vulkan_self_test = false;
     bool load_only = false, raw_prompt = false;
     const char *backend = "cpu";
@@ -3362,6 +3363,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--load-only") == 0) load_only = true;
         else if (strcmp(argv[i], "--self-test") == 0) self_test = true;
         else if (strcmp(argv[i], "--bench") == 0) bench = true;
+#ifdef QW6_VULKAN
+        else if (strcmp(argv[i], "--bench-vulkan") == 0) { bench = true; bench_vulkan = true; use_vulkan = true; vk_strict = true; }
+#endif
         else if (strcmp(argv[i], "--cpu") == 0) { use_vulkan = false; }
         else if (strcmp(argv[i], "--raw") == 0) { raw_prompt = true; }
         else if (strcmp(argv[i], "--vulkan") == 0) { use_vulkan = true; }
@@ -3558,6 +3562,15 @@ int main(int argc, char **argv) {
     session.greedy = (temp <= 0.0f);
     session.dump_logits = dump_logits;
     session.dump_logprobs = dump_logprobs;
+    if (bench_vulkan) {
+        session.greedy = true;
+        session.dump_logits = false;
+        session.dump_logprobs = false;
+        temp = 0.0f;
+        top_p = 1.0f;
+        top_k = 0;
+        fprintf(stderr, "qw6: strict no-readback Vulkan benchmark enabled\n");
+    }
 
     if (prompt) {
         float *prefill_logits_snapshot = NULL;
@@ -3678,6 +3691,9 @@ int main(int argc, char **argv) {
     if (bench) {
         if (!prompt) prompt = "Hello";
         fprintf(stderr, "qw6: benchmark mode\n");
+        if (bench_vulkan) {
+            fprintf(stderr, "qw6: benchmark backend: Vulkan strict greedy no-readback\n");
+        }
         /* Run a timed generation */
         uint32_t *btok = NULL;
         uint32_t bn = 0;

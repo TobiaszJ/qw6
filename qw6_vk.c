@@ -2008,6 +2008,7 @@ struct qw6_vk_pipe_s {
     uint32_t timestamp_query_next;
     uint64_t dispatch_count;
     uint64_t fallback_count;
+    uint64_t readback_bytes;
     vk_pipe_cache_t pipe_cache[QW6_VK_CACHE_MAX];
     int pipe_cache_count;
     VkDescriptorPool descriptor_pool;
@@ -2537,6 +2538,7 @@ static int qw6_vk_pipe_sample_greedy(struct qw6_vk_pipe_s *p,
                               1, 1, 1) != 0) return -1;
     uint32_t tok;
     memcpy(&tok, p->scr_sample.mapped, sizeof(tok));
+    p->readback_bytes += sizeof(tok);
     *out_token = tok;
     return 0;
 }
@@ -3278,6 +3280,7 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
     /* Read back logits to CPU (NULL = skip, e.g. when only GPU sample is needed) */
     if (logits_out) {
         memcpy(logits_out, lg->mapped, QW6_VOCAB_SIZE * sizeof(float));
+        p->readback_bytes += (uint64_t)QW6_VOCAB_SIZE * sizeof(float);
     }
     free(hidden_cpu);
     return 0;
@@ -3304,14 +3307,15 @@ int qw6_vk_pipe_forward_greedy(qw6_vk_pipe_t *p, qw6_model_t *m,
 void qw6_vk_pipe_free(qw6_vk_pipe_t *p) {
     if (!p) return;
     if (p->profile) {
-        fprintf(stderr, "qw6_vk profile: dispatches=%llu fallbacks=%llu timestamps=%s\n",
+        fprintf(stderr, "qw6_vk profile: dispatches=%llu fallbacks=%llu timestamps=%s readback=%llu bytes\n",
                 (unsigned long long)p->dispatch_count,
                 (unsigned long long)p->fallback_count,
-                p->vk.timestamp_supported ? "on" : "off");
+                p->vk.timestamp_supported ? "on" : "off",
+                (unsigned long long)p->readback_bytes);
         for (int i = 0; i < p->pipe_cache_count; i++) {
             vk_pipe_cache_t *c = &p->pipe_cache[i];
             if (!c->valid || c->calls == 0) continue;
-            fprintf(stderr, "  %-32s calls=%llu setup=%.3f ms gpu=%.3f ms wall=%.3f ms avg=%.3f ms bytes=%llu\n",
+            fprintf(stderr, "  %-32s calls=%llu setup=%.3f ms gpu=%.3f ms wall=%.3f ms avg=%.3f ms bind=%llu\n",
                     c->shader_path,
                     (unsigned long long)c->calls,
                     c->cpu_setup_ms,
