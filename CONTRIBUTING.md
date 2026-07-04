@@ -1,7 +1,9 @@
 # Contributing to qw6
 
-This project is in pre-alpha. The priority is Phase 1 (CPU reference path) —
-correctness before speed.
+This project is in pre-alpha. Phase 2 (Vulkan GPU pipeline) is the active
+development focus. Phase 1 (CPU reference) was never validated against reference
+logits — GPU correctness is validated by comparing against llama.cpp's Vulkan
+backend on the same hardware.
 
 ---
 
@@ -9,116 +11,107 @@ correctness before speed.
 
 ```bash
 make cpu        # CPU-only reference/debug build (no Vulkan needed)
-make vulkan     # Vulkan build for BC-250 (requires Mesa 25.1+, Vulkan SDK)
-make test       # Run regression tests
-make test-tokenizer # Run tokenizer regression tests when tokenizer data is available
-make bench      # Run benchmarks
-./qw6 --self-test # Run CPU self-tests without model/tokenizer data
-./qw6 --load-only -m model.gguf # Validate and probe native GGUF weight access
+make vulkan     # Vulkan build for BC-250 (requires Mesa 25.1+, Vulkan SDK, glslc)
+make test       # Run regression tests (CPU, no model needed)
+make test-tokenizer # Run tokenizer regression tests (requires tokenizer data)
 ```
 
-**CPU build** works on any Linux machine. It is for correctness checking only —
-do not treat it as the production target.
+### GPU Pipeline Test
+```bash
+make vulkan
+./qw6 --vulkan-self-test                    # Verify all GPU shaders
+./qw6 --load-only --vulkan -m model.gguf    # Model probe vs CPU reference
+./qw6 -m model.gguf -p "Hi" -n 1 --nothink --raw --vulkan  # Full pipeline test
+./qw6 -m model.gguf -p "Hello" -n 3 --nothink --vulkan      # With chat template
+```
+
+**CPU build** works on any Linux machine, but was never validated against
+reference outputs. Do not treat it as a correctness reference.
 
 **Vulkan build** requires:
 - Mesa 25.1.0+ (25.3.4+ recommended)
-- Vulkan headers (`vulkan-dev` or equivalent)
-- GFX1013 GPU (BC-250) or compatible RADV-supported AMD APU
-- TTM tuning (see [BC250_SETUP.md](BC250_SETUP.md))
+- Vulkan headers and `glslc` (Vulkan SDK or `shaderc`)
+- GFX1013 GPU (BC-250) — see [BC250_SETUP.md](BC250_SETUP.md) for hardware setup
+- TTM tuning for 16 GB unified memory
 
 ---
 
-## Testing
+## Current Known Issues
 
-### Test Vectors
+### GPU Pipeline
+- `matmul_q5k.spv` produces 100-500x wrong output despite byte-identical weight
+  data — workaround: pre-dequantize Q5_K→FP32 during pipeline init
+- IQ2_S / IQ3_S expert weights lack GPU shaders — CPU fallback
+- Pipeline caching disabled (GPU hang when reusing VkPipeline objects)
+- No chunked prefill — multi-token prompts are processed one at a time (~28s/token)
+- Core inference math not validated against reference outputs
 
-`tests/test-vectors/` contains official Qwen 3.6-35B-A3B API continuations:
+### CPU Reference
+- No comparison against llama.cpp or other reference implementation ever performed
+- Both CPU and GPU paths may produce incorrect tokens
+- `qw6_cpu_matmul_iq2m` uses a flat test format, NOT the real IQ2_XXS GGUF blocks
+  (but `qw6_tensor_matvec` → `qw6_tensor_dequantize_row` uses the correct format)
 
-```
-tests/test-vectors/
-├── short_prompt.txt          # ~100 token prompt, greedy decoding, thinking disabled
-├── short_expected.json       # Expected top-k logprobs at each step
-├── medium_4k.txt             # 4K token prompt
-├── medium_4k_expected.json
-├── long_32k.txt              # 32K token prompt (tests DeltaNet state)
-├── long_32k_expected.json
-├── tool_call.txt             # Tool calling format test
-└── tool_call_expected.json
-```
+---
 
-### Regression Test
-
-```bash
-make test
-# or manually:
-./qw6 --self-test
-
-# Optional tokenizer regression test (requires tokenizer/tokenizer.json):
-make test-tokenizer
-
-# Native Qwen3.6 GGUF loader/dequant probe:
-./qw6 --load-only -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf
-
-# Planned full regression runner:
-./qw6_test --logprob-vectors      # Compare local logprobs vs API test vectors
-./qw6_test --server               # Server API smoke test
-```
-
-`--load-only` currently validates the Qwen3.6 GGUF metadata, maps real tensor
-data, dequantizes supported formats, runs native MatVec probes, routes layer 0
-experts, and runs the layer 0 shared-FFN probe. It does not yet perform full
-native generation.
-
-A regression test failure means tokenizer, tensor loading, quantization,
-template handling, attention, or DeltaNet state has diverged from the reference.
-Fix before submitting a PR.
-
-### Debugging
+## Debugging
 
 ```bash
-./qw6 --dump-tokens -p "..."     # Tokenise and exit (check tokeniser)
-./qw6 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
-./qw6 --dump-logits /tmp/logits.json --vulkan --nothink --prompt-file prompt.txt
-./qw6-server --trace /tmp/trace.txt ...   # Full session trace
+./qw6 --dump-tokens -p "..."        # Tokenise and print token IDs
+./qw6 --inspect-gguf model.gguf     # Print GGUF metadata and tensor table
+./qw6 -m model.gguf --load-only     # Run native probe functions
+
+# With --raw flag to skip chat template (shorter prefill):
+./qw6 -m model.gguf -p "Hi" -n 1 --nothink --raw --vulkan
 ```
+
+### Using llama.cpp as Reference
+
+A working llama.cpp build with Vulkan support is available at `/home/teejay/llama.cpp/`.
+
+```bash
+# Compare outputs:
+/home/teejay/llama.cpp/build/bin/llama-completion -m model.gguf \
+  --prompt "Hello" -n 10 --temp 0 --no-mmap -ngl 999 --no-warmup
+```
+
+llama.cpp processes ~17ms/token on the BC-250 with Vulkan (`-ngl 999`).
 
 ---
 
 ## Quality Standards
 
-Following the project's coding standards:
-
-1. **No uncontrolled control flow** — no goto, no recursion, no callback hell
+1. **No uncontrolled control flow** — no gotos, no recursion
 2. **All loops must terminate** — fixed upper bound or clear exit path
-3. **No dynamic memory after init** — allocate upfront, no uncontrolled object creation
-4. **Max 60 lines per function**
-5. **At least 2 guards/assertions per function** (input validation, postconditions)
-6. **Minimal dereferencing** — no deep nested property access, no non-null without guard
-7. **Metaprogramming only for conditionals** — no eval, exec, complex macros
-8. **Minimal scope** — no global mutable state, no mutable default arguments
-9. **Check every return value, validate every input** — never silent-fail
-10. **Linter warnings = errors** — strict mode, warnings are errors
+3. **No dynamic memory after init** — pre-allocate
+4. **Max 60 lines per function** (soft limit)
+5. **At least 2 guards per function** — input validation, postconditions
+6. **Minimal dereferencing** — guard before access
+7. **Check every return value** — never silent-fail
+8. **Linter warnings = errors** — strict mode (`-Werror`)
 
 ---
 
 ## Pull Request Checklist
 
-- [ ] `make cpu` succeeds
-- [ ] `make test` passes (tokenizer-free CPU self-test)
-- [ ] `make test-tokenizer` passes when `tokenizer/tokenizer.json` is available
-- [ ] `./qw6 --load-only -m <Qwen3.6 GGUF>` passes when real weights are available
-- [ ] Logprob vector tests pass once Phase 1 inference is complete
-- [ ] Style: 60-line function limit, 2+ assertions per function, strict linter
-- [ ] No new memory leaks (`valgrind --leak-check=full ./qw6 --cpu -p "test"`)
-- [ ] Vulkan build: no validation layer errors (`vulkaninfo --validate`)
-- [ ] Commit message: descriptive, present tense ("Add Gated DeltaNet conv1d kernel" not "added")
+- [ ] `make cpu` succeeds with no warnings
+- [ ] `make vulkan` succeeds with no warnings
+- [ ] `./qw6 --self-test` passes
+- [ ] `./qw6 --vulkan-self-test` passes on BC-250
+- [ ] `./qw6 --load-only --vulkan -m <model.gguf>` passes
+- [ ] No new `valgrind` issues in CPU path
+- [ ] Style: function length, assertions, strict linter
+- [ ] Commit message: descriptive, present tense
 
 ---
 
 ## Areas Needing Help
 
-- **Vulkan compute shader optimisation** — especially Gfx1013 wave64 tiling
-- **Gated DeltaNet kernel** — reference implementation from `fla` / `causal_conv1d`
-- **imatrix collection** — calibration corpus for routed expert quantisation
-- **Test vectors** — additional prompts at different context lengths
-- **Documentation** — additional BC-250 hardware quirks, GFX1013 ISA notes
+- **Fix `matmul_q5k.spv`** — produce correct output despite correct weight data
+- **Port IQ2_S / IQ3_S shaders** — from llama.cpp's `mul_mat_vec_iq2_s.comp`
+- **Fix pipeline caching** — GPU hang when reusing VkPipeline objects
+- **Chunked prefill** — batch N tokens through forward pass
+- **Model validation** — compare layer-by-layer logits against llama.cpp
+- **DeltaNet / Attention GPU kernels** — wire up existing shaders into pipeline
+- **Performance optimisation** — wave64 tiling, fused kernels, memory layout
+- **Chat template** — read from GGUF metadata instead of hardcoded CHATML

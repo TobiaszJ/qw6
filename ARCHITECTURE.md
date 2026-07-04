@@ -7,39 +7,62 @@ C program that runs Qwen 3.6-35B-A3B on an AMD BC-250 using Vulkan compute.
 
 ## Current Implementation Status
 
-`qw6` is still pre-alpha. The current code is building the native CPU reference
-path before the Vulkan backend:
+`qw6` is in **Phase 2: GPU dispatch pipeline active on BC-250**. The pipeline
+runs all 40 layers on GPU for supported operations with CPU fallback for
+others.
+
+### Phase 1: CPU Reference Path (completed but unvalidated)
 
 - GGUF v3 metadata parsing and Qwen3.6 model validation are implemented.
 - Unsloth/llama.cpp `qwen35moe` GGUF layouts are supported for tensor indexing.
 - Model weights are accessed through `mmap`; tensors store real file offsets,
   shapes, quant types, byte spans, and data pointers.
 - Packed 3D routed-expert tensors are split into per-expert views.
-- Native dequantization currently covers F32, F16, BF16, Q4_K, Q5_K, Q6_K,
+- Native dequantization covers F32, F16, BF16, Q4_K, Q5_K, Q6_K,
   IQ2_XXS, IQ2_S, and IQ3_S.
 - Native probes run output projection MatVec, layer-0 RMSNorm, router top-k,
   routed/shared-expert FFN, and a single-token layer-0 Gated DeltaNet forward
   probe against real Qwen3.6 weights.
-- Native greedy generation has a CPU smoke path through all 40 layers with
-  KV cache, DeltaNet state, Conv1D state, final norm, and output logits.
-- Phase 2 has a Vulkan runtime smoke layer: device selection, host-visible
-  buffers, descriptor/pipeline creation, SPIR-V shader build, and a verified
-  compute dispatch on BC-250 RADV.
-- GPU `rmsnorm_full`, chunked `rmsnorm`, `matvec_f32`, `matmul_q4k`,
-  `matmul_q5k`, `matmul_q6k`, `silu_mul`, single-workgroup `argmax`, greedy
-  `sampling`, `rope_mrope`, `moe_route`, `moe_gather`, `deltanet_conv1d`,
-  `deltanet_update`, `deltanet_retrieve`, and `mtp_draft` kernels are covered
-  by the Vulkan self-test; short-context `attention_gqa` is also covered. The
-  Vulkan `matvec_f32` path is probed against the real layer-0 MoE router
-  weights from Qwen3.6.
+- Native greedy generation has a CPU smoke path through all 40 layers.
+- **Note:** Phase 1 was never validated against reference logits. Both CPU and
+  GPU paths may produce incorrect tokens vs llama.cpp reference.
 
-Not yet implemented:
+### Phase 2: Vulkan GPU Pipeline (active)
 
-- reference-logit parity for the 40-layer native forward pass
-- optimized/chunked prefill
-- text-quality validation beyond smoke generation
-- GPU dispatch orchestration for full 40-layer model inference
-- quantized GPU MatVec kernels for Q/K/IQ expert formats
+**GPU dispatch infrastructure:**
+- Vulkan device init, host-visible buffer allocation, SPIR-V shader build
+- Big weight buffer: 10.7 GB of model weights uploaded to GPU at init
+- Persistent scratch buffers for hidden state, residuals, norms, attention, FFN
+- Per-layer KV cache (10 full-attn layers) and DeltaNet state + Conv1D state
+  (30 linear-attn layers) on GPU
+- Pipeline caching with VkPipeline reuse (disabled — GPU hang under investigation)
+
+**On-GPU operations:**
+- `matvec_f32` — FP32 matrix-vector multiply
+- `matmul_q4k` / `matmul_q5k` / `matmul_q6k` — K-quant dequant + matmul
+- `matmul_iq2xxs` — IQ2_XXS dequant + matmul (verified 3.5e-6 vs CPU)
+- `rmsnorm_full` — RMSNorm
+- `add` — element-wise vector add
+- `silu_mul` — SiLU activation + element-wise multiply
+- `argmax` / `sampling` — greedy token selection
+
+**CPU fallback operations** (to be moved to GPU):
+- Attention output projection (Q5_K GPU shader produces wrong output;
+  workaround: pre-dequantize to FP32 during init)
+- IQ2_S / IQ3_S expert matmuls (no GPU shaders yet)
+- GQA attention, MRoPE, Conv1D shift, DeltaNet update/retrieve
+- MoE routing (CPU reads 256 logits, selects top-8)
+- Element-wise gate application, scale/activation functions
+
+**Chat template:**
+- Automatic CHATML wrapping: `<|im_start|>system\n...<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n`
+- Use `--raw` to skip template for direct prompt testing
+
+### Known Issues
+- `matmul_q5k.spv`: 100-500x wrong output despite byte-identical data
+- Pipeline caching: GPU hang when reusing VkPipeline objects
+- No chunked prefill: multi-token prompts processed one at a time (~28s/token)
+- Reference-logit parity not established for any path
 
 The old experimental external `llama.cpp` generation bridge is not part of the
 native engine path.
@@ -303,15 +326,16 @@ Q6_K for critical components: near-lossless quality, +0.37 GB vs Q4_K_M.
 
 | Module | File | Description |
 |---|---|---|
-| Core engine | `qw6.c` | Single-file inference engine (ds4-style) |
-| Server | `qw6-server.c` | OpenAI-compatible HTTP server |
-| Agent | `qw6-agent.c` | Coding agent (post-V1) |
-| Eval | `qw6-eval.c` | Test-vector extractor |
-| Bench | `qw6-bench.c` | Frontier-based benchmarking |
-| Test runner | `qw6_test.c` | Regression tests |
-| Vulkan kernels | `vulkan/*.comp` | SPIR-V compute shaders |
+| Core engine | `qw6.c` | Single-file inference engine (GGUF loader, CPU kernels, session) |
+| Tokenizer | `qw6_tok.c` | BPE tokenizer (248k vocab, 247k merges) |
+| Vulkan backend | `qw6_vk.c` | Vulkan device mgmt, shader dispatch, pipeline context |
+| Vulkan pipeline | `qw6_vk_pipe.h` | Opaque pipeline handle for full 40-layer GPU dispatch |
+| Vulkan shaders | `vulkan/*.comp` | 18 compute shaders + `add.comp` |
+| Model header | `qw6.h` | Architecture constants, quant types, tensor structs, API |
+| Tokenizer header | `qw6_tok.h` | Tokenizer API |
+| Vulkan header | `qw6_vk.h` | Vulkan backend API + pipeline API |
 | GGUF tools | `gguf-tools/` | Conversion, quantisation, imatrix |
-| Test vectors | `tests/test-vectors/` | Official Qwen API logits |
+| Tests | `tests/test-vectors/` | Official Qwen API logits (pending) |
 
 ### 3.3 Vulkan Compute Pipeline
 
@@ -343,20 +367,25 @@ full control. The pipeline per compute dispatch:
 
 | Kernel | Input | Output | Notes |
 |---|---|---|---|
-| `matmul_iq2m.comp` | IQ2_M weights, FP16/INT8 activations | FP16 output | On-the-fly dequant, tiled MatMul |
-| `matmul_q4k.comp` | Q4_K weights (shared expert, attention) | FP16 output | Q4_K dequant + MatMul |
-| `matmul_q8.comp` | Q8_0 weights (critical layers) | FP16 output | For attention/output if quality-sensitive |
-| `attention_gqa.comp` | Q, K, V tensors | Attention output | GQA: 16 Q heads, 2 KV heads, MRoPE, gating |
-| `deltanet_conv1d.comp` | Input, conv kernel (size 4) | Conv output | Causal short conv before delta update |
-| `deltanet_update.comp` | State, key, value, delta | New state | Delta-rule recurrent update |
+| `matmul_iq2xxs.comp` | IQ2_XXS weights, FP32 activations | FP32 output | On-the-fly dequant via grid+sign LUT, verified on BC-250 |
+| `matmul_q4k.comp` | Q4_K weights | FP32 output | Q4_K block dequant + MatMul |
+| `matmul_q5k.comp` | Q5_K weights | FP32 output | Q5_K block dequant (known bug: 100-500x wrong, use CPU fallback) |
+| `matmul_q6k.comp` | Q6_K weights | FP32 output | Q6_K block dequant + MatMul |
+| `matvec_f32.comp` | FP32 weights, FP32 activations | FP32 output | Simple dot product per row |
+| `attention_gqa.comp` | Q, K cache, V cache | Attention output | GQA: 16 Q heads, 2 KV heads, head_dim=256 |
+| `deltanet_conv1d.comp` | Input [kernel_size,dim], conv kernel | Conv output | Causal short conv (kernel_size=4) |
+| `deltanet_update.comp` | State, key, value, query, beta | New state | Delta-rule recurrent update with gating |
 | `deltanet_retrieve.comp` | State, query | Retrieved value | State→output read |
 | `moe_route.comp` | Router logits | Expert indices + weights | Top-8 selection from 256 experts |
-| `moe_gather.comp` | Expert weights, activations | Expert outputs | Gather 8 routed + 1 shared |
-| `rmsnorm.comp` | Input, weight, eps | Normalised output | RMSNorm with eps=1e-6 |
-| `rope_mrope.comp` | Q/K tensors, positions | Rotated Q/K | MRoPE: split [11,11,10], interleave, partial 0.25 |
-| `mtp_draft.comp` | Hidden state, embeddings | Draft tokens | 1-layer MTP for speculative decoding |
-| `argmax.comp` | Logits | Token ID | Greedy / top-k / top-p sampling |
-| `softmax.comp` | Logits / router logits | Probabilities | For sampling and MoE routing |
+| `moe_gather.comp` | Expert outputs, weights, shared output | Final FFN output | Gather 8 routed + 1 shared expert |
+| `rmsnorm_full.comp` | Input, weight, eps | Normalised output | Single-vector RMSNorm |
+| `rmsnorm.comp` / `rmsnorm_apply.comp` | Input, weight, eps | Normalised output | Multi-workgroup/chunked RMSNorm |
+| `add.comp` | A, B | A+B | Element-wise vector addition |
+| `silu_mul.comp` | gate, up | silu(gate)*up | SiLU activation + element-wise multiply |
+| `rope_mrope.comp` | Q/K tensors, position | Rotated Q/K | MRoPE: 3-section [11,11,10], partial_rotary=0.25 |
+| `mtp_draft.comp` | Hidden state, embeddings | Draft logits | 1-layer MTP for speculative decoding |
+| `argmax.comp` | Logits | Token ID (index) | Greedy argmax |
+| `sampling.comp` | Logits | Token ID | Greedy sampling (top-1) |
 
 ### 3.5 Inference Loop
 

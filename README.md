@@ -38,62 +38,105 @@ project builds on top of that.
 
 ## Status
 
-**Pre-alpha. Native CPU reference path in progress.**
+**Phase 2: GPU dispatch pipeline — active on BC-250.**
 
-`qw6` now performs real native work against Qwen 3.6 GGUF weights:
+qw6 now performs real GPU-accelerated inference against Qwen 3.6 GGUF weights on
+the BC-250 via Vulkan compute:
 
-- GGUF v3 metadata parsing and model validation for Unsloth/llama.cpp Qwen3.6 layouts (`qwen35moe`)
+**GPU pipeline (Phase 2):**
+- Full 40-layer inference orchestration with on-GPU matmul, RMSNorm, SiLU, and
+  element-wise add operations
+- 10.7 GB model weight upload to GPU-visible buffer (once at init)
+- GPU matmul dispatches for FP32, Q4_K, Q5_K, Q6_K, IQ2_XXS quant formats
+- Persistent KV cache and DeltaNet state buffers for all layers
+- Pipeline caching infrastructure (VkPipeline reuse across dispatches)
+- Attention output projection: pre-dequantized Q5_K→FP32 on CPU during init
+  as workaround for a GPU Q5_K shader issue
+- Chat template: automatic CHATML wrapping for Qwen conversation format
+
+**CPU reference (Phase 1):**
+- GGUF v3 metadata parsing and model validation for Unsloth/llama.cpp Qwen3.6 layouts
 - `mmap`-backed weight access with tensor offsets, shapes, quant types, and byte spans
-- packed routed-expert tensors split into per-expert views
-- tokenizer loading and token dump path
-- CPU kernels and probes for RMSNorm, top-k MoE routing, routed/shared-expert FFN, and native matvec
-- native dequantization for F32, F16, BF16, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_S, and IQ3_S
-- layer-0 Gated DeltaNet single-token forward probe through SSM conv, GDN update, gated norm, and `ssm_out`
-- 40-layer CPU greedy generation smoke path
-- Phase 2 Vulkan runtime smoke path with SPIR-V shader build, GPU
-  `rmsnorm_full`, chunked GPU `rmsnorm`, GPU `matvec_f32`, GPU `matmul_q4k`,
-  GPU `matmul_q5k`, GPU `matmul_q6k`, GPU `matmul_iq2xxs`, GPU `silu_mul`, single-workgroup GPU
-  `argmax`, GPU greedy `sampling`, GPU `rope_mrope`, GPU short-context
-  `attention_gqa`, GPU `moe_route`, GPU `moe_gather`, GPU `deltanet_conv1d`,
-  GPU `deltanet_update`, GPU `deltanet_retrieve`, GPU `mtp_draft`, and a
-  layer-0 router probe against real Qwen weights
+- Packed routed-expert tensors split into per-expert views
+- Tokenizer (BPE, 248k vocab) with encode/decode and dump support
+- Native dequantization for F32, F16, BF16, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_S, IQ3_S
+- CPU kernels: RMSNorm, MoE routing (top-8 of 256), GQA attention, MRoPE,
+  Gated DeltaNet (conv1d, update, retrieve), SiLU, softmax, argmax
+- 40-layer greedy generation smoke path
 
-The repository currently contains CPU engine code, tokenizer implementation,
-native GGUF loader/indexing, kernel scaffolding, and design documentation:
+**18 Vulkan compute shaders:** `rmsnorm`, `rmsnorm_apply`, `rmsnorm_full`,
+`matvec_f32`, `matmul_q4k`, `matmul_q5k`, `matmul_q6k`, `matmul_iq2xxs`,
+`add`, `silu_mul`, `argmax`, `sampling`, `rope_mrope`, `attention_gqa`,
+`moe_route`, `moe_gather`, `deltanet_conv1d`, `deltanet_update`,
+`deltanet_retrieve`, `mtp_draft`.
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — Engine design (Vulkan compute pipeline, MoE routing, Gated DeltaNet, Gated Attention, MTP, server API)
+The repository contains:
+- [ARCHITECTURE.md](ARCHITECTURE.md) — Engine design and implementation details
 - [MODEL_CARD.md](MODEL_CARD.md) — Qwen 3.6-35B-A3B specifications, tensor layout, quantisation plan
 - [BC250_SETUP.md](BC250_SETUP.md) — Hardware setup guide (Vulkan, TTM, 40-CU unlock, oberon, memory)
 - [ROADMAP.md](ROADMAP.md) — Development phases and milestones
 - [CONTRIBUTING.md](CONTRIBUTING.md) — Build, test, regression protocol
 
-The CPU scaffolding can be checked without BC-250 hardware, model weights, or
-tokenizer test vectors:
+---
 
+## Quick Start
+
+### CPU self-test (no hardware required)
 ```bash
 make test        # builds qw6 and runs ./qw6 --self-test
-./qw6 --inspect-gguf model.gguf  # inspect a GGUF header without loading tensors
+./qw6 --inspect-gguf model.gguf  # inspect GGUF header
 ```
 
-With real Qwen3.6 GGUF weights available, the native loader/dequant probes can
-be run with:
-
+### GPU pipeline (BC-250 required)
 ```bash
-./qw6 --load-only -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf
-./qw6 -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf -p "Hello" -n 2 --nothink
-make vulkan && ./qw6 --vulkan-self-test
-./qw6 --load-only --vulkan -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf
+make vulkan                    # build with Vulkan support
+./qw6 --vulkan-self-test       # verify all GPU shaders
+./qw6 --load-only --vulkan -m model.gguf  # probe weights vs CPU
+./qw6 -m model.gguf -p "Hello" -n 5 --nothink --vulkan  # generate
+./qw6 -m model.gguf -p "Hello" -n 5 --vulkan  # with chat template
+./qw6 -m model.gguf -p "Hi" -n 1 --nothink --raw --vulkan  # raw prompt
 ```
 
-Expected current behavior: model metadata validation passes and native probes
-print tensor checksums, router top-k experts, routed/shared-FFN summaries, and a
-layer-0 DeltaNet forward checksum. The generation command runs a native
-40-layer CPU smoke path and prints greedy token IDs plus decoded text; reference
-logit parity and performance work are still pending. The Vulkan self-test
-selects the BC-250 RADV device and validates real compute dispatches; the
-`--load-only --vulkan` path also compares GPU layer-0 router MatVec against CPU.
-Full model inference still uses CPU fallback kernels when `--vulkan` is
-requested.
+### Usage flags
+| Flag | Description |
+|---|---|
+| `-m model.gguf` | Model file (required for inference) |
+| `-p "prompt"` | Prompt text |
+| `-n N` | Number of tokens to generate |
+| `--temp T` | Sampling temperature (0 = greedy) |
+| `--vulkan` | Use GPU pipeline (Phase 2) |
+| `--cpu` | Use CPU reference path (default) |
+| `--nothink` | Disable thinking mode |
+| `--raw` | Skip chat template (raw prompt only) |
+| `--vulkan-self-test` | Run Vulkan compute shader self-test |
+| `--load-only` | Load model and run probes only |
+| `--self-test` | Run CPU self-test |
+| `--inspect-gguf` | Print GGUF metadata and tensor table |
+| `--dump-tokens` | Tokenize prompt and print token IDs |
+
+### Output example
+```
+$ ./qw6 -m Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf -p "Hi" -n 1 --nothink --raw --vulkan
+...
+qw6: generated text: "!"
+qw6: 1 tokens in 28.61s
+```
+
+---
+
+## Project Structure
+
+| File | Purpose |
+|---|---|
+| `qw6.c` (~115K) | Main inference engine (GGUF loader, CPU kernels, session) |
+| `qw6.h` (~13K) | Architecture constants, quant types, tensor structs, API |
+| `qw6_tok.c` (~41K) | BPE tokenizer (248k vocab) |
+| `qw6_tok.h` (~2K) | Tokenizer API |
+| `qw6_vk.c` (~2250 lines) | Vulkan compute backend (shaders, dispatch, pipeline) |
+| `qw6_vk.h` (~3K) | Vulkan backend API |
+| `qw6_vk_pipe.h` (~3K) | GPU pipeline context (opaque handle) |
+| `vulkan/*.comp` | 18 GLSL compute shaders + `add.comp` |
+| `Makefile` | Build targets: `cpu`, `vulkan`, `test`, `bench` |
 
 ## Acknowledgements
 
