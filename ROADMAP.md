@@ -102,7 +102,7 @@ Goal: GPU-accelerated inference on BC-250 via Vulkan compute shaders.
 - [x] Large-file handling: ftell/fseek → ftello/fseeko with off_t for 64-bit file sizes.
 - [x] `type_counts[30]` → `type_counts[36]` (enum goes to GGML_TYPE_TQ2_0 = 35).
 - [x] Model metadata validated: architecture, layer count, hidden size, query heads, KV heads, expert count, experts per token, MoE inter size.
-- [ ] The Vulkan init path mutates `attn_o` tensors to FP32 after pre-dequantization. This workaround should be replaced with a separate GPU-side replacement tensor or fixed Q5_K shader so the model structure remains immutable after load.
+- [x] The Vulkan init path mutates `attn_o` tensors to FP32 after pre-dequantization. This workaround should be replaced with a separate GPU-side replacement tensor or fixed Q5_K shader so the model structure remains immutable after load.
 - [x] `vk_offset` sentinel fixed: comment now correctly says `(size_t)-1` = not uploaded.
 
 ### Tokenizer and prompt-format problems
@@ -283,7 +283,7 @@ Goal: first match llama.cpp numerically, then surpass its BC-250 throughput for 
 - [ ] Upload weights to device-local memory through staging.
 - [ ] Put scratch, KV cache, DeltaNet state, and Conv1D state in device-local memory.
 - [ ] Use small host-visible buffers only for input token IDs, control data, and final token readback.
-- [ ] Remove the FP32 `attn_o` mutation by fixing Q5_K or storing an explicit replacement tensor outside the model object.
+- [x] Remove the FP32 `attn_o` mutation by fixing Q5_K or storing an explicit replacement tensor outside the model object.
 - [ ] Add memory-budget checks for BC-250 before allocation.
 
 ### Milestone 4: Model-specific fused kernels

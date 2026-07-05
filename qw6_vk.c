@@ -2160,6 +2160,8 @@ struct qw6_vk_pipe_s {
     size_t weight_capacity;
     qw6_vk_buffer_t iq2s_grid;
     qw6_vk_buffer_t iq3s_grid;
+    qw6_tensor_t attn_o_fp32[QW6_NUM_LAYERS];
+    bool attn_o_fp32_valid[QW6_NUM_LAYERS];
 
     /* Persistent scratch buffers */
     qw6_vk_buffer_t scr_hidden;    /* [HIDDEN_SIZE] float */
@@ -2426,6 +2428,14 @@ static int qw6_vk_pipe_matvec(struct qw6_vk_pipe_s *p,
         /* Unsupported on GPU — caller must fall back to CPU */
         return -1;
     }
+}
+
+static const qw6_tensor_t *qw6_vk_pipe_attn_o(const struct qw6_vk_pipe_s *p,
+                                              const qw6_model_t *m,
+                                              int layer) {
+    if (p && p->attn_o_fp32_valid[layer] && p->attn_o_fp32[layer].data)
+        return &p->attn_o_fp32[layer];
+    return &m->layers[layer].attn_o;
 }
 
 /* GPU dispatch helpers for pipeline ops */
@@ -2973,32 +2983,45 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m, bool strict) {
 
     fprintf(stderr, "qw6_vk_pipe: %zu bytes weights uploaded, %u max_ctx\n",
             ctx->weight_capacity, ctx->max_ctx);
-    /* Pre-dequantize attn_o weights for GPU (Q5_K shader has a bug) */
+    /* Pre-dequantize attn_o weights into a separate FP32 replacement tensor.
+     * The model object itself stays immutable after load. */
     for (int _li = 0; _li < QW6_NUM_LAYERS; _li++) {
         qw6_tensor_t *ao = &m->layers[_li].attn_o;
         if (!ao->data || ao->vk_offset == (size_t)-1 || ao->data_size < 64) continue;
         uint32_t nrows = ao->rows, ncols = ao->cols;
         size_t f32_sz = (size_t)nrows * ncols * sizeof(float);
-        /* Extend the weight buffer to hold dequantized version */
-        size_t deq_off = ctx->weight_capacity;
-        deq_off = (deq_off + 255) & ~(size_t)255;
-        if (deq_off + f32_sz > ctx->weights.size) {
-            fprintf(stderr, "qw6_vk_pipe: L%d attn_o dequant buffer too small\n", _li);
+        float *deq_ptr = calloc((size_t)nrows * ncols, sizeof(float));
+        if (!deq_ptr) {
+            fprintf(stderr, "qw6_vk_pipe: L%d attn_o FP32 replacement alloc failed\n", _li);
             continue;
         }
-        float *deq_ptr = (float *)((uint8_t *)ctx->weights.mapped + deq_off);
         /* Dequantize each row */
         for (uint32_t _r = 0; _r < nrows; _r++) {
             if (qw6_tensor_dequantize_row(ao, _r, deq_ptr + _r * ncols) != 0)
                 break;
         }
-        /* Change quant type to FP32 and point to dequantized data */
-        ao->quant = QW6_Q_FP32;
-        ao->data = deq_ptr;
-        ao->vk_offset = deq_off;
-        ao->data_size = f32_sz;
-        ctx->weight_capacity = deq_off + f32_sz;
-        fprintf(stderr, "qw6_vk_pipe: L%d attn_o dequantized to FP32 (%zu MB)\n",
+        snprintf(ctx->attn_o_fp32[_li].name, sizeof(ctx->attn_o_fp32[_li].name),
+                 "%s.fp32", ao->name);
+        ctx->attn_o_fp32[_li].rows = nrows;
+        ctx->attn_o_fp32[_li].cols = ncols;
+        ctx->attn_o_fp32[_li].ne[0] = ncols;
+        ctx->attn_o_fp32[_li].ne[1] = nrows;
+        ctx->attn_o_fp32[_li].ne[2] = 1;
+        ctx->attn_o_fp32[_li].ne[3] = 1;
+        ctx->attn_o_fp32[_li].n_dims = 2;
+        ctx->attn_o_fp32[_li].quant = QW6_Q_FP32;
+        ctx->attn_o_fp32[_li].data = deq_ptr;
+        ctx->attn_o_fp32[_li].data_size = f32_sz;
+        ctx->attn_o_fp32[_li].file_offset = ao->file_offset;
+        ctx->attn_o_fp32[_li].vk_offset = (size_t)-1;
+        if (qw6_vk_upload_tensor(ctx, &ctx->attn_o_fp32[_li]) == (size_t)-1) {
+            free(deq_ptr);
+            memset(&ctx->attn_o_fp32[_li], 0, sizeof(ctx->attn_o_fp32[_li]));
+            fprintf(stderr, "qw6_vk_pipe: L%d attn_o upload failed\n", _li);
+            continue;
+        }
+        ctx->attn_o_fp32_valid[_li] = true;
+        fprintf(stderr, "qw6_vk_pipe: L%d attn_o stored as separate FP32 replacement (%zu MB)\n",
                 _li, f32_sz / (1024*1024));
     }
     *p = ctx;
@@ -3309,9 +3332,8 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
                        QW6_NUM_Q_HEADS * QW6_HEAD_DIM * sizeof(float));
             }
 
-            /* Output projection. attn_o is pre-dequantized to FP32 at init
-             * because the Q5_K shader is still numerically wrong for it. */
-            VK_MATMUL(&m->layers[l].attn_o, att, s1,
+            /* Output projection uses the pipe-local FP32 replacement when present. */
+            VK_MATMUL(qw6_vk_pipe_attn_o(p, m, l), att, s1,
                       QW6_HIDDEN_SIZE, QW6_NUM_Q_HEADS * QW6_HEAD_DIM);
             att_out = s1;
         }
@@ -3505,6 +3527,7 @@ void qw6_vk_pipe_free(qw6_vk_pipe_t *p) {
     if (p->scr_moe_idx.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_moe_idx);
     if (p->scr_moe_w.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_moe_w);
     for (int i = 0; i < QW6_NUM_LAYERS; i++) {
+        if (p->attn_o_fp32_valid[i]) free(p->attn_o_fp32[i].data);
         if (qw6_layer_type(i) == QW6_LAYER_FULL_ATTN) {
             if (p->k_cache[i].buffer) qw6_vk_buffer_destroy(&p->vk, &p->k_cache[i]);
             if (p->v_cache[i].buffer) qw6_vk_buffer_destroy(&p->vk, &p->v_cache[i]);
