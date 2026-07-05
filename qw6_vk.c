@@ -2862,7 +2862,16 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m, bool strict) {
     ctx->max_ctx = m->max_context > 0 ? m->max_context : QW6_DEFAULT_CTX;
 
     /* ---- Allocate the big weight buffer ---- */
-    size_t total_w = m->total_weight_bytes + 512 * 1024 * 1024; /* +512 MB for dequant temps */
+    size_t attn_o_fp32_bytes = 0;
+    for (int l = 0; l < QW6_NUM_LAYERS; l++) {
+        if (qw6_layer_type(l) != QW6_LAYER_FULL_ATTN) continue;
+        qw6_tensor_t *ao = &m->layers[l].attn_o;
+        if (!ao->data || ao->rows == 0 || ao->cols == 0) continue;
+        size_t f32_sz = (size_t)ao->rows * ao->cols * sizeof(float);
+        attn_o_fp32_bytes = (attn_o_fp32_bytes + 255) & ~(size_t)255;
+        attn_o_fp32_bytes += f32_sz;
+    }
+    size_t total_w = m->total_weight_bytes + attn_o_fp32_bytes;
     if (qw6_vk_buffer_create(&ctx->vk, &ctx->weights, total_w,
                              QW6_VK_USAGE_STORAGE_DST) != 0) {
         qw6_vk_free(&ctx->vk); free(ctx); return -1;
