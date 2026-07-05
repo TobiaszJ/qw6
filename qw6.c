@@ -609,26 +609,45 @@ static int bind_layer_tensor(qw6_model_t *m, int layer,
     const char *local = ti->name + strlen(prefix);
     qw6_tensor_t *dst = NULL;
 
-    if (strcmp(local, "attn_norm.weight") == 0) dst = &m->layers[layer].norm;
-    else if (strcmp(local, "post_attention_norm.weight") == 0) dst = &m->layers[layer].post_norm;
-    else if (strcmp(local, "attn_qkv.weight") == 0) dst = &m->layers[layer].attn_q;
-    else if (strcmp(local, "attn_q.weight") == 0) dst = &m->layers[layer].attn_q;
-    else if (strcmp(local, "attn_k.weight") == 0) dst = &m->layers[layer].attn_k;
-    else if (strcmp(local, "attn_v.weight") == 0) dst = &m->layers[layer].attn_v;
-    else if (strcmp(local, "attn_q_norm.weight") == 0) dst = &m->layers[layer].attn_q_norm;
-    else if (strcmp(local, "attn_k_norm.weight") == 0) dst = &m->layers[layer].attn_k_norm;
-    else if (strcmp(local, "attn_output.weight") == 0) dst = &m->layers[layer].attn_o;
-    else if (strcmp(local, "attn_gate.weight") == 0) dst = &m->layers[layer].attn_gate;
-    else if (strcmp(local, "ssm_conv1d.weight") == 0) dst = &m->layers[layer].conv1d;
-    else if (strcmp(local, "ssm_in.weight") == 0) dst = &m->layers[layer].dn_key;
-    else if (strcmp(local, "ssm_out.weight") == 0) dst = &m->layers[layer].dn_out;
-    else if (strcmp(local, "ssm_norm.weight") == 0) dst = &m->layers[layer].dn_norm;
-    else if (strcmp(local, "ssm_alpha.weight") == 0) dst = &m->layers[layer].dn_alpha;
-    else if (strcmp(local, "ssm_beta.weight") == 0) dst = &m->layers[layer].dn_beta;
-    else if (strcmp(local, "ssm_dt.bias") == 0) dst = &m->layers[layer].dn_dt;
-    else if (strcmp(local, "ssm_a") == 0) dst = &m->layers[layer].dn_a;
-    else if (strcmp(local, "ffn_gate_inp.weight") == 0) dst = &m->layers[layer].moe_router;
-    else if (strcmp(local, "ffn_gate_inp_shexp.weight") == 0) dst = &m->layers[layer].shared_router;
+    if (strcmp(local, "attn_norm.weight") == 0) {
+        dst = &m->layers[layer].norm;
+    } else if (strcmp(local, "post_attention_norm.weight") == 0) {
+        dst = &m->layers[layer].post_norm;
+    } else if (strcmp(local, "attn_qkv.weight") == 0) {
+        dst = &m->layers[layer].attn_q;
+    } else if (strcmp(local, "attn_q.weight") == 0) {
+        dst = &m->layers[layer].attn_q;
+    } else if (strcmp(local, "attn_k.weight") == 0) {
+        dst = &m->layers[layer].attn_k;
+    } else if (strcmp(local, "attn_v.weight") == 0) {
+        dst = &m->layers[layer].attn_v;
+    } else if (strcmp(local, "attn_q_norm.weight") == 0) {
+        dst = &m->layers[layer].attn_q_norm;
+    } else if (strcmp(local, "attn_k_norm.weight") == 0) {
+        dst = &m->layers[layer].attn_k_norm;
+    } else if (strcmp(local, "attn_output.weight") == 0) {
+        dst = &m->layers[layer].attn_o;
+    } else if (strcmp(local, "attn_gate.weight") == 0) {
+        dst = &m->layers[layer].attn_gate;
+    } else if (strcmp(local, "ssm_conv1d.weight") == 0) {
+        dst = &m->layers[layer].conv1d;
+    } else if (strcmp(local, "ssm_out.weight") == 0) {
+        dst = &m->layers[layer].dn_out;
+    } else if (strcmp(local, "ssm_norm.weight") == 0) {
+        dst = &m->layers[layer].dn_norm;
+    } else if (strcmp(local, "ssm_alpha.weight") == 0) {
+        dst = &m->layers[layer].dn_alpha;
+    } else if (strcmp(local, "ssm_beta.weight") == 0) {
+        dst = &m->layers[layer].dn_beta;
+    } else if (strcmp(local, "ssm_dt.bias") == 0) {
+        dst = &m->layers[layer].dn_dt;
+    } else if (strcmp(local, "ssm_a") == 0) {
+        dst = &m->layers[layer].dn_a;
+    } else if (strcmp(local, "ffn_gate_inp.weight") == 0) {
+        dst = &m->layers[layer].moe_router;
+    } else if (strcmp(local, "ffn_gate_inp_shexp.weight") == 0) {
+        dst = &m->layers[layer].shared_router;
+    }
     else if (strcmp(local, "ffn_gate_exps.weight") == 0) {
         if (bind_expert_pack(m->layers[layer].expert_gate, ti, base, abs_offset, span) != 0)
             return -1;
@@ -655,6 +674,127 @@ static int bind_layer_tensor(qw6_model_t *m, int layer,
     if (qw6_tensor_bind(dst, ti, base, abs_offset, span) != 0)
         return -1;
     return 1;
+}
+
+static int qw6_validate_layer_bindings(const qw6_model_t *m, int layer) {
+    const qw6_layer_type_t type = qw6_layer_type(layer);
+    const qw6_tensor_t *norm = &m->layers[layer].norm;
+    const qw6_tensor_t *post_norm = &m->layers[layer].post_norm;
+    const qw6_tensor_t *moe_router = &m->layers[layer].moe_router;
+    const qw6_tensor_t *shared_router = &m->layers[layer].shared_router;
+    const qw6_tensor_t *shared_gate = &m->layers[layer].shared_gate;
+    const qw6_tensor_t *shared_up = &m->layers[layer].shared_up;
+    const qw6_tensor_t *shared_down = &m->layers[layer].shared_down;
+    const qw6_tensor_t *expert_gate = &m->layers[layer].expert_gate[0];
+    const qw6_tensor_t *expert_up = &m->layers[layer].expert_up[0];
+    const qw6_tensor_t *expert_down = &m->layers[layer].expert_down[0];
+    const qw6_tensor_t *attn_q = &m->layers[layer].attn_q;
+    const qw6_tensor_t *attn_k = &m->layers[layer].attn_k;
+    const qw6_tensor_t *attn_v = &m->layers[layer].attn_v;
+    const qw6_tensor_t *attn_o = &m->layers[layer].attn_o;
+    const qw6_tensor_t *attn_q_norm = &m->layers[layer].attn_q_norm;
+    const qw6_tensor_t *attn_k_norm = &m->layers[layer].attn_k_norm;
+    const qw6_tensor_t *attn_gate = &m->layers[layer].attn_gate;
+    const qw6_tensor_t *conv1d = &m->layers[layer].conv1d;
+    const qw6_tensor_t *dn_out = &m->layers[layer].dn_out;
+    const qw6_tensor_t *dn_norm = &m->layers[layer].dn_norm;
+    const qw6_tensor_t *dn_alpha = &m->layers[layer].dn_alpha;
+    const qw6_tensor_t *dn_beta = &m->layers[layer].dn_beta;
+    const qw6_tensor_t *dn_dt = &m->layers[layer].dn_dt;
+    const qw6_tensor_t *dn_a = &m->layers[layer].dn_a;
+    int missing = 0;
+
+    const struct {
+        const qw6_tensor_t *t;
+        const char *name;
+    } common[] = {
+        {norm, "attn_norm.weight"},
+        {post_norm, "post_attention_norm.weight"},
+        {moe_router, "ffn_gate_inp.weight"},
+        {shared_router, "ffn_gate_inp_shexp.weight"},
+        {shared_gate, "ffn_gate_shexp.weight"},
+        {shared_up, "ffn_up_shexp.weight"},
+        {shared_down, "ffn_down_shexp.weight"},
+    };
+    const struct {
+        const qw6_tensor_t *t;
+        const char *name;
+    } experts[] = {
+        {expert_gate, "ffn_gate_exps.weight"},
+        {expert_up, "ffn_up_exps.weight"},
+        {expert_down, "ffn_down_exps.weight"},
+    };
+    const struct {
+        const qw6_tensor_t *t;
+        const char *name;
+    } full[] = {
+        {attn_q, "attn_q.weight"},
+        {attn_k, "attn_k.weight"},
+        {attn_v, "attn_v.weight"},
+        {attn_o, "attn_output.weight"},
+        {attn_q_norm, "attn_q_norm.weight"},
+        {attn_k_norm, "attn_k_norm.weight"},
+    };
+    const struct {
+        const qw6_tensor_t *t;
+        const char *name;
+    } linear[] = {
+        {attn_q, "attn_qkv.weight"},
+        {conv1d, "ssm_conv1d.weight"},
+        {dn_out, "ssm_out.weight"},
+        {dn_norm, "ssm_norm.weight"},
+        {dn_alpha, "ssm_alpha.weight"},
+        {dn_beta, "ssm_beta.weight"},
+        {dn_dt, "ssm_dt.bias"},
+        {dn_a, "ssm_a"},
+        {attn_gate, "attn_gate.weight"},
+    };
+
+    for (size_t i = 0; i < sizeof(common) / sizeof(common[0]); i++) {
+        if (!common[i].t->data) {
+            if (!missing) {
+                fprintf(stderr, "qw6: layer %d is missing required tensors:", layer);
+                missing = 1;
+            }
+            fprintf(stderr, " %s", common[i].name);
+        }
+    }
+    for (size_t i = 0; i < sizeof(experts) / sizeof(experts[0]); i++) {
+        if (!experts[i].t->data) {
+            if (!missing) {
+                fprintf(stderr, "qw6: layer %d is missing required tensors:", layer);
+                missing = 1;
+            }
+            fprintf(stderr, " %s", experts[i].name);
+        }
+    }
+    if (type == QW6_LAYER_FULL_ATTN) {
+        for (size_t i = 0; i < sizeof(full) / sizeof(full[0]); i++) {
+            if (!full[i].t->data) {
+                if (!missing) {
+                    fprintf(stderr, "qw6: layer %d is missing required tensors:", layer);
+                    missing = 1;
+                }
+                fprintf(stderr, " %s", full[i].name);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < sizeof(linear) / sizeof(linear[0]); i++) {
+            if (!linear[i].t->data) {
+                if (!missing) {
+                    fprintf(stderr, "qw6: layer %d is missing required tensors:", layer);
+                    missing = 1;
+                }
+                fprintf(stderr, " %s", linear[i].name);
+            }
+        }
+    }
+
+    if (missing) {
+        fputc('\n', stderr);
+        return -1;
+    }
+    return 0;
 }
 
 static int qw6_validate_qwen_metadata(const gguf_ctx_t *ctx) {
@@ -1079,12 +1219,19 @@ int qw6_gguf_read_file(const char *path, qw6_model_t *m) {
             token_embd, output, output_norm, layers_with_tensors,
             QW6_NUM_LAYERS, attn_tensors, ssm_tensors, moe_tensors);
 
-    if (token_embd != 1 || output != 1 ||
+    if (token_embd != 1 || output != 1 || output_norm != 1 ||
         layers_with_tensors != QW6_NUM_LAYERS || ssm_tensors == 0 ||
         attn_tensors == 0 || moe_tensors == 0) {
         fprintf(stderr, "qw6: GGUF does not match required Qwen3.6 tensor layout\n");
         qw6_gguf_free(&ctx);
         return -1;
+    }
+
+    for (uint32_t i = 0; i < QW6_NUM_LAYERS; i++) {
+        if (qw6_validate_layer_bindings(m, (int)i) != 0) {
+            qw6_gguf_free(&ctx);
+            return -1;
+        }
     }
 
     qw6_gguf_free(&ctx);
