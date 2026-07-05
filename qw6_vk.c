@@ -2167,7 +2167,6 @@ struct qw6_vk_pipe_s {
     qw6_vk_buffer_t scr_hidden;    /* [HIDDEN_SIZE] float */
     qw6_vk_buffer_t scr_resid;     /* [HIDDEN_SIZE] float */
     qw6_vk_buffer_t scr_normed;    /* [HIDDEN_SIZE] float */
-    qw6_vk_buffer_t scr_norm_w;    /* [HIDDEN_SIZE] float */
     qw6_vk_buffer_t scr_attn;      /* [HIDDEN_SIZE] float */
     qw6_vk_buffer_t scr_ffn;       /* [HIDDEN_SIZE] float */
     qw6_vk_buffer_t scr_s0;        /* [HIDDEN_SIZE*2] float */
@@ -2441,13 +2440,14 @@ static const qw6_tensor_t *qw6_vk_pipe_attn_o(const struct qw6_vk_pipe_s *p,
 /* GPU dispatch helpers for pipeline ops */
 
 static int qw6_vk_pipe_rmsnorm(struct qw6_vk_pipe_s *p,
-                                qw6_vk_buffer_t *x, qw6_vk_buffer_t *w,
+                                qw6_vk_buffer_t *x, const qw6_tensor_t *w,
                                 qw6_vk_buffer_t *y, uint32_t n, float eps) {
-    const size_t zero[3] = {0, 0, 0};
-    qw6_vk_buffer_t *bufs[3] = {x, w, y};
+    if (!w || w->vk_offset == (size_t)-1) return -1;
+    const size_t offs[3] = {0, w->vk_offset, 0};
+    qw6_vk_buffer_t *bufs[3] = {x, &p->weights, y};
     qw6_vk_rmsnorm_push_t push = {.n = n, .eps = eps};
     return qw6_vk_pipe_dispatch(p, "vulkan/rmsnorm_full.spv",
-                                bufs, zero, 3, &push, sizeof(push), 1, 1, 1);
+                                bufs, offs, 3, &push, sizeof(push), 1, 1, 1);
 }
 
 static int qw6_vk_pipe_add(struct qw6_vk_pipe_s *p,
@@ -2898,7 +2898,6 @@ int qw6_vk_pipe_init(qw6_vk_pipe_t **p, qw6_model_t *m, bool strict) {
     VK_BUF_SZ(scr_hidden, QW6_HIDDEN_SIZE);
     VK_BUF_SZ(scr_resid, QW6_HIDDEN_SIZE);
     VK_BUF_SZ(scr_normed, QW6_HIDDEN_SIZE);
-    VK_BUF_SZ(scr_norm_w, QW6_HIDDEN_SIZE);
     VK_BUF_SZ(scr_attn, QW6_HIDDEN_SIZE);
     VK_BUF_SZ(scr_ffn, QW6_HIDDEN_SIZE);
     VK_BUF_SZ(scr_s0, QW6_LINEAR_QKV_DIM);
@@ -3070,7 +3069,6 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
     qw6_vk_buffer_t *hid = &p->scr_hidden;
     qw6_vk_buffer_t *res = &p->scr_resid;
     qw6_vk_buffer_t *nrm = &p->scr_normed;
-    qw6_vk_buffer_t *nw  = &p->scr_norm_w;
     qw6_vk_buffer_t *att = &p->scr_attn;
     qw6_vk_buffer_t *ffn = &p->scr_ffn;
     qw6_vk_buffer_t *s0  = &p->scr_s0;
@@ -3123,9 +3121,7 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
         memcpy(res->mapped, hid->mapped, QW6_HIDDEN_SIZE * sizeof(float));
 
         /* Pre-attention RMSNorm: normed = rmsnorm(hidden, norm_w) */
-        /* Upload norm weights to GPU scratch */
-        VK_WRITE(nw, ((float *)m->layers[l].norm.data), QW6_HIDDEN_SIZE);
-        VK_RMSNORM(hid, nw, nrm);
+        VK_RMSNORM(hid, &m->layers[l].norm, nrm);
 
         if (qw6_layer_type(l) == QW6_LAYER_LINEAR_ATTN) {
             /* ---- Linear Attention (Gated DeltaNet) ---- */
@@ -3355,8 +3351,7 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
         memcpy(res->mapped, hid->mapped, QW6_HIDDEN_SIZE * sizeof(float));
 
         /* Post-attention RMSNorm */
-        VK_WRITE(nw, ((float *)m->layers[l].post_norm.data), QW6_HIDDEN_SIZE);
-        VK_RMSNORM(hid, nw, nrm);
+        VK_RMSNORM(hid, &m->layers[l].post_norm, nrm);
 
         /* Router matvec: 256 experts, top-k=8 */
         VK_MATMUL(&m->layers[l].moe_router, nrm, s0,
@@ -3451,8 +3446,7 @@ int qw6_vk_pipe_forward(qw6_vk_pipe_t *p, qw6_model_t *m,
 
     /* ---- Output: Final RMSNorm + output projection ---- */
     {
-        VK_WRITE(nw, ((float *)m->output_norm.data), QW6_HIDDEN_SIZE);
-        VK_RMSNORM(hid, nw, nrm);
+        VK_RMSNORM(hid, &m->output_norm, nrm);
 
         /* Output projection: [vocab, hidden] matvec. This is 248320 rows - large! */
         VK_MATMUL(&m->output, nrm, lg, QW6_VOCAB_SIZE, QW6_HIDDEN_SIZE);
@@ -3526,7 +3520,6 @@ void qw6_vk_pipe_free(qw6_vk_pipe_t *p) {
     if (p->scr_hidden.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_hidden);
     if (p->scr_resid.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_resid);
     if (p->scr_normed.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_normed);
-    if (p->scr_norm_w.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_norm_w);
     if (p->scr_attn.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_attn);
     if (p->scr_ffn.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_ffn);
     if (p->scr_s0.buffer) qw6_vk_buffer_destroy(&p->vk, &p->scr_s0);
